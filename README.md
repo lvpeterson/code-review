@@ -16,12 +16,22 @@ python main.py <target_path> --language python --framework flask   # skip detect
 ```
 
 `--html` writes a single self-contained HTML file (no external assets, so it
-opens fine offline) with one collapsible card per route. Expanding a card
-shows the full handler source with line numbers, the associated baseline
-findings, and an "open in editor" link (`vscode://file/...`) that jumps
-straight to that file:line if VS Code is installed. It also has a search box
-and severity/language filters in the sidebar for scanning a large codebase's
-worth of routes quickly.
+opens fine offline) with one collapsible card per route, syntax-highlighted.
+Expanding a card shows the full handler source with line numbers, the
+associated baseline findings, and an "open in editor" link
+(`vscode://file/...`) that jumps straight to that file:line if VS Code is
+installed. Routes are sorted worst-severity-first within each section by
+default; the "Sort" dropdown re-orders by path/method/file instead. The
+sidebar has severity/method/language filters plus a text search box, all
+composable together.
+
+Each route also has a checkbox to mark it reviewed as you triage through
+the list -- reviewed routes dim and get a strikethrough, and "Hide reviewed"
+in the topbar filters them out entirely so you can watch the remaining list
+shrink. This persists in the browser's local storage keyed to the target
+path, so it survives closing and reopening the same report file (but not a
+fresh `--html` run somewhere else, or opening it in a different browser).
+"Reset reviewed" clears it.
 
 ## Layout
 

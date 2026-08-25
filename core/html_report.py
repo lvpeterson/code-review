@@ -7,7 +7,9 @@ needs to open straight from disk, including on an air-gapped machine.
 """
 from __future__ import annotations
 
+import hashlib
 import html
+import itertools
 from datetime import datetime
 from pathlib import Path
 
@@ -20,6 +22,8 @@ from core.models import Finding, Route, ScanResult
 
 _SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2, "info": 3}
 _SEVERITY_LABEL = {"high": "High", "medium": "Medium", "low": "Low", "info": "Info"}
+_ROUTE_SORT_RANK = {**_SEVERITY_RANK, "clean": 4}  # "clean" only applies to routes, never to a Finding
+_METHOD_ORDER = {"GET": 0, "POST": 1, "PUT": 2, "PATCH": 3, "DELETE": 4, "OPTIONS": 5, "HEAD": 6}
 
 # night-owl's own background (#011627) already sits in the same navy family
 # as this report's palette, so its token colors blend in once we force the
@@ -123,11 +127,12 @@ def _route_search_blob(route: Route) -> str:
     return _esc(" ".join([route.path, route.handler_name, route.file, " ".join(route.methods)]).lower())
 
 
-def _render_route(route: Route, findings: list[Finding], target_path: Path, language: str) -> str:
+def _render_route(route: Route, findings: list[Finding], target_path: Path, language: str, route_id: str) -> str:
     route_findings = [f for f in findings if f.route is route]
     worst = _worst_severity(route_findings)
 
     method_badges = "".join(f'<span class="method m-{_esc(m.lower())}">{_esc(m)}</span>' for m in route.methods)
+    methods_attr = " ".join(m.lower() for m in route.methods)
     finding_tags = "".join(
         f'<span class="tag sev-{_esc(f.severity)}">{_esc(f.check_id)}</span>' for f in route_findings
     )
@@ -137,8 +142,9 @@ def _render_route(route: Route, findings: list[Finding], target_path: Path, lang
     code_html = _render_code_block(target_path, route, language)
 
     return f"""
-      <details class="route-card sev-{worst}" data-severity="{worst}" data-search="{_route_search_blob(route)}">
+      <details class="route-card sev-{worst}" data-severity="{worst}" data-methods="{_esc(methods_attr)}" data-search="{_route_search_blob(route)}">
         <summary>
+          <input type="checkbox" class="review-toggle" data-route-id="{_esc(route_id)}" title="Mark reviewed" aria-label="Mark this route reviewed">
           <span class="methods">{method_badges}</span>
           <span class="path">{_esc(route.path)}</span>
           <span class="handler">{_esc(route.handler_name)}</span>
@@ -153,8 +159,20 @@ def _render_route(route: Route, findings: list[Finding], target_path: Path, lang
       </details>"""
 
 
-def _render_group(result: ScanResult, target_path: Path) -> str:
-    routes_html = "".join(_render_route(r, result.findings, target_path, result.language) for r in result.routes)
+def _render_group(result: ScanResult, target_path: Path, route_ids: itertools.count) -> str:
+    # Worst-first by default -- the JS "Sort by" control lets the reader
+    # reorder interactively, but the first thing anyone sees on open should
+    # already be what needs attention most.
+    sorted_routes = sorted(
+        result.routes,
+        key=lambda r: _ROUTE_SORT_RANK.get(
+            _worst_severity([f for f in result.findings if f.route is r]), 9
+        ),
+    )
+    routes_html = "".join(
+        _render_route(r, result.findings, target_path, result.language, f"route-{next(route_ids)}")
+        for r in sorted_routes
+    )
     notes_html = "".join(f'<p class="group-note">{_esc(n)}</p>' for n in result.notes)
     return f"""
     <section class="group" data-lang="{_esc(result.language)}">
@@ -171,6 +189,10 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
     all_routes = [rt for r in results for rt in r.routes]
     severity_counts = {sev: sum(1 for f in all_findings if f.severity == sev) for sev in _SEVERITY_RANK}
     languages = sorted({r.language for r in results})
+    methods_present = sorted(
+        {m for r in all_routes for m in r.methods},
+        key=lambda m: (_METHOD_ORDER.get(m, 99), m),
+    )
 
     lang_filters = "".join(
         f'<label><input type="checkbox" class="f-lang" value="{_esc(lang)}" checked> {_esc(lang)}</label>'
@@ -181,10 +203,20 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
         f'<span class="sidebar-count">{severity_counts[sev]}</span></label>'
         for sev, label in _SEVERITY_LABEL.items()
     )
+    method_filters = "".join(
+        f'<label><input type="checkbox" class="f-method" value="{m.lower()}" checked> {_esc(m)}</label>'
+        for m in methods_present
+    )
 
-    groups_html = "".join(_render_group(r, target_path) for r in results) or '<p class="no-findings">No supported language/framework detected in target.</p>'
+    route_ids = itertools.count(1)
+    groups_html = "".join(_render_group(r, target_path, route_ids) for r in results) or '<p class="no-findings">No supported language/framework detected in target.</p>'
 
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    # Namespaces this report's "reviewed" checklist in localStorage so two
+    # different reports opened in the same browser (file:// pages can share
+    # one storage bucket) don't clobber each other's progress. Stable across
+    # re-runs against the same target, so re-scanning doesn't wipe progress.
+    report_id = hashlib.sha256(str(target_path.resolve()).encode("utf-8")).hexdigest()[:12]
 
     return f"""<!doctype html>
 <html lang="en">
@@ -208,8 +240,16 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
     </div>
     <div class="topbar-actions">
       <input id="search" type="search" placeholder="filter by path, handler, file&hellip;" autocomplete="off">
+      <select id="sort-select" title="Sort routes within each section">
+        <option value="severity">Sort: severity</option>
+        <option value="path">Sort: path</option>
+        <option value="method">Sort: method</option>
+        <option value="file">Sort: file</option>
+      </select>
       <button id="expand-all" type="button">Expand all</button>
       <button id="collapse-all" type="button">Collapse all</button>
+      <label class="hide-reviewed-toggle"><input type="checkbox" id="hide-reviewed"> Hide reviewed</label>
+      <button id="reset-reviewed" type="button">Reset reviewed</button>
     </div>
   </header>
 
@@ -220,12 +260,18 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
         <div class="stat sev-high"><span class="stat-value">{severity_counts["high"]}</span><span class="stat-label">high</span></div>
         <div class="stat sev-medium"><span class="stat-value">{severity_counts["medium"]}</span><span class="stat-label">medium</span></div>
         <div class="stat sev-low"><span class="stat-value">{severity_counts["low"]}</span><span class="stat-label">low</span></div>
+        <div class="stat stat-reviewed"><span class="stat-value" id="reviewed-stat">0 / {len(all_routes)}</span><span class="stat-label">reviewed</span></div>
       </div>
 
       <div class="filter-group">
         <h2>Severity</h2>
         {sev_filters}
         <label><input type="checkbox" class="f-sev" value="clean" checked> No findings</label>
+      </div>
+
+      <div class="filter-group">
+        <h2>Method</h2>
+        {method_filters}
       </div>
 
       <div class="filter-group">
@@ -241,6 +287,7 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
 </div>
 
 <script>
+const REPORT_ID = "{report_id}";
 {_JS}
 </script>
 </body>
@@ -313,6 +360,17 @@ body {
 }
 #search:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
+#sort-select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 8px 10px;
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+#sort-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
 button {
   background: var(--surface-raised);
   border: 1px solid var(--border);
@@ -325,6 +383,17 @@ button {
 }
 button:hover { border-color: var(--accent); }
 button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.hide-reviewed-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+.hide-reviewed-toggle input { accent-color: var(--accent); cursor: pointer; }
 
 .layout { display: flex; align-items: flex-start; }
 
@@ -345,6 +414,8 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .stat.sev-high .stat-value { color: var(--sev-high); }
 .stat.sev-medium .stat-value { color: var(--sev-medium); }
 .stat.sev-low .stat-value { color: var(--sev-low); }
+.stat-reviewed { border-top: 1px solid var(--border); margin-top: 4px; padding-top: 8px; }
+.stat-reviewed .stat-value { color: var(--sev-clean); }
 
 .filter-group { margin-bottom: 22px; }
 .filter-group h2 {
@@ -397,6 +468,10 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .route-card.sev-low { border-left-color: var(--sev-low); }
 .route-card.sev-info { border-left-color: var(--sev-info); }
 
+.route-card.reviewed { opacity: 0.45; }
+.route-card.reviewed:hover { opacity: 0.8; }
+.route-card.reviewed .path, .route-card.reviewed .handler { text-decoration: line-through; }
+
 .route-card summary {
   display: flex;
   align-items: center;
@@ -410,6 +485,14 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .route-card summary::-webkit-details-marker { display: none; }
 .route-card summary:hover { background: var(--surface-raised); }
 .route-card summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.review-toggle {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  accent-color: var(--sev-clean);
+  cursor: pointer;
+}
 
 .methods { display: flex; gap: 4px; flex-shrink: 0; }
 .method {
@@ -535,11 +618,15 @@ document.getElementById('collapse-all').addEventListener('click', () => {
 const search = document.getElementById('search');
 const sevBoxes = document.querySelectorAll('.f-sev');
 const langBoxes = document.querySelectorAll('.f-lang');
+const methodBoxes = document.querySelectorAll('.f-method');
+const hideReviewed = document.getElementById('hide-reviewed');
 
 function applyFilters() {
   const q = search.value.trim().toLowerCase();
   const activeSev = new Set([...sevBoxes].filter(b => b.checked).map(b => b.value));
   const activeLang = new Set([...langBoxes].filter(b => b.checked).map(b => b.value));
+  const activeMethod = new Set([...methodBoxes].filter(b => b.checked).map(b => b.value));
+  const hideDone = hideReviewed.checked;
 
   document.querySelectorAll('section.group').forEach(section => {
     let anyVisible = false;
@@ -547,7 +634,10 @@ function applyFilters() {
     section.querySelectorAll('details.route-card').forEach(card => {
       const textOk = !q || card.dataset.search.includes(q);
       const sevOk = activeSev.has(card.dataset.severity);
-      const visible = langOk && textOk && sevOk;
+      const methods = card.dataset.methods ? card.dataset.methods.split(' ') : [];
+      const methodOk = methods.length === 0 || methods.some(m => activeMethod.has(m));
+      const reviewedOk = !hideDone || !card.classList.contains('reviewed');
+      const visible = langOk && textOk && sevOk && methodOk && reviewedOk;
       card.style.display = visible ? '' : 'none';
       if (visible) anyVisible = true;
     });
@@ -558,6 +648,97 @@ function applyFilters() {
 search.addEventListener('input', applyFilters);
 sevBoxes.forEach(b => b.addEventListener('change', applyFilters));
 langBoxes.forEach(b => b.addEventListener('change', applyFilters));
+methodBoxes.forEach(b => b.addEventListener('change', applyFilters));
+hideReviewed.addEventListener('change', applyFilters);
+
+// --- Sort ---
+const SORT_SEVERITY_RANK = { high: 0, medium: 1, low: 2, info: 3, clean: 4 };
+const sortSelect = document.getElementById('sort-select');
+
+function sortValue(card, key) {
+  if (key === 'severity') return SORT_SEVERITY_RANK[card.dataset.severity] ?? 9;
+  if (key === 'path') return card.querySelector('.path').textContent.trim().toLowerCase();
+  if (key === 'method') return (card.dataset.methods || '').split(' ')[0] || '';
+  if (key === 'file') return card.querySelector('.loc').textContent.trim().toLowerCase();
+  return 0;
+}
+
+function applySort() {
+  const key = sortSelect.value;
+  document.querySelectorAll('section.group').forEach(section => {
+    const cards = [...section.querySelectorAll('details.route-card')];
+    cards.sort((a, b) => {
+      const va = sortValue(a, key), vb = sortValue(b, key);
+      if (va < vb) return -1;
+      if (va > vb) return 1;
+      return 0;
+    });
+    cards.forEach(c => section.appendChild(c));
+  });
+}
+
+sortSelect.addEventListener('change', applySort);
+
+// --- Reviewed checklist (persisted per-report in localStorage) ---
+const STORAGE_KEY = 'appsec-review:' + REPORT_ID + ':reviewed';
+
+function loadReviewed() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return new Set(raw ? JSON.parse(raw) : []);
+  } catch (e) {
+    return new Set();
+  }
+}
+
+function saveReviewed() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify([...reviewed]));
+  } catch (e) {
+    // storage unavailable (private browsing, restrictive file:// policy,
+    // storage full, ...) -- reviewed state just won't persist on reload.
+  }
+}
+
+let reviewed = loadReviewed();
+const reviewToggles = document.querySelectorAll('.review-toggle');
+
+function updateReviewedStat() {
+  const stat = document.getElementById('reviewed-stat');
+  if (stat) stat.textContent = reviewed.size + ' / ' + reviewToggles.length;
+}
+
+function applyReviewedState() {
+  reviewToggles.forEach(cb => {
+    const isReviewed = reviewed.has(cb.dataset.routeId);
+    cb.checked = isReviewed;
+    cb.closest('details.route-card').classList.toggle('reviewed', isReviewed);
+  });
+  updateReviewedStat();
+}
+
+reviewToggles.forEach(cb => {
+  cb.addEventListener('click', (e) => {
+    // Without this, clicking the checkbox also toggles the parent
+    // <details> open/closed, since the click bubbles up through <summary>.
+    e.stopPropagation();
+    const id = cb.dataset.routeId;
+    if (cb.checked) reviewed.add(id); else reviewed.delete(id);
+    cb.closest('details.route-card').classList.toggle('reviewed', cb.checked);
+    saveReviewed();
+    updateReviewedStat();
+    if (hideReviewed.checked) applyFilters();
+  });
+});
+
+document.getElementById('reset-reviewed').addEventListener('click', () => {
+  reviewed.clear();
+  saveReviewed();
+  applyReviewedState();
+  if (hideReviewed.checked) applyFilters();
+});
+
+applyReviewedState();
 """
 
 

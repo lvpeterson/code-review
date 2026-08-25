@@ -155,6 +155,17 @@ body {
 }
 #search:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
+#sort-select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 8px 10px;
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+#sort-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
 button {
   background: var(--surface-raised);
   border: 1px solid var(--border);
@@ -167,6 +178,17 @@ button {
 }
 button:hover { border-color: var(--accent); }
 button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.hide-reviewed-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+.hide-reviewed-toggle input { accent-color: var(--accent); cursor: pointer; }
 
 .layout { display: flex; align-items: flex-start; }
 
@@ -187,6 +209,8 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .stat.sev-high .stat-value { color: var(--sev-high); }
 .stat.sev-medium .stat-value { color: var(--sev-medium); }
 .stat.sev-low .stat-value { color: var(--sev-low); }
+.stat-reviewed { border-top: 1px solid var(--border); margin-top: 4px; padding-top: 8px; }
+.stat-reviewed .stat-value { color: var(--sev-clean); }
 
 .filter-group { margin-bottom: 22px; }
 .filter-group h2 {
@@ -239,6 +263,10 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .route-card.sev-low { border-left-color: var(--sev-low); }
 .route-card.sev-info { border-left-color: var(--sev-info); }
 
+.route-card.reviewed { opacity: 0.45; }
+.route-card.reviewed:hover { opacity: 0.8; }
+.route-card.reviewed .path, .route-card.reviewed .handler { text-decoration: line-through; }
+
 .route-card summary {
   display: flex;
   align-items: center;
@@ -252,6 +280,14 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .route-card summary::-webkit-details-marker { display: none; }
 .route-card summary:hover { background: var(--surface-raised); }
 .route-card summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.review-toggle {
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  accent-color: var(--sev-clean);
+  cursor: pointer;
+}
 
 .methods { display: flex; gap: 4px; flex-shrink: 0; }
 .method {
@@ -374,13 +410,21 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
       <span class="brand-mark">&sect;</span>
       <div>
         <h1>Appsec Review</h1>
-        <p class="meta">sample-app &middot; generated 2026-08-25 13:24 &middot; 11 routes</p>
+        <p class="meta">sample-app &middot; generated 2026-08-25 13:30 &middot; 11 routes</p>
       </div>
     </div>
     <div class="topbar-actions">
       <input id="search" type="search" placeholder="filter by path, handler, file&hellip;" autocomplete="off">
+      <select id="sort-select" title="Sort routes within each section">
+        <option value="severity">Sort: severity</option>
+        <option value="path">Sort: path</option>
+        <option value="method">Sort: method</option>
+        <option value="file">Sort: file</option>
+      </select>
       <button id="expand-all" type="button">Expand all</button>
       <button id="collapse-all" type="button">Collapse all</button>
+      <label class="hide-reviewed-toggle"><input type="checkbox" id="hide-reviewed"> Hide reviewed</label>
+      <button id="reset-reviewed" type="button">Reset reviewed</button>
     </div>
   </header>
 
@@ -391,12 +435,18 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
         <div class="stat sev-high"><span class="stat-value">0</span><span class="stat-label">high</span></div>
         <div class="stat sev-medium"><span class="stat-value">1</span><span class="stat-label">medium</span></div>
         <div class="stat sev-low"><span class="stat-value">6</span><span class="stat-label">low</span></div>
+        <div class="stat stat-reviewed"><span class="stat-value" id="reviewed-stat">0 / 11</span><span class="stat-label">reviewed</span></div>
       </div>
 
       <div class="filter-group">
         <h2>Severity</h2>
         <label><input type="checkbox" class="f-sev" value="high" checked> High <span class="sidebar-count">0</span></label><label><input type="checkbox" class="f-sev" value="medium" checked> Medium <span class="sidebar-count">1</span></label><label><input type="checkbox" class="f-sev" value="low" checked> Low <span class="sidebar-count">6</span></label><label><input type="checkbox" class="f-sev" value="info" checked> Info <span class="sidebar-count">6</span></label>
         <label><input type="checkbox" class="f-sev" value="clean" checked> No findings</label>
+      </div>
+
+      <div class="filter-group">
+        <h2>Method</h2>
+        <label><input type="checkbox" class="f-method" value="get" checked> GET</label><label><input type="checkbox" class="f-method" value="post" checked> POST</label><label><input type="checkbox" class="f-method" value="delete" checked> DELETE</label>
       </div>
 
       <div class="filter-group">
@@ -413,44 +463,9 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
       </h2>
       
       
-      <details class="route-card sev-low" data-severity="low" data-search="/invoices/&lt;int:invoice_id&gt; get_invoice app.py get">
+      <details class="route-card sev-medium" data-severity="medium" data-methods="delete" data-search="/invoices/&lt;int:invoice_id&gt; delete_invoice app.py delete">
         <summary>
-          <span class="methods"><span class="method m-get">GET</span></span>
-          <span class="path">/invoices/&lt;int:invoice_id&gt;</span>
-          <span class="handler">get_invoice</span>
-          <span class="loc">app.py:6</span>
-          <span class="tags"><span class="tag sev-info">IDOR-001</span><span class="tag sev-low">AUTH-001</span></span>
-        </summary>
-        <div class="route-body">
-          <p class="auth-note">auth: none detected</p>
-          <div class="findings">
-    <div class="finding sev-info">
-      <span class="finding-tag">IDOR-001</span>
-      <span class="finding-sev">Info</span>
-      <p class="finding-title">Route takes object identifier(s): invoice_id</p>
-      <p class="finding-desc">Path includes an id-like parameter. Verify the handler checks that the authenticated user actually owns/may access the referenced object before returning or mutating it.</p>
-    </div>
-    <div class="finding sev-low">
-      <span class="finding-tag">AUTH-001</span>
-      <span class="finding-sev">Low</span>
-      <p class="finding-title">No recognized auth control detected on route</p>
-      <p class="finding-desc">No known auth decorator/middleware/annotation was found on this route. Confirm whether it&#x27;s intentionally public; if not, check for auth enforced elsewhere (global middleware, gateway, base class).</p>
-    </div></div>
-          
-    <div class="code-header">
-      <span class="code-path">app.py:6</span>
-      <a class="ide-link" href="vscode://file/C:/Users/lvpet/OneDrive/Documents/GitHub/Scripts/code-review/demo/sample-app/app.py:6">open in editor &rarr;</a>
-    </div><div class="code-block"><div class="highlight"><pre><span></span><span class="hll"><span class="linenos"> 6</span><span class="nd">@app</span><span class="o">.</span><span class="n">route</span><span class="p">(</span><span class="s2">"/invoices/&lt;int:invoice_id&gt;"</span><span class="p">,</span> <span class="n">methods</span><span class="o">=</span><span class="p">[</span><span class="s2">"GET"</span><span class="p">])</span>
-</span><span class="linenos"> 7</span><span class="k">def</span><span class="w"> </span><span class="nf">get_invoice</span><span class="p">(</span><span class="n">invoice_id</span><span class="p">):</span>
-<span class="linenos"> 8</span>    <span class="c1"># No ownership check -- any authenticated user can pull any invoice_id.</span>
-<span class="linenos"> 9</span>    <span class="n">invoice</span> <span class="o">=</span> <span class="n">db</span><span class="o">.</span><span class="n">query</span><span class="p">(</span><span class="n">Invoice</span><span class="p">)</span><span class="o">.</span><span class="n">filter_by</span><span class="p">(</span><span class="nb">id</span><span class="o">=</span><span class="n">invoice_id</span><span class="p">)</span><span class="o">.</span><span class="n">first</span><span class="p">()</span>
-<span class="linenos">10</span>    <span class="k">return</span> <span class="p">{</span><span class="s2">"id"</span><span class="p">:</span> <span class="n">invoice</span><span class="o">.</span><span class="n">id</span><span class="p">,</span> <span class="s2">"total"</span><span class="p">:</span> <span class="n">invoice</span><span class="o">.</span><span class="n">total</span><span class="p">,</span> <span class="s2">"owner"</span><span class="p">:</span> <span class="n">invoice</span><span class="o">.</span><span class="n">owner_id</span><span class="p">}</span>
-</pre></div>
-</div>
-        </div>
-      </details>
-      <details class="route-card sev-medium" data-severity="medium" data-search="/invoices/&lt;int:invoice_id&gt; delete_invoice app.py delete">
-        <summary>
+          <input type="checkbox" class="review-toggle" data-route-id="route-1" title="Mark reviewed" aria-label="Mark this route reviewed">
           <span class="methods"><span class="method m-delete">DELETE</span></span>
           <span class="path">/invoices/&lt;int:invoice_id&gt;</span>
           <span class="handler">delete_invoice</span>
@@ -485,57 +500,46 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 </div>
         </div>
       </details>
-      <details class="route-card sev-clean" data-severity="clean" data-search="/account/profile get_profile app.py get">
+      <details class="route-card sev-low" data-severity="low" data-methods="get" data-search="/invoices/&lt;int:invoice_id&gt; get_invoice app.py get">
         <summary>
+          <input type="checkbox" class="review-toggle" data-route-id="route-2" title="Mark reviewed" aria-label="Mark this route reviewed">
           <span class="methods"><span class="method m-get">GET</span></span>
-          <span class="path">/account/profile</span>
-          <span class="handler">get_profile</span>
-          <span class="loc">app.py:20</span>
-          <span class="tags"></span>
+          <span class="path">/invoices/&lt;int:invoice_id&gt;</span>
+          <span class="handler">get_invoice</span>
+          <span class="loc">app.py:6</span>
+          <span class="tags"><span class="tag sev-info">IDOR-001</span><span class="tag sev-low">AUTH-001</span></span>
         </summary>
         <div class="route-body">
-          <p class="auth-note">auth: login_required</p>
-          <div class="findings"><p class="no-findings">No baseline findings on this route.</p></div>
+          <p class="auth-note">auth: none detected</p>
+          <div class="findings">
+    <div class="finding sev-info">
+      <span class="finding-tag">IDOR-001</span>
+      <span class="finding-sev">Info</span>
+      <p class="finding-title">Route takes object identifier(s): invoice_id</p>
+      <p class="finding-desc">Path includes an id-like parameter. Verify the handler checks that the authenticated user actually owns/may access the referenced object before returning or mutating it.</p>
+    </div>
+    <div class="finding sev-low">
+      <span class="finding-tag">AUTH-001</span>
+      <span class="finding-sev">Low</span>
+      <p class="finding-title">No recognized auth control detected on route</p>
+      <p class="finding-desc">No known auth decorator/middleware/annotation was found on this route. Confirm whether it&#x27;s intentionally public; if not, check for auth enforced elsewhere (global middleware, gateway, base class).</p>
+    </div></div>
           
     <div class="code-header">
-      <span class="code-path">app.py:20</span>
-      <a class="ide-link" href="vscode://file/C:/Users/lvpet/OneDrive/Documents/GitHub/Scripts/code-review/demo/sample-app/app.py:20">open in editor &rarr;</a>
-    </div><div class="code-block"><div class="highlight"><pre><span></span><span class="hll"><span class="linenos">20</span><span class="nd">@app</span><span class="o">.</span><span class="n">route</span><span class="p">(</span><span class="s2">"/account/profile"</span><span class="p">,</span> <span class="n">methods</span><span class="o">=</span><span class="p">[</span><span class="s2">"GET"</span><span class="p">])</span>
-</span><span class="linenos">21</span><span class="nd">@login_required</span>
-<span class="linenos">22</span><span class="k">def</span><span class="w"> </span><span class="nf">get_profile</span><span class="p">():</span>
-<span class="linenos">23</span>    <span class="k">return</span> <span class="p">{</span><span class="s2">"email"</span><span class="p">:</span> <span class="n">current_user</span><span class="o">.</span><span class="n">email</span><span class="p">,</span> <span class="s2">"name"</span><span class="p">:</span> <span class="n">current_user</span><span class="o">.</span><span class="n">name</span><span class="p">}</span>
+      <span class="code-path">app.py:6</span>
+      <a class="ide-link" href="vscode://file/C:/Users/lvpet/OneDrive/Documents/GitHub/Scripts/code-review/demo/sample-app/app.py:6">open in editor &rarr;</a>
+    </div><div class="code-block"><div class="highlight"><pre><span></span><span class="hll"><span class="linenos"> 6</span><span class="nd">@app</span><span class="o">.</span><span class="n">route</span><span class="p">(</span><span class="s2">"/invoices/&lt;int:invoice_id&gt;"</span><span class="p">,</span> <span class="n">methods</span><span class="o">=</span><span class="p">[</span><span class="s2">"GET"</span><span class="p">])</span>
+</span><span class="linenos"> 7</span><span class="k">def</span><span class="w"> </span><span class="nf">get_invoice</span><span class="p">(</span><span class="n">invoice_id</span><span class="p">):</span>
+<span class="linenos"> 8</span>    <span class="c1"># No ownership check -- any authenticated user can pull any invoice_id.</span>
+<span class="linenos"> 9</span>    <span class="n">invoice</span> <span class="o">=</span> <span class="n">db</span><span class="o">.</span><span class="n">query</span><span class="p">(</span><span class="n">Invoice</span><span class="p">)</span><span class="o">.</span><span class="n">filter_by</span><span class="p">(</span><span class="nb">id</span><span class="o">=</span><span class="n">invoice_id</span><span class="p">)</span><span class="o">.</span><span class="n">first</span><span class="p">()</span>
+<span class="linenos">10</span>    <span class="k">return</span> <span class="p">{</span><span class="s2">"id"</span><span class="p">:</span> <span class="n">invoice</span><span class="o">.</span><span class="n">id</span><span class="p">,</span> <span class="s2">"total"</span><span class="p">:</span> <span class="n">invoice</span><span class="o">.</span><span class="n">total</span><span class="p">,</span> <span class="s2">"owner"</span><span class="p">:</span> <span class="n">invoice</span><span class="o">.</span><span class="n">owner_id</span><span class="p">}</span>
 </pre></div>
 </div>
         </div>
       </details>
-      <details class="route-card sev-clean" data-severity="clean" data-search="/account/profile update_profile app.py post">
+      <details class="route-card sev-low" data-severity="low" data-methods="get" data-search="/healthz health_check app.py get">
         <summary>
-          <span class="methods"><span class="method m-post">POST</span></span>
-          <span class="path">/account/profile</span>
-          <span class="handler">update_profile</span>
-          <span class="loc">app.py:26</span>
-          <span class="tags"></span>
-        </summary>
-        <div class="route-body">
-          <p class="auth-note">auth: login_required</p>
-          <div class="findings"><p class="no-findings">No baseline findings on this route.</p></div>
-          
-    <div class="code-header">
-      <span class="code-path">app.py:26</span>
-      <a class="ide-link" href="vscode://file/C:/Users/lvpet/OneDrive/Documents/GitHub/Scripts/code-review/demo/sample-app/app.py:26">open in editor &rarr;</a>
-    </div><div class="code-block"><div class="highlight"><pre><span></span><span class="hll"><span class="linenos">26</span><span class="nd">@app</span><span class="o">.</span><span class="n">route</span><span class="p">(</span><span class="s2">"/account/profile"</span><span class="p">,</span> <span class="n">methods</span><span class="o">=</span><span class="p">[</span><span class="s2">"POST"</span><span class="p">])</span>
-</span><span class="linenos">27</span><span class="nd">@login_required</span>
-<span class="linenos">28</span><span class="k">def</span><span class="w"> </span><span class="nf">update_profile</span><span class="p">():</span>
-<span class="linenos">29</span>    <span class="n">payload</span> <span class="o">=</span> <span class="n">request</span><span class="o">.</span><span class="n">get_json</span><span class="p">()</span>
-<span class="linenos">30</span>    <span class="n">current_user</span><span class="o">.</span><span class="n">name</span> <span class="o">=</span> <span class="n">payload</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"name"</span><span class="p">)</span>
-<span class="linenos">31</span>    <span class="n">db</span><span class="o">.</span><span class="n">commit</span><span class="p">()</span>
-<span class="linenos">32</span>    <span class="k">return</span> <span class="p">{</span><span class="s2">"ok"</span><span class="p">:</span> <span class="kc">True</span><span class="p">}</span>
-</pre></div>
-</div>
-        </div>
-      </details>
-      <details class="route-card sev-low" data-severity="low" data-search="/healthz health_check app.py get">
-        <summary>
+          <input type="checkbox" class="review-toggle" data-route-id="route-3" title="Mark reviewed" aria-label="Mark this route reviewed">
           <span class="methods"><span class="method m-get">GET</span></span>
           <span class="path">/healthz</span>
           <span class="handler">health_check</span>
@@ -562,6 +566,57 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 </div>
         </div>
       </details>
+      <details class="route-card sev-clean" data-severity="clean" data-methods="get" data-search="/account/profile get_profile app.py get">
+        <summary>
+          <input type="checkbox" class="review-toggle" data-route-id="route-4" title="Mark reviewed" aria-label="Mark this route reviewed">
+          <span class="methods"><span class="method m-get">GET</span></span>
+          <span class="path">/account/profile</span>
+          <span class="handler">get_profile</span>
+          <span class="loc">app.py:20</span>
+          <span class="tags"></span>
+        </summary>
+        <div class="route-body">
+          <p class="auth-note">auth: login_required</p>
+          <div class="findings"><p class="no-findings">No baseline findings on this route.</p></div>
+          
+    <div class="code-header">
+      <span class="code-path">app.py:20</span>
+      <a class="ide-link" href="vscode://file/C:/Users/lvpet/OneDrive/Documents/GitHub/Scripts/code-review/demo/sample-app/app.py:20">open in editor &rarr;</a>
+    </div><div class="code-block"><div class="highlight"><pre><span></span><span class="hll"><span class="linenos">20</span><span class="nd">@app</span><span class="o">.</span><span class="n">route</span><span class="p">(</span><span class="s2">"/account/profile"</span><span class="p">,</span> <span class="n">methods</span><span class="o">=</span><span class="p">[</span><span class="s2">"GET"</span><span class="p">])</span>
+</span><span class="linenos">21</span><span class="nd">@login_required</span>
+<span class="linenos">22</span><span class="k">def</span><span class="w"> </span><span class="nf">get_profile</span><span class="p">():</span>
+<span class="linenos">23</span>    <span class="k">return</span> <span class="p">{</span><span class="s2">"email"</span><span class="p">:</span> <span class="n">current_user</span><span class="o">.</span><span class="n">email</span><span class="p">,</span> <span class="s2">"name"</span><span class="p">:</span> <span class="n">current_user</span><span class="o">.</span><span class="n">name</span><span class="p">}</span>
+</pre></div>
+</div>
+        </div>
+      </details>
+      <details class="route-card sev-clean" data-severity="clean" data-methods="post" data-search="/account/profile update_profile app.py post">
+        <summary>
+          <input type="checkbox" class="review-toggle" data-route-id="route-5" title="Mark reviewed" aria-label="Mark this route reviewed">
+          <span class="methods"><span class="method m-post">POST</span></span>
+          <span class="path">/account/profile</span>
+          <span class="handler">update_profile</span>
+          <span class="loc">app.py:26</span>
+          <span class="tags"></span>
+        </summary>
+        <div class="route-body">
+          <p class="auth-note">auth: login_required</p>
+          <div class="findings"><p class="no-findings">No baseline findings on this route.</p></div>
+          
+    <div class="code-header">
+      <span class="code-path">app.py:26</span>
+      <a class="ide-link" href="vscode://file/C:/Users/lvpet/OneDrive/Documents/GitHub/Scripts/code-review/demo/sample-app/app.py:26">open in editor &rarr;</a>
+    </div><div class="code-block"><div class="highlight"><pre><span></span><span class="hll"><span class="linenos">26</span><span class="nd">@app</span><span class="o">.</span><span class="n">route</span><span class="p">(</span><span class="s2">"/account/profile"</span><span class="p">,</span> <span class="n">methods</span><span class="o">=</span><span class="p">[</span><span class="s2">"POST"</span><span class="p">])</span>
+</span><span class="linenos">27</span><span class="nd">@login_required</span>
+<span class="linenos">28</span><span class="k">def</span><span class="w"> </span><span class="nf">update_profile</span><span class="p">():</span>
+<span class="linenos">29</span>    <span class="n">payload</span> <span class="o">=</span> <span class="n">request</span><span class="o">.</span><span class="n">get_json</span><span class="p">()</span>
+<span class="linenos">30</span>    <span class="n">current_user</span><span class="o">.</span><span class="n">name</span> <span class="o">=</span> <span class="n">payload</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"name"</span><span class="p">)</span>
+<span class="linenos">31</span>    <span class="n">db</span><span class="o">.</span><span class="n">commit</span><span class="p">()</span>
+<span class="linenos">32</span>    <span class="k">return</span> <span class="p">{</span><span class="s2">"ok"</span><span class="p">:</span> <span class="kc">True</span><span class="p">}</span>
+</pre></div>
+</div>
+        </div>
+      </details>
     </section>
     <section class="group" data-lang="java">
       <h2 class="group-title">java / spring
@@ -569,8 +624,9 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
       </h2>
       
       
-      <details class="route-card sev-low" data-severity="low" data-search="/api/orders/{orderid} getorder ordercontroller.java get">
+      <details class="route-card sev-low" data-severity="low" data-methods="get" data-search="/api/orders/{orderid} getorder ordercontroller.java get">
         <summary>
+          <input type="checkbox" class="review-toggle" data-route-id="route-6" title="Mark reviewed" aria-label="Mark this route reviewed">
           <span class="methods"><span class="method m-get">GET</span></span>
           <span class="path">/api/orders/{orderId}</span>
           <span class="handler">getOrder</span>
@@ -605,8 +661,39 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 </div>
         </div>
       </details>
-      <details class="route-card sev-info" data-severity="info" data-search="/api/orders/{orderid}/refund refundorder ordercontroller.java post">
+      <details class="route-card sev-low" data-severity="low" data-methods="get" data-search="/api/orders/status status ordercontroller.java get">
         <summary>
+          <input type="checkbox" class="review-toggle" data-route-id="route-7" title="Mark reviewed" aria-label="Mark this route reviewed">
+          <span class="methods"><span class="method m-get">GET</span></span>
+          <span class="path">/api/orders/status</span>
+          <span class="handler">status</span>
+          <span class="loc">OrderController.java:23</span>
+          <span class="tags"><span class="tag sev-low">AUTH-001</span></span>
+        </summary>
+        <div class="route-body">
+          <p class="auth-note">auth: none detected</p>
+          <div class="findings">
+    <div class="finding sev-low">
+      <span class="finding-tag">AUTH-001</span>
+      <span class="finding-sev">Low</span>
+      <p class="finding-title">No recognized auth control detected on route</p>
+      <p class="finding-desc">No known auth decorator/middleware/annotation was found on this route. Confirm whether it&#x27;s intentionally public; if not, check for auth enforced elsewhere (global middleware, gateway, base class).</p>
+    </div></div>
+          
+    <div class="code-header">
+      <span class="code-path">OrderController.java:23</span>
+      <a class="ide-link" href="vscode://file/C:/Users/lvpet/OneDrive/Documents/GitHub/Scripts/code-review/demo/sample-app/OrderController.java:23">open in editor &rarr;</a>
+    </div><div class="code-block"><div class="highlight"><pre><span></span><span class="linenos">22</span><span class="w">    </span><span class="nd">@GetMapping</span><span class="p">(</span><span class="s">"/status"</span><span class="p">)</span>
+<span class="hll"><span class="linenos">23</span><span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="nf">status</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+</span><span class="linenos">24</span><span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="s">"ok"</span><span class="p">;</span>
+<span class="linenos">25</span><span class="w">    </span><span class="p">}</span>
+</pre></div>
+</div>
+        </div>
+      </details>
+      <details class="route-card sev-info" data-severity="info" data-methods="post" data-search="/api/orders/{orderid}/refund refundorder ordercontroller.java post">
+        <summary>
+          <input type="checkbox" class="review-toggle" data-route-id="route-8" title="Mark reviewed" aria-label="Mark this route reviewed">
           <span class="methods"><span class="method m-post">POST</span></span>
           <span class="path">/api/orders/{orderId}/refund</span>
           <span class="handler">refundOrder</span>
@@ -636,35 +723,6 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 </div>
         </div>
       </details>
-      <details class="route-card sev-low" data-severity="low" data-search="/api/orders/status status ordercontroller.java get">
-        <summary>
-          <span class="methods"><span class="method m-get">GET</span></span>
-          <span class="path">/api/orders/status</span>
-          <span class="handler">status</span>
-          <span class="loc">OrderController.java:23</span>
-          <span class="tags"><span class="tag sev-low">AUTH-001</span></span>
-        </summary>
-        <div class="route-body">
-          <p class="auth-note">auth: none detected</p>
-          <div class="findings">
-    <div class="finding sev-low">
-      <span class="finding-tag">AUTH-001</span>
-      <span class="finding-sev">Low</span>
-      <p class="finding-title">No recognized auth control detected on route</p>
-      <p class="finding-desc">No known auth decorator/middleware/annotation was found on this route. Confirm whether it&#x27;s intentionally public; if not, check for auth enforced elsewhere (global middleware, gateway, base class).</p>
-    </div></div>
-          
-    <div class="code-header">
-      <span class="code-path">OrderController.java:23</span>
-      <a class="ide-link" href="vscode://file/C:/Users/lvpet/OneDrive/Documents/GitHub/Scripts/code-review/demo/sample-app/OrderController.java:23">open in editor &rarr;</a>
-    </div><div class="code-block"><div class="highlight"><pre><span></span><span class="linenos">22</span><span class="w">    </span><span class="nd">@GetMapping</span><span class="p">(</span><span class="s">"/status"</span><span class="p">)</span>
-<span class="hll"><span class="linenos">23</span><span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="nf">status</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
-</span><span class="linenos">24</span><span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="s">"ok"</span><span class="p">;</span>
-<span class="linenos">25</span><span class="w">    </span><span class="p">}</span>
-</pre></div>
-</div>
-        </div>
-      </details>
     </section>
     <section class="group" data-lang="javascript">
       <h2 class="group-title">javascript / express
@@ -672,8 +730,9 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
       </h2>
       
       
-      <details class="route-card sev-low" data-severity="low" data-search="/accounts/:accountid/balance &lt;inline handler&gt; server.js get">
+      <details class="route-card sev-low" data-severity="low" data-methods="get" data-search="/accounts/:accountid/balance &lt;inline handler&gt; server.js get">
         <summary>
+          <input type="checkbox" class="review-toggle" data-route-id="route-9" title="Mark reviewed" aria-label="Mark this route reviewed">
           <span class="methods"><span class="method m-get">GET</span></span>
           <span class="path">/accounts/:accountId/balance</span>
           <span class="handler">&lt;inline handler&gt;</span>
@@ -707,8 +766,38 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 </div>
         </div>
       </details>
-      <details class="route-card sev-info" data-severity="info" data-search="/accounts/:accountid/transfer accounts.transfer server.js post">
+      <details class="route-card sev-low" data-severity="low" data-methods="get" data-search="/ping &lt;inline handler&gt; server.js get">
         <summary>
+          <input type="checkbox" class="review-toggle" data-route-id="route-10" title="Mark reviewed" aria-label="Mark this route reviewed">
+          <span class="methods"><span class="method m-get">GET</span></span>
+          <span class="path">/ping</span>
+          <span class="handler">&lt;inline handler&gt;</span>
+          <span class="loc">server.js:12</span>
+          <span class="tags"><span class="tag sev-low">AUTH-001</span></span>
+        </summary>
+        <div class="route-body">
+          <p class="auth-note">auth: none detected</p>
+          <div class="findings">
+    <div class="finding sev-low">
+      <span class="finding-tag">AUTH-001</span>
+      <span class="finding-sev">Low</span>
+      <p class="finding-title">No recognized auth control detected on route</p>
+      <p class="finding-desc">No known auth decorator/middleware/annotation was found on this route. Confirm whether it&#x27;s intentionally public; if not, check for auth enforced elsewhere (global middleware, gateway, base class).</p>
+    </div></div>
+          
+    <div class="code-header">
+      <span class="code-path">server.js:12</span>
+      <a class="ide-link" href="vscode://file/C:/Users/lvpet/OneDrive/Documents/GitHub/Scripts/code-review/demo/sample-app/server.js:12">open in editor &rarr;</a>
+    </div><div class="code-block"><div class="highlight"><pre><span></span><span class="hll"><span class="linenos">12</span><span class="nx">app</span><span class="p">.</span><span class="nx">get</span><span class="p">(</span><span class="s1">'/ping'</span><span class="p">,</span><span class="w"> </span><span class="kd">function</span><span class="w"> </span><span class="p">(</span><span class="nx">req</span><span class="p">,</span><span class="w"> </span><span class="nx">res</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+</span><span class="linenos">13</span><span class="w">  </span><span class="nx">res</span><span class="p">.</span><span class="nx">send</span><span class="p">(</span><span class="s1">'pong'</span><span class="p">);</span>
+<span class="linenos">14</span><span class="p">});</span>
+</pre></div>
+</div>
+        </div>
+      </details>
+      <details class="route-card sev-info" data-severity="info" data-methods="post" data-search="/accounts/:accountid/transfer accounts.transfer server.js post">
+        <summary>
+          <input type="checkbox" class="review-toggle" data-route-id="route-11" title="Mark reviewed" aria-label="Mark this route reviewed">
           <span class="methods"><span class="method m-post">POST</span></span>
           <span class="path">/accounts/:accountId/transfer</span>
           <span class="handler">accounts.transfer</span>
@@ -737,40 +826,13 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 </div>
         </div>
       </details>
-      <details class="route-card sev-low" data-severity="low" data-search="/ping &lt;inline handler&gt; server.js get">
-        <summary>
-          <span class="methods"><span class="method m-get">GET</span></span>
-          <span class="path">/ping</span>
-          <span class="handler">&lt;inline handler&gt;</span>
-          <span class="loc">server.js:12</span>
-          <span class="tags"><span class="tag sev-low">AUTH-001</span></span>
-        </summary>
-        <div class="route-body">
-          <p class="auth-note">auth: none detected</p>
-          <div class="findings">
-    <div class="finding sev-low">
-      <span class="finding-tag">AUTH-001</span>
-      <span class="finding-sev">Low</span>
-      <p class="finding-title">No recognized auth control detected on route</p>
-      <p class="finding-desc">No known auth decorator/middleware/annotation was found on this route. Confirm whether it&#x27;s intentionally public; if not, check for auth enforced elsewhere (global middleware, gateway, base class).</p>
-    </div></div>
-          
-    <div class="code-header">
-      <span class="code-path">server.js:12</span>
-      <a class="ide-link" href="vscode://file/C:/Users/lvpet/OneDrive/Documents/GitHub/Scripts/code-review/demo/sample-app/server.js:12">open in editor &rarr;</a>
-    </div><div class="code-block"><div class="highlight"><pre><span></span><span class="hll"><span class="linenos">12</span><span class="nx">app</span><span class="p">.</span><span class="nx">get</span><span class="p">(</span><span class="s1">'/ping'</span><span class="p">,</span><span class="w"> </span><span class="kd">function</span><span class="w"> </span><span class="p">(</span><span class="nx">req</span><span class="p">,</span><span class="w"> </span><span class="nx">res</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
-</span><span class="linenos">13</span><span class="w">  </span><span class="nx">res</span><span class="p">.</span><span class="nx">send</span><span class="p">(</span><span class="s1">'pong'</span><span class="p">);</span>
-<span class="linenos">14</span><span class="p">});</span>
-</pre></div>
-</div>
-        </div>
-      </details>
     </section>
     </main>
   </div>
 </div>
 
 <script>
+const REPORT_ID = "9b466b11faad";
 
 document.getElementById('expand-all').addEventListener('click', () => {
   document.querySelectorAll('details.route-card').forEach(d => d.open = true);
@@ -782,11 +844,15 @@ document.getElementById('collapse-all').addEventListener('click', () => {
 const search = document.getElementById('search');
 const sevBoxes = document.querySelectorAll('.f-sev');
 const langBoxes = document.querySelectorAll('.f-lang');
+const methodBoxes = document.querySelectorAll('.f-method');
+const hideReviewed = document.getElementById('hide-reviewed');
 
 function applyFilters() {
   const q = search.value.trim().toLowerCase();
   const activeSev = new Set([...sevBoxes].filter(b => b.checked).map(b => b.value));
   const activeLang = new Set([...langBoxes].filter(b => b.checked).map(b => b.value));
+  const activeMethod = new Set([...methodBoxes].filter(b => b.checked).map(b => b.value));
+  const hideDone = hideReviewed.checked;
 
   document.querySelectorAll('section.group').forEach(section => {
     let anyVisible = false;
@@ -794,7 +860,10 @@ function applyFilters() {
     section.querySelectorAll('details.route-card').forEach(card => {
       const textOk = !q || card.dataset.search.includes(q);
       const sevOk = activeSev.has(card.dataset.severity);
-      const visible = langOk && textOk && sevOk;
+      const methods = card.dataset.methods ? card.dataset.methods.split(' ') : [];
+      const methodOk = methods.length === 0 || methods.some(m => activeMethod.has(m));
+      const reviewedOk = !hideDone || !card.classList.contains('reviewed');
+      const visible = langOk && textOk && sevOk && methodOk && reviewedOk;
       card.style.display = visible ? '' : 'none';
       if (visible) anyVisible = true;
     });
@@ -805,6 +874,97 @@ function applyFilters() {
 search.addEventListener('input', applyFilters);
 sevBoxes.forEach(b => b.addEventListener('change', applyFilters));
 langBoxes.forEach(b => b.addEventListener('change', applyFilters));
+methodBoxes.forEach(b => b.addEventListener('change', applyFilters));
+hideReviewed.addEventListener('change', applyFilters);
+
+// --- Sort ---
+const SORT_SEVERITY_RANK = { high: 0, medium: 1, low: 2, info: 3, clean: 4 };
+const sortSelect = document.getElementById('sort-select');
+
+function sortValue(card, key) {
+  if (key === 'severity') return SORT_SEVERITY_RANK[card.dataset.severity] ?? 9;
+  if (key === 'path') return card.querySelector('.path').textContent.trim().toLowerCase();
+  if (key === 'method') return (card.dataset.methods || '').split(' ')[0] || '';
+  if (key === 'file') return card.querySelector('.loc').textContent.trim().toLowerCase();
+  return 0;
+}
+
+function applySort() {
+  const key = sortSelect.value;
+  document.querySelectorAll('section.group').forEach(section => {
+    const cards = [...section.querySelectorAll('details.route-card')];
+    cards.sort((a, b) => {
+      const va = sortValue(a, key), vb = sortValue(b, key);
+      if (va < vb) return -1;
+      if (va > vb) return 1;
+      return 0;
+    });
+    cards.forEach(c => section.appendChild(c));
+  });
+}
+
+sortSelect.addEventListener('change', applySort);
+
+// --- Reviewed checklist (persisted per-report in localStorage) ---
+const STORAGE_KEY = 'appsec-review:' + REPORT_ID + ':reviewed';
+
+function loadReviewed() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return new Set(raw ? JSON.parse(raw) : []);
+  } catch (e) {
+    return new Set();
+  }
+}
+
+function saveReviewed() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify([...reviewed]));
+  } catch (e) {
+    // storage unavailable (private browsing, restrictive file:// policy,
+    // storage full, ...) -- reviewed state just won't persist on reload.
+  }
+}
+
+let reviewed = loadReviewed();
+const reviewToggles = document.querySelectorAll('.review-toggle');
+
+function updateReviewedStat() {
+  const stat = document.getElementById('reviewed-stat');
+  if (stat) stat.textContent = reviewed.size + ' / ' + reviewToggles.length;
+}
+
+function applyReviewedState() {
+  reviewToggles.forEach(cb => {
+    const isReviewed = reviewed.has(cb.dataset.routeId);
+    cb.checked = isReviewed;
+    cb.closest('details.route-card').classList.toggle('reviewed', isReviewed);
+  });
+  updateReviewedStat();
+}
+
+reviewToggles.forEach(cb => {
+  cb.addEventListener('click', (e) => {
+    // Without this, clicking the checkbox also toggles the parent
+    // <details> open/closed, since the click bubbles up through <summary>.
+    e.stopPropagation();
+    const id = cb.dataset.routeId;
+    if (cb.checked) reviewed.add(id); else reviewed.delete(id);
+    cb.closest('details.route-card').classList.toggle('reviewed', cb.checked);
+    saveReviewed();
+    updateReviewedStat();
+    if (hideReviewed.checked) applyFilters();
+  });
+});
+
+document.getElementById('reset-reviewed').addEventListener('click', () => {
+  reviewed.clear();
+  saveReviewed();
+  applyReviewedState();
+  if (hideReviewed.checked) applyFilters();
+});
+
+applyReviewedState();
 
 </script>
 </body>
