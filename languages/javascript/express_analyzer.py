@@ -57,9 +57,25 @@ KNOWN_AUTH_INDICATORS = {
 
 _INLINE_HANDLER_TYPES = {"arrow_function", "function", "function_expression"}
 
+# supertest's persistent-agent API (`supertest.agent(app)`) is called
+# directly as `agent.get('/path')` -- if someone names that agent "app" or
+# "router" (both plausible in a test file that also imports the real app
+# under that name), it parses identically to a real route registration.
+# Only test files pay the cost of this extra check: skip a match when the
+# base name isn't a *confirmed* express()/Router() object AND the file
+# imports supertest.
+_SUPERTEST_IMPORT_MARKERS = (
+    "require('supertest')", 'require("supertest")',
+    "from 'supertest'", 'from "supertest"',
+)
+
 
 def _parser_for(path: Path) -> Parser:
     return Parser(_TS_LANGUAGE) if path.suffix == ".ts" else Parser(_JS_LANGUAGE)
+
+
+def _imports_supertest(text: str) -> bool:
+    return any(marker in text for marker in _SUPERTEST_IMPORT_MARKERS)
 
 
 def _node_text(node: Node, src: bytes) -> str:
@@ -85,9 +101,9 @@ def _iter_nodes(node: Node):
         yield from _iter_nodes(child)
 
 
-def _extract_route_call(node: Node, src: bytes) -> tuple[str, str, list[str]] | None:
-    """Return (verb, path, [middleware/handler arg descriptions]) if `node`
-    is an `app.<verb>(path, ...)` / `router.<verb>(path, ...)` call.
+def _extract_route_call(node: Node, src: bytes) -> tuple[str, str, str, list[str]] | None:
+    """Return (object_name, verb, path, [middleware/handler arg descriptions])
+    if `node` is an `app.<verb>(path, ...)` / `router.<verb>(path, ...)` call.
     """
     if node.type != "call_expression":
         return None
@@ -100,7 +116,8 @@ def _extract_route_call(node: Node, src: bytes) -> tuple[str, str, list[str]] | 
     prop = func.child_by_field_name("property")
     if obj is None or prop is None or obj.type != "identifier":
         return None
-    if _node_text(obj, src) not in _ROUTER_OBJECT_NAMES:
+    obj_name = _node_text(obj, src)
+    if obj_name not in _ROUTER_OBJECT_NAMES:
         return None
 
     verb = _node_text(prop, src)
@@ -115,7 +132,41 @@ def _extract_route_call(node: Node, src: bytes) -> tuple[str, str, list[str]] | 
         return None
 
     path = _string_value(args[0], src) or ""
-    return verb, path, [_describe_arg(a, src) for a in args[1:]]
+    return obj_name, verb, path, [_describe_arg(a, src) for a in args[1:]]
+
+
+def _is_express_constructor_call(node: Node, src: bytes) -> bool:
+    """True for `express()` or `<anything>.Router(...)` -- covers
+    `require('express')()` under any import alias.
+    """
+    if node.type != "call_expression":
+        return False
+    func = node.child_by_field_name("function")
+    if func is None:
+        return False
+    text = _node_text(func, src)
+    return text == "express" or text.endswith(".Router")
+
+
+def _locally_declared_names(root: Node, src: bytes) -> dict[str, bool]:
+    """Map every name this *one file* declares via `const/let/var name = ...`
+    to whether that declaration is an express()/Router() constructor call.
+
+    Deliberately per-file, not project-wide: JS variable binding is scoped
+    per file, so if this file shadows "app" with something else (e.g. a
+    supertest agent), that's what matters here -- not what "app" happens to
+    resolve to in some other file entirely.
+    """
+    declared: dict[str, bool] = {}
+    for node in _iter_nodes(root):
+        if node.type != "variable_declarator":
+            continue
+        name_node = node.child_by_field_name("name")
+        value_node = node.child_by_field_name("value")
+        if name_node is None or value_node is None or name_node.type != "identifier":
+            continue
+        declared[_node_text(name_node, src)] = _is_express_constructor_call(value_node, src)
+    return declared
 
 
 def _iter_named_function_defs(root: Node, src: bytes):
@@ -171,17 +222,29 @@ class ExpressAnalyzer(BaseFrameworkAnalyzer):
         handler_index = _build_handler_index(self.target_path)
 
         for src_file in iter_files(self.target_path, (".js", ".ts")):
-            src = read_text_safe(src_file).encode("utf-8")
-            if not src:
+            text = read_text_safe(src_file)
+            if not text:
                 continue
+            src = text.encode("utf-8")
+            imports_supertest = _imports_supertest(text)
 
             tree = _parser_for(src_file).parse(src)
+            locally_declared = _locally_declared_names(tree.root_node, src)
 
             for node in _iter_nodes(tree.root_node):
                 extracted = _extract_route_call(node, src)
                 if extracted is None:
                     continue
-                verb, path, rest_args = extracted
+                obj_name, verb, path, rest_args = extracted
+
+                # Only skip when this *same file* shadows the name with
+                # something that's provably not an express()/Router() AND
+                # the file imports supertest. A name this file doesn't
+                # declare at all (imported from elsewhere, the common
+                # cross-file app pattern) is still claimed by default.
+                declared_as_express = locally_declared.get(obj_name)
+                if declared_as_express is False and imports_supertest:
+                    continue
 
                 handler_name = rest_args[-1] if rest_args else "?"
                 middleware_names = rest_args[:-1]

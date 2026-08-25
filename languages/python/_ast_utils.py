@@ -75,6 +75,29 @@ def parse_source(text: str, filename: str) -> ast.AST | None:
         return None
 
 
+def mock_import_names(tree: ast.AST) -> set[str]:
+    """Local names bound to `unittest.mock` (module or its `patch`), so
+    route-decorator matching can tell `@patch(...)` / `@mock.patch(...)`
+    test mocks apart from real `@app.patch(...)` routes -- both parse to a
+    decorator literally named "patch", and mock.patch is one of the most
+    common decorators in any Flask/FastAPI test suite.
+    """
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.module in ("unittest.mock", "mock"):
+                names.update(alias.asname or alias.name for alias in node.names)
+            elif node.module == "unittest":
+                names.update(alias.asname or alias.name for alias in node.names if alias.name == "mock")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in ("unittest.mock", "mock"):
+                    # `import unittest.mock` (no `as`) binds the name
+                    # "unittest", not "mock" -- only `as` rebinds the leaf.
+                    names.add(alias.asname or alias.name.split(".")[0])
+    return names
+
+
 def source_range(node: DecoratedNode) -> tuple[int, int]:
     """Full (start_line, end_line), 1-indexed inclusive, covering this
     def/class's decorators (if any) through its last line -- what an HTML

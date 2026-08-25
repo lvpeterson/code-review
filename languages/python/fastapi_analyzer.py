@@ -19,6 +19,7 @@ from languages.python._app_index import build_app_object_index
 from languages.python._ast_utils import (
     dotted_name,
     iter_functions,
+    mock_import_names,
     parse_decorators,
     parse_source,
     source_range,
@@ -65,6 +66,7 @@ class FastAPIAnalyzer(BaseFrameworkAnalyzer):
             tree = parse_source(text, str(py_file))
             if tree is None:
                 continue
+            mock_names = mock_import_names(tree)
 
             for func in iter_functions(tree):
                 decorators = parse_decorators(func)
@@ -75,11 +77,19 @@ class FastAPIAnalyzer(BaseFrameworkAnalyzer):
                 if route_deco is None:
                     continue
 
+                base_name = route_deco.dotted.split(".", 1)[0]
+
+                # `@patch(...)` / `@mock.patch(...)` from unittest.mock parse
+                # identically to a bare "patch" route decorator -- extremely
+                # common in test files, so exclude anything bound to
+                # unittest.mock before it's ever treated as a route.
+                if base_name in mock_names:
+                    continue
+
                 # FastAPI's @app.get/@app.post are syntactically identical to
                 # Flask's 2.x shortcuts -- only skip when we can prove this
                 # object is actually a Flask/Blueprint instance. Leave it
                 # claimed if unresolved (e.g. `app` imported from elsewhere).
-                base_name = route_deco.dotted.split(".", 1)[0]
                 if app_index.get(base_name) == "flask":
                     continue
 

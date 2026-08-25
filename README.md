@@ -123,6 +123,16 @@ duplicate you can tell apart by which app object it actually decorates.
 Django doesn't need this treatment -- its urls.py registration syntax
 doesn't overlap with Flask/FastAPI's decorator syntax at all.
 
+There's a second, unrelated collision worth knowing about if you extend
+these analyzers: `unittest.mock.patch` -- used constantly in test files as
+`@patch(...)` or `@mock.patch(...)` -- parses to a decorator literally named
+"patch", identical to `@app.patch(...)`. `mock_import_names()` in
+`_ast_utils.py` tracks what a file imports from `unittest.mock` (module
+alias, `from ... import patch`, `from unittest import mock`, etc) so both
+analyzers can exclude it before it's ever treated as a route. If you add a
+new HTTP-verb-named check anywhere, check whether some other common
+decorator happens to share that name the same way.
+
 ## Populating the HTML report's code view
 
 The HTML report's expandable code block comes from three optional `Route`
@@ -147,6 +157,29 @@ routes at all yet.
 - `checks/idor.py` only flags the presence of an id-like path param -- it
   doesn't (yet) inspect the handler body for an ownership check. That's the
   natural next thing to build now that route extraction is AST-precise.
+  It's also whole-word-aware (`_is_id_like()`), not substring matching --
+  `valid`/`width`/`hidden`/`provider`/`guide` all *contain* "id"/"uuid"
+  as a substring without being object identifiers, so a naive substring
+  check drowns real findings in noise.
+- `_extract_route_call()` in `express_analyzer.py` only skips a match when
+  *this same file* locally shadows `app`/`router` with something proven
+  not to be `express()`/`.Router()` **and** the file imports `supertest`
+  (`agent.get('/path')` from a persistent supertest agent named "app"
+  parses identically to a real route registration). Deliberately per-file,
+  not project-wide, since JS variable binding is scoped per file -- the
+  same name being a real Express object in one file says nothing about
+  what it is in another.
+- Two lower-probability collisions along the same lines that aren't handled
+  yet, if you run into them: a Flask app coexisting with the (unrelated)
+  Bottle framework, which also exports a bare `@route(...)` decorator; and
+  `auth_decorators` in Flask/FastAPI/Express currently lists *every*
+  non-route decorator/middleware/`Depends()` target, not just ones
+  matching `KNOWN_AUTH_INDICATORS` (Spring and Django already filter to
+  known indicators only) -- so the HTML report's "auth: ..." line can show
+  an unrelated decorator (e.g. a caching one) on an actually-unprotected
+  route. Harmless to the AUTH-001 check itself (it only alerts on the
+  *absence* of a known indicator), just a cosmetic mismatch worth tightening
+  if it causes confusion in practice.
 - Express's `_ROUTER_OBJECT_NAMES` only recognizes variables literally named
   `app`/`router` -- it doesn't trace `const foo = express.Router()` to catch
   arbitrary variable names. Extend `_extract_route_call` if this codebase
