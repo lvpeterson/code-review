@@ -12,11 +12,12 @@ def detect_language(target_path: Path) -> bool:
     return any(True for _ in iter_files(target_path, (".rb",)))
 
 
-def detect_framework(target_path: Path) -> str | None:
-    """Return "rails" | "sinatra" | None."""
+def detect_frameworks(target_path: Path) -> list[str]:
+    """Return every framework detected: "rails" and/or "sinatra"."""
     gemfile_text = read_text_safe(target_path / "Gemfile").lower()
+    found: list[str] = []
     if "rails" in gemfile_text or any_file_exists(target_path, "config/routes.rb"):
-        return "rails"
+        found.append("rails")
     if "sinatra" in gemfile_text:
-        return "sinatra"
-    return None
+        found.append("sinatra")
+    return found

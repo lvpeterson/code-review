@@ -73,3 +73,13 @@ def parse_source(text: str, filename: str) -> ast.AST | None:
         return ast.parse(text, filename=filename)
     except SyntaxError:
         return None
+
+
+def source_range(node: DecoratedNode) -> tuple[int, int]:
+    """Full (start_line, end_line), 1-indexed inclusive, covering this
+    def/class's decorators (if any) through its last line -- what an HTML
+    report would want to show as "the code for this handler".
+    """
+    start = min([node.lineno, *(d.lineno for d in node.decorator_list)])
+    end = node.end_lineno if node.end_lineno is not None else node.lineno
+    return start, end

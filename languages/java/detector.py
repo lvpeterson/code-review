@@ -14,8 +14,8 @@ def detect_language(target_path: Path) -> bool:
     return any(True for _ in iter_files(target_path, (".java",)))
 
 
-def detect_framework(target_path: Path) -> str | None:
-    """Return "spring" | None.
+def detect_frameworks(target_path: Path) -> list[str]:
+    """Return every framework detected -- currently just ["spring"] or [].
 
     TODO: add detect for other Java frameworks as needed (Struts, JAX-RS/
     Jersey, Micronaut, Quarkus) -- follow the same pattern as spring below.
@@ -25,11 +25,11 @@ def detect_framework(target_path: Path) -> str | None:
         manifest_text += read_text_safe(target_path / name).lower()
 
     if "spring-boot" in manifest_text or "springframework" in manifest_text:
-        return "spring"
+        return ["spring"]
 
     for java_file in iter_files(target_path, (".java",)):
         text = read_text_safe(java_file)
         if "org.springframework" in text or "@SpringBootApplication" in text:
-            return "spring"
+            return ["spring"]
 
-    return None
+    return []

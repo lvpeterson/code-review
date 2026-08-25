@@ -12,15 +12,15 @@ def detect_language(target_path: Path) -> bool:
     return any(True for _ in iter_files(target_path, (".go",)))
 
 
-def detect_framework(target_path: Path) -> str | None:
-    """Return "gin" | "net/http" | None.
+def detect_frameworks(target_path: Path) -> list[str]:
+    """Return every framework detected: "gin" and/or "net_http".
 
     TODO: this is a stub -- only distinguishes gin vs stdlib net/http via
     go.mod. Add gorilla/mux, echo, fiber, etc following this same pattern.
     """
     mod_text = read_text_safe(target_path / "go.mod").lower()
     if "gin-gonic/gin" in mod_text:
-        return "gin"
+        return ["gin"]
     if any(True for _ in iter_files(target_path, (".go",))):
-        return "net_http"
-    return None
+        return ["net_http"]
+    return []

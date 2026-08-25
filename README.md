@@ -11,8 +11,17 @@ first. Nothing here proves a vulnerability -- it's triage tooling.
 pip install -r requirements.txt
 python main.py <target_path>
 python main.py <target_path> --json report.json
+python main.py <target_path> --html report.html
 python main.py <target_path> --language python --framework flask   # skip detection
 ```
+
+`--html` writes a single self-contained HTML file (no external assets, so it
+opens fine offline) with one collapsible card per route. Expanding a card
+shows the full handler source with line numbers, the associated baseline
+findings, and an "open in editor" link (`vscode://file/...`) that jumps
+straight to that file:line if VS Code is installed. It also has a search box
+and severity/language filters in the sidebar for scanning a large codebase's
+worth of routes quickly.
 
 ## Layout
 
@@ -25,11 +34,12 @@ core/
   registry.py                @register("language", "framework") decorator + lookup
   fsutil.py                   file-walking helpers shared by detectors/analyzers
   report.py                    console + JSON output
+  html_report.py                self-contained interactive HTML report
 checks/                    framework-agnostic heuristics, operate on Route objects
   idor.py                    flags routes with id-like path params
   auth.py                    flags routes with no recognized auth decorator/middleware
 languages/<lang>/
-  detector.py               detect_language() / detect_framework() for that language
+  detector.py               detect_language() / detect_frameworks() for that language
   <framework>_analyzer.py    route extraction + baseline checks for one framework
 ```
 
@@ -37,6 +47,14 @@ Currently implemented (route extraction + baseline checks):
 - **python**: flask, fastapi, django
 - **java**: spring
 - **javascript**: express
+
+`detect_frameworks()` returns a *list* -- a codebase can trip more than one
+framework in the same language (e.g. a Flask app that's grown FastAPI
+services alongside it mid-migration), and each gets its own deep-dive and
+its own section in the report, rather than one silently winning detection
+and the other's routes going unscanned. See "Multiple frameworks in one
+language" below for how Flask/FastAPI specifically avoid double-counting
+the same route when both are present.
 
 Detection-only stubs (framework gets identified but analyzer returns empty +
 a note -- fill these in following the pattern of an implemented one):
@@ -50,13 +68,13 @@ a note -- fill these in following the pattern of an implemented one):
    `BaseFrameworkAnalyzer` and implementing `find_routes()` +
    `run_baseline_checks()`. Decorate the class with
    `@register("<lang>", "<framework>")`.
-2. Teach `languages/<lang>/detector.py`'s `detect_framework()` to recognize it.
+2. Teach `languages/<lang>/detector.py`'s `detect_frameworks()` to recognize it.
 3. Import the new module in `languages/<lang>/__init__.py`.
 
 ## Adding a new language
 
 1. Create `languages/<newlang>/` with `detector.py` (`detect_language()` +
-   `detect_framework()`) and one `<framework>_analyzer.py` per framework.
+   `detect_frameworks()`) and one `<framework>_analyzer.py` per framework.
 2. Add an `__init__.py` that imports the detector and every analyzer module
    (this is what triggers registration).
 3. Import the new package in `languages/__init__.py` and add it to
@@ -82,6 +100,43 @@ The stub languages (go, ruby, dotnet) don't have a parser wired in yet.
 Reasonable options when you get there: `go/ast` via a small Go helper
 binary for Go, `tree-sitter-ruby`/`tree-sitter-c-sharp` (same tree-sitter
 pattern as Express) for Ruby/.NET.
+
+## Multiple frameworks in one language
+
+Flask 2.x's shortcut decorators (`@app.get(...)`, `@app.post(...)`) are
+syntactically identical to FastAPI's -- decorator name alone can't tell them
+apart. So `flask_analyzer.py` and `fastapi_analyzer.py` both consult a
+shared index (`languages/python/_app_index.py`) built by scanning every
+module for the actual constructor call (`Flask(...)`, `Blueprint(...)`,
+`FastAPI(...)`, `APIRouter(...)`) each variable name is assigned to, and
+each analyzer **vetoes** a match only when it can prove the object belongs
+to the *other* framework.
+
+If a name can't be resolved at all (most commonly: `app` constructed in one
+module and imported into the blueprint/router modules that decorate
+routes on it -- extremely common in both frameworks), both analyzers claim
+it by default rather than either dropping it. That means a handful of
+ambiguous cases can appear in both the Flask and FastAPI sections of the
+report; that's the deliberate tradeoff, since under-reporting (silently
+missing routes) is worse for an appsec triage tool than an occasional
+duplicate you can tell apart by which app object it actually decorates.
+Django doesn't need this treatment -- its urls.py registration syntax
+doesn't overlap with Flask/FastAPI's decorator syntax at all.
+
+## Populating the HTML report's code view
+
+The HTML report's expandable code block comes from three optional `Route`
+fields: `source_file` (defaults to `file` when unset), `source_start_line`,
+`source_end_line`. When an analyzer can resolve a handler's full body range
+it should set these -- see `languages/python/_ast_utils.py:source_range()`
+(stdlib `ast` gives exact start/end lines for free), the brace-counting
+`_method_end_line()` in `spring_analyzer.py` (javalang doesn't expose an end
+position), or tree-sitter's `node.start_point`/`end_point` in
+`express_analyzer.py` (exact by construction). If an analyzer leaves them
+unset, the report just falls back to showing the single registration line
+with a note that the body wasn't automatically resolved -- the stub
+languages (go, ruby, dotnet) currently do this since they don't extract
+routes at all yet.
 
 ## Notes on the current heuristics
 

@@ -17,6 +17,17 @@ class Route:
     auth_decorators: list[str] = field(default_factory=list)
     raw_snippet: str = ""
 
+    # Full source range of the handler implementation, for the HTML report's
+    # expandable code view. `source_file` defaults to `file` when unset --
+    # only set it when the handler lives elsewhere (e.g. Django's urls.py
+    # registration vs. the view function's actual file in views.py).
+    # Left as None when an analyzer couldn't resolve the handler's body
+    # (e.g. an Express route passed a handler name it couldn't trace) --
+    # the report then falls back to showing just the registration line.
+    source_file: Optional[str] = None
+    source_start_line: Optional[int] = None
+    source_end_line: Optional[int] = None
+
     # Freeform bucket for framework-specific extras (e.g. Spring class-level
     # @RequestMapping prefix, Django view class name, etc). Deep-dive
     # analyzers can stash whatever they need here without changing the schema.

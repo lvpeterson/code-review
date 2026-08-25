@@ -15,11 +15,13 @@ from core.base import BaseFrameworkAnalyzer
 from core.fsutil import iter_files, read_text_safe
 from core.models import Finding, Route
 from core.registry import register
+from languages.python._app_index import build_app_object_index
 from languages.python._ast_utils import (
     dotted_name,
     iter_functions,
     parse_decorators,
     parse_source,
+    source_range,
 )
 
 _HTTP_METHODS = {"get", "post", "put", "patch", "delete", "options", "head"}
@@ -56,6 +58,7 @@ def _depends_targets(func) -> list[str]:
 class FastAPIAnalyzer(BaseFrameworkAnalyzer):
     def find_routes(self) -> list[Route]:
         routes: list[Route] = []
+        app_index = build_app_object_index(self.target_path)
 
         for py_file in iter_files(self.target_path, (".py",)):
             text = read_text_safe(py_file)
@@ -72,8 +75,17 @@ class FastAPIAnalyzer(BaseFrameworkAnalyzer):
                 if route_deco is None:
                     continue
 
+                # FastAPI's @app.get/@app.post are syntactically identical to
+                # Flask's 2.x shortcuts -- only skip when we can prove this
+                # object is actually a Flask/Blueprint instance. Leave it
+                # claimed if unresolved (e.g. `app` imported from elsewhere).
+                base_name = route_deco.dotted.split(".", 1)[0]
+                if app_index.get(base_name) == "flask":
+                    continue
+
                 path = route_deco.args[0] if isinstance(route_deco.args[0], str) else "?"
                 auth_decorators = _depends_targets(func)
+                start_line, end_line = source_range(func)
 
                 routes.append(
                     Route(
@@ -84,6 +96,8 @@ class FastAPIAnalyzer(BaseFrameworkAnalyzer):
                         line=route_deco.node.lineno,
                         auth_decorators=auth_decorators,
                         raw_snippet=f"@{route_deco.dotted}(...) def {func.name}(...)",
+                        source_start_line=start_line,
+                        source_end_line=end_line,
                     )
                 )
 

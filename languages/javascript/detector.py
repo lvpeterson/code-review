@@ -13,8 +13,8 @@ def detect_language(target_path: Path) -> bool:
     return any(True for _ in iter_files(target_path, (".js", ".ts")))
 
 
-def detect_framework(target_path: Path) -> str | None:
-    """Return "express" | None.
+def detect_frameworks(target_path: Path) -> list[str]:
+    """Return every framework detected -- currently just ["express"] or [].
 
     TODO: add detect for other JS frameworks (NestJS, Koa, Hapi, Fastify) --
     follow the same pattern as express below.
@@ -27,11 +27,11 @@ def detect_framework(target_path: Path) -> str | None:
             data = {}
         deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
         if "express" in deps:
-            return "express"
+            return ["express"]
 
     for src_file in iter_files(target_path, (".js", ".ts")):
         text = read_text_safe(src_file)
         if "require('express')" in text or 'require("express")' in text or "from 'express'" in text or 'from "express"' in text:
-            return "express"
+            return ["express"]
 
-    return None
+    return []

@@ -14,31 +14,36 @@ def detect_language(target_path: Path) -> bool:
     return any(True for _ in iter_files(target_path, (".py",)))
 
 
-def detect_framework(target_path: Path) -> str | None:
-    """Return "flask" | "fastapi" | "django" | None.
-
-    Checks dependency manifests first (cheap, high-confidence), then falls
-    back to scanning source for import statements.
+def detect_frameworks(target_path: Path) -> list[str]:
+    """Return every framework this Python codebase appears to use -- a repo
+    migrating from Flask to FastAPI (or otherwise running both) reports both,
+    so each gets its own deep-dive instead of one silently winning and the
+    other's routes going unscanned.
     """
     manifest_text = ""
     for name in _LANGUAGE_SIGNAL_FILES:
         manifest_text += read_text_safe(target_path / name).lower()
 
+    found: set[str] = set()
     if "django" in manifest_text or any_file_exists(target_path, "manage.py"):
-        return "django"
+        found.add("django")
     if "fastapi" in manifest_text:
-        return "fastapi"
+        found.add("fastapi")
     if "flask" in manifest_text:
-        return "flask"
+        found.add("flask")
 
-    # Manifest didn't tell us -- fall back to scanning source for imports.
+    if found:
+        return sorted(found)
+
+    # Manifest didn't tell us anything -- fall back to scanning source for
+    # imports (slower, so only done when the manifest was no help at all).
     for py_file in iter_files(target_path, (".py",)):
         text = read_text_safe(py_file)
         if "django" in text and ("django.db" in text or "django.urls" in text or "settings" in py_file.name):
-            return "django"
+            found.add("django")
         if "from fastapi" in text or "import fastapi" in text:
-            return "fastapi"
+            found.add("fastapi")
         if "from flask" in text or "import flask" in text:
-            return "flask"
+            found.add("flask")
 
-    return None
+    return sorted(found)

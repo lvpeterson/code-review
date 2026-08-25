@@ -10,6 +10,7 @@ of by guessing at a line-number window) and look up each view by name.
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass, field
 
 from checks import auth as auth_checks
 from checks import idor as idor_checks
@@ -17,7 +18,7 @@ from core.base import BaseFrameworkAnalyzer
 from core.fsutil import iter_files, read_text_safe
 from core.models import Finding, Route
 from core.registry import register
-from languages.python._ast_utils import dotted_name, literal, parse_decorators, parse_source
+from languages.python._ast_utils import dotted_name, literal, parse_decorators, parse_source, source_range
 
 _URL_FUNCS = {"path", "re_path", "url"}
 
@@ -29,6 +30,18 @@ KNOWN_AUTH_INDICATORS = {
     "IsAuthenticated",
     "permission_classes",
 }
+
+
+@dataclass
+class _ViewInfo:
+    """Where a view function/class actually lives, for the HTML report's
+    code view -- urls.py only has the registration, not the implementation.
+    """
+
+    file: str
+    start_line: int
+    end_line: int
+    auth_tokens: list[str] = field(default_factory=list)
 
 
 def _describe_view(node: ast.AST) -> tuple[str, str]:
@@ -47,11 +60,12 @@ def _describe_view(node: ast.AST) -> tuple[str, str]:
     return "?", ""
 
 
-def _build_auth_index(target_path) -> dict[str, list[str]]:
-    """Map view function/class name -> auth-related tokens found on it
-    (decorators, base classes, or a `permission_classes = [...]` attribute).
+def _build_view_index(target_path) -> dict[str, _ViewInfo]:
+    """Map view function/class name -> where it's defined + auth-related
+    tokens found on it (decorators, base classes, or a
+    `permission_classes = [...]` attribute).
     """
-    index: dict[str, list[str]] = {}
+    index: dict[str, _ViewInfo] = {}
 
     for py_file in iter_files(target_path, (".py",)):
         if py_file.name == "urls.py":
@@ -60,12 +74,13 @@ def _build_auth_index(target_path) -> dict[str, list[str]]:
         tree = parse_source(text, str(py_file))
         if tree is None:
             continue
+        relative_file = str(py_file.relative_to(target_path))
 
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 tokens = [d.name for d in parse_decorators(node) if d.name in KNOWN_AUTH_INDICATORS]
-                if tokens:
-                    index[node.name] = tokens
+                start_line, end_line = source_range(node)
+                index[node.name] = _ViewInfo(relative_file, start_line, end_line, tokens)
 
             elif isinstance(node, ast.ClassDef):
                 tokens = [d.name for d in parse_decorators(node) if d.name in KNOWN_AUTH_INDICATORS]
@@ -84,8 +99,8 @@ def _build_auth_index(target_path) -> dict[str, list[str]]:
                     if isinstance(values, (list, tuple)):
                         tokens.append("permission_classes")
 
-                if tokens:
-                    index[node.name] = tokens
+                start_line, end_line = source_range(node)
+                index[node.name] = _ViewInfo(relative_file, start_line, end_line, tokens)
 
     return index
 
@@ -94,7 +109,7 @@ def _build_auth_index(target_path) -> dict[str, list[str]]:
 class DjangoAnalyzer(BaseFrameworkAnalyzer):
     def find_routes(self) -> list[Route]:
         routes: list[Route] = []
-        auth_index = _build_auth_index(self.target_path)
+        view_index = _build_view_index(self.target_path)
 
         for py_file in iter_files(self.target_path, (".py",)):
             if py_file.name != "urls.py":
@@ -118,6 +133,7 @@ class DjangoAnalyzer(BaseFrameworkAnalyzer):
                     continue
 
                 handler_name, lookup_key = _describe_view(node.args[1])
+                view_info = view_index.get(lookup_key)
 
                 routes.append(
                     Route(
@@ -126,8 +142,11 @@ class DjangoAnalyzer(BaseFrameworkAnalyzer):
                         handler_name=handler_name,
                         file=str(py_file.relative_to(self.target_path)),
                         line=node.lineno,
-                        auth_decorators=auth_index.get(lookup_key, []),
+                        auth_decorators=view_info.auth_tokens if view_info else [],
                         raw_snippet=f"{func_name}({path!r}, {handler_name})",
+                        source_file=view_info.file if view_info else None,
+                        source_start_line=view_info.start_line if view_info else None,
+                        source_end_line=view_info.end_line if view_info else None,
                     )
                 )
 

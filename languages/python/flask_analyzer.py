@@ -12,7 +12,8 @@ from core.base import BaseFrameworkAnalyzer
 from core.fsutil import iter_files, read_text_safe
 from core.models import Finding, Route
 from core.registry import register
-from languages.python._ast_utils import iter_functions, parse_decorators, parse_source
+from languages.python._app_index import build_app_object_index
+from languages.python._ast_utils import iter_functions, parse_decorators, parse_source, source_range
 
 # For `@app.route(...)`, methods come from the `methods=` kwarg (default
 # GET). The shortcut decorators fix the method outright.
@@ -41,6 +42,7 @@ KNOWN_AUTH_INDICATORS = {
 class FlaskAnalyzer(BaseFrameworkAnalyzer):
     def find_routes(self) -> list[Route]:
         routes: list[Route] = []
+        app_index = build_app_object_index(self.target_path)
 
         for py_file in iter_files(self.target_path, (".py",)):
             text = read_text_safe(py_file)
@@ -57,11 +59,20 @@ class FlaskAnalyzer(BaseFrameworkAnalyzer):
                 if route_deco is None:
                     continue
 
+                # Flask's @app.get/@app.post shortcuts are syntactically
+                # identical to FastAPI's -- only skip when we can prove this
+                # object is actually a FastAPI/APIRouter instance. Leave it
+                # claimed if unresolved (e.g. `app` imported from elsewhere).
+                base_name = route_deco.dotted.split(".", 1)[0]
+                if app_index.get(base_name) == "fastapi":
+                    continue
+
                 path = route_deco.args[0] if isinstance(route_deco.args[0], str) else "?"
                 fixed_methods = _ROUTE_DECORATOR_METHODS[route_deco.name]
                 methods = fixed_methods or route_deco.kwargs.get("methods") or ["GET"]
 
                 auth_decorators = [d.name for d in decorators if d is not route_deco]
+                start_line, end_line = source_range(func)
 
                 routes.append(
                     Route(
@@ -72,6 +83,8 @@ class FlaskAnalyzer(BaseFrameworkAnalyzer):
                         line=route_deco.node.lineno,
                         auth_decorators=auth_decorators,
                         raw_snippet=f"@{route_deco.dotted}(...) def {func.name}(...)",
+                        source_start_line=start_line,
+                        source_end_line=end_line,
                     )
                 )
 
