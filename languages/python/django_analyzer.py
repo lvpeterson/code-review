@@ -16,7 +16,7 @@ from checks import auth as auth_checks
 from checks import idor as idor_checks
 from core.base import BaseFrameworkAnalyzer
 from core.fsutil import iter_files, read_text_safe
-from core.models import Finding, Route
+from core.models import Finding, Route, ScanResult
 from core.registry import register
 from languages.python._ast_utils import dotted_name, literal, parse_decorators, parse_source, source_range
 
@@ -105,6 +105,55 @@ def _build_view_index(target_path) -> dict[str, _ViewInfo]:
     return index
 
 
+def _permission_names(node: ast.AST) -> list[str]:
+    """Extract permission class names whether they're written as string
+    paths (`'rest_framework.permissions.IsAuthenticated'`, the usual style
+    in settings.py) or bare class references (`permissions.IsAuthenticated`).
+    """
+    if not isinstance(node, (ast.List, ast.Tuple)):
+        return []
+    names = []
+    for elt in node.elts:
+        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+            names.append(elt.value)
+        else:
+            name = dotted_name(elt)
+            if name:
+                names.append(name)
+    return names
+
+
+def _detect_drf_default_permissions(target_path) -> tuple[str, int, str] | None:
+    """DRF's REST_FRAMEWORK["DEFAULT_PERMISSION_CLASSES"] in settings.py
+    applies to every DRF view by default unless a view overrides it --
+    doesn't require any per-view decorator, so it's invisible to the
+    per-view auth-decorator scan above.
+    """
+    for py_file in iter_files(target_path, (".py",)):
+        if py_file.name != "settings.py":
+            continue
+        text = read_text_safe(py_file)
+        tree = parse_source(text, str(py_file))
+        if tree is None:
+            continue
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            if not any(isinstance(t, ast.Name) and t.id == "REST_FRAMEWORK" for t in node.targets):
+                continue
+            if not isinstance(node.value, ast.Dict):
+                continue
+            for key_node, val_node in zip(node.value.keys, node.value.values):
+                if not (isinstance(key_node, ast.Constant) and key_node.value == "DEFAULT_PERMISSION_CLASSES"):
+                    continue
+                perms = _permission_names(val_node)
+                if perms and any("AllowAny" not in p for p in perms):
+                    relative_file = str(py_file.relative_to(target_path))
+                    return relative_file, node.lineno, f"REST_FRAMEWORK DEFAULT_PERMISSION_CLASSES={perms}"
+    return None
+
+
 @register("python", "django")
 class DjangoAnalyzer(BaseFrameworkAnalyzer):
     def find_routes(self) -> list[Route]:
@@ -160,3 +209,10 @@ class DjangoAnalyzer(BaseFrameworkAnalyzer):
         # missing @csrf_protect on state-changing views, raw SQL via .raw()/
         # extra() with unsanitized input.
         return findings
+
+    def analyze(self) -> ScanResult:
+        result = super().analyze()
+        detected = _detect_drf_default_permissions(self.target_path)
+        if detected:
+            auth_checks.apply_global_auth_note(result, *detected)
+        return result

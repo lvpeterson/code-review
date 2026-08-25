@@ -20,10 +20,16 @@ opens fine offline) with one collapsible card per route, syntax-highlighted.
 Expanding a card shows the full handler source with line numbers, the
 associated baseline findings, and an "open in editor" link
 (`vscode://file/...`) that jumps straight to that file:line if VS Code is
-installed. Routes are sorted worst-severity-first within each section by
-default; the "Sort" dropdown re-orders by path/method/file instead. The
-sidebar has severity/method/language filters plus a text search box, all
-composable together.
+installed. Every occurrence of a path parameter (`user_id`, `orderId`, ...)
+inside the handler body is also underlined -- this is *only* a visual
+pointer to where user-controlled input enters the function (see
+`core/paths.py:extract_path_param_names()` + `core/html_report.py:_highlight_params()`),
+not a traced dataflow to any sink; it can't tell you whether that value
+actually reaches something dangerous, only where it shows up textually.
+Routes are sorted worst-severity-first within each section by default; the
+"Sort" dropdown re-orders by path/method/file instead. The sidebar has
+severity/method/language filters plus a text search box, all composable
+together.
 
 Each route also has a checkbox to mark it reviewed as you triage through
 the list -- reviewed routes dim and get a strikethrough, and "Hide reviewed"
@@ -110,6 +116,37 @@ The stub languages (go, ruby, dotnet) don't have a parser wired in yet.
 Reasonable options when you get there: `go/ast` via a small Go helper
 binary for Go, `tree-sitter-ruby`/`tree-sitter-c-sharp` (same tree-sitter
 pattern as Express) for Ruby/.NET.
+
+## Global auth mechanisms
+
+`checks/auth.py`'s AUTH-001 check only sees *per-route* auth decorators --
+but a lot of real apps enforce auth globally instead: a Flask
+`@before_request`, FastAPI's `dependencies=[Depends(...)]` on the app/router
+constructor, Django REST Framework's `DEFAULT_PERMISSION_CLASSES` in
+settings.py, a Spring `SecurityFilterChain` bean (arguably the *primary* way
+most real Spring apps do auth -- `@PreAuthorize` is often just extra
+restriction on top), or an Express `app.use(authMiddleware)`. Without
+detecting these, an app that does auth entirely through one of them would
+get every single route flagged.
+
+Each analyzer's `analyze()` override (see `_detect_global_*` in each
+`<framework>_analyzer.py`) checks for its framework's version of this and,
+if found, calls `checks/auth.py:apply_global_auth_note()`, which attaches a
+caveat both as a group-level note and appended to every AUTH-001 finding's
+description.
+
+This is deliberately **presence-only, not per-route**: it tells you *some*
+global mechanism exists somewhere in the project, not which specific routes
+it actually covers. Determining that precisely would mean simulating each
+framework's real path-matching/registration-order semantics (Express's
+registration order + path prefixes across mounted sub-routers, Spring
+Security's Ant-style path patterns, Flask blueprint registration order) --
+a lot of surface area for a heuristic tool to get wrong silently, especially
+since getting it wrong here means *suppressing* a real finding rather than
+just adding noise. If you want to build the precise version for a specific
+framework later, Express is the most mechanically tractable one (linear
+`app.use()`/`router.use()` call order + string path prefixes, no separate
+path-pattern DSL to interpret).
 
 ## Multiple frameworks in one language
 

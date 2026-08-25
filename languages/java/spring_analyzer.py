@@ -14,7 +14,7 @@ from checks import auth as auth_checks
 from checks import idor as idor_checks
 from core.base import BaseFrameworkAnalyzer
 from core.fsutil import iter_files, read_text_safe
-from core.models import Finding, Route
+from core.models import Finding, Route, ScanResult
 from core.registry import register
 
 _MAPPING_ANNOTATIONS = {
@@ -120,6 +120,38 @@ def _annotation_values(annotation) -> dict[str, str]:
     return result
 
 
+def _detect_global_security_filter_chain(target_path) -> tuple[str, int, str] | None:
+    """Most real Spring Security setups enforce auth through a
+    SecurityFilterChain bean (or the older WebSecurityConfigurerAdapter
+    `configure(HttpSecurity)` override) rather than -- or in addition to --
+    per-method @PreAuthorize. Without this, an app that does auth entirely
+    through the filter chain would get every single route flagged.
+    """
+    for java_file in iter_files(target_path, (".java",)):
+        text = read_text_safe(java_file)
+        try:
+            tree = javalang.parse.parse(text)
+        except Exception:
+            continue
+
+        for _, member in tree.filter(javalang.tree.MethodDeclaration):
+            return_type_name = getattr(member.return_type, "name", None) if member.return_type else None
+            is_filter_chain_bean = return_type_name == "SecurityFilterChain"
+            is_legacy_configure = member.name == "configure" and any(
+                getattr(p.type, "name", None) == "HttpSecurity" for p in member.parameters
+            )
+            if not (is_filter_chain_bean or is_legacy_configure) or not member.position:
+                continue
+
+            end_line = _method_end_line(text, member.position.line)
+            body_text = "\n".join(text.split("\n")[member.position.line - 1:end_line])
+            if ".authenticated()" in body_text or ".anyRequest()" in body_text:
+                relative_file = str(java_file.relative_to(target_path))
+                return relative_file, member.position.line, f"{member.name}(...) configures a security filter chain with broad .authenticated() coverage"
+
+    return None
+
+
 @register("java", "spring")
 class SpringAnalyzer(BaseFrameworkAnalyzer):
     def find_routes(self) -> list[Route]:
@@ -194,3 +226,10 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
         # CSRF config, JPA repository methods exposed directly (Spring Data
         # REST) without ownership filtering.
         return findings
+
+    def analyze(self) -> ScanResult:
+        result = super().analyze()
+        detected = _detect_global_security_filter_chain(self.target_path)
+        if detected:
+            auth_checks.apply_global_auth_note(result, *detected)
+        return result

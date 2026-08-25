@@ -25,7 +25,7 @@ from checks import auth as auth_checks
 from checks import idor as idor_checks
 from core.base import BaseFrameworkAnalyzer
 from core.fsutil import iter_files, read_text_safe
-from core.models import Finding, Route
+from core.models import Finding, Route, ScanResult
 from core.registry import register
 
 _JS_LANGUAGE = Language(tsjs.language())
@@ -199,6 +199,46 @@ def _iter_named_function_defs(root: Node, src: bytes):
                 yield _node_text(left, src), node
 
 
+def _detect_global_use_middleware(target_path: Path) -> tuple[str, int, str] | None:
+    """`app.use(authMiddleware)` / `router.use(authMiddleware)` applies to
+    every route registered after it (or matching its path prefix, if one is
+    given) -- restricted to names matching KNOWN_AUTH_INDICATORS since
+    app.use() is also how cors()/helmet()/bodyParser()/morgan() etc get
+    registered, and those would otherwise swamp this with noise.
+    """
+    for src_file in iter_files(target_path, (".js", ".ts")):
+        src = read_text_safe(src_file).encode("utf-8")
+        if not src:
+            continue
+        tree = _parser_for(src_file).parse(src)
+
+        for node in _iter_nodes(tree.root_node):
+            if node.type != "call_expression":
+                continue
+            func = node.child_by_field_name("function")
+            if func is None or func.type != "member_expression":
+                continue
+            obj = func.child_by_field_name("object")
+            prop = func.child_by_field_name("property")
+            if obj is None or prop is None or obj.type != "identifier":
+                continue
+            if _node_text(obj, src) not in _ROUTER_OBJECT_NAMES or _node_text(prop, src) != "use":
+                continue
+
+            args_node = node.child_by_field_name("arguments")
+            if args_node is None:
+                continue
+            for arg in args_node.named_children:
+                if arg.type != "identifier":
+                    continue
+                name = _node_text(arg, src)
+                if name in KNOWN_AUTH_INDICATORS:
+                    relative_file = str(src_file.relative_to(target_path))
+                    line = node.start_point[0] + 1
+                    return relative_file, line, f"{_node_text(obj, src)}.use({name})"
+    return None
+
+
 def _build_handler_index(target_path: Path) -> dict[str, tuple[str, int, int]]:
     """Project-wide map of function name -> (file, start_line, end_line),
     used to resolve a named handler passed by reference to its real body.
@@ -287,3 +327,10 @@ class ExpressAnalyzer(BaseFrameworkAnalyzer):
         # TODO: Express-specific checks -- e.g. cors() with no origin
         # restriction, missing helmet(), body-parser without size limits.
         return findings
+
+    def analyze(self) -> ScanResult:
+        result = super().analyze()
+        detected = _detect_global_use_middleware(self.target_path)
+        if detected:
+            auth_checks.apply_global_auth_note(result, *detected)
+        return result

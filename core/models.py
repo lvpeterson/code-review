@@ -61,3 +61,9 @@ class ScanResult:
     routes: list[Route] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+
+    # Where a detected global auth mechanism (Flask before_request, a Spring
+    # SecurityFilterChain bean, etc) actually lives, so the HTML report can
+    # render a real "open in editor" link to it instead of just naming it in
+    # text. None when no such mechanism was detected in this scan.
+    global_auth_source: Optional[tuple[str, int, str]] = None  # (file, line, description)

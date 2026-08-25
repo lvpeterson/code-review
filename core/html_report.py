@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import html
 import itertools
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from pygments.lexers import get_lexer_by_name, get_lexer_for_filename
 from pygments.util import ClassNotFound
 
 from core.models import Finding, Route, ScanResult
+from core.paths import extract_path_param_names
 
 _SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2, "info": 3}
 _SEVERITY_LABEL = {"high": "High", "medium": "Medium", "low": "Low", "info": "Info"}
@@ -76,6 +78,34 @@ def _read_lines(target_path: Path, file_rel: str, start: int, end: int) -> tuple
     return [(n, lines[n - 1]) for n in range(start, end + 1)], None
 
 
+def _highlight_params(highlighted_html: str, param_names: list[str]) -> str:
+    """Mark every occurrence of a route's path-parameter names in already
+    syntax-highlighted Pygments output -- pure visual aid pointing at where
+    user-controlled input enters the handler, not a claim about what
+    happens to it afterward (no dataflow/sink tracing here).
+
+    Works by matching Pygments' own per-identifier <span> tags exactly --
+    every name reference (python "n", java "n", javascript "nx", ...) is
+    already wrapped in its own complete <span class="...">exact_text</span>,
+    so anchoring on that (rather than a raw substring search over the HTML)
+    guarantees this only ever marks whole-identifier matches. It naturally
+    can't match text inside a string or comment token, since those spans
+    contain the surrounding quote characters/comment marker too and so
+    never have content exactly equal to a bare parameter name.
+    """
+    names = {n for n in param_names if n}
+    if not names:
+        return highlighted_html
+
+    pattern = re.compile(
+        r'<span class="([^"]*)">(' + "|".join(re.escape(n) for n in names) + r")</span>"
+    )
+    return pattern.sub(
+        r'<span class="\1 param-highlight" title="path parameter -- user-controlled input">\2</span>',
+        highlighted_html,
+    )
+
+
 def _render_code_block(target_path: Path, route: Route, language: str) -> str:
     source_file = route.source_file or route.file
     start = route.source_start_line
@@ -109,6 +139,7 @@ def _render_code_block(target_path: Path, route: Route, language: str) -> str:
         hl_lines=hl_lines,
     )
     highlighted = pygments_highlight(code_text, _get_lexer(language, source_file), formatter)
+    highlighted = _highlight_params(highlighted, extract_path_param_names(route.path))
 
     return header + note + f'<div class="code-block">{highlighted}</div>'
 
@@ -174,12 +205,24 @@ def _render_group(result: ScanResult, target_path: Path, route_ids: itertools.co
         for r in sorted_routes
     )
     notes_html = "".join(f'<p class="group-note">{_esc(n)}</p>' for n in result.notes)
+
+    global_auth_html = ""
+    if result.global_auth_source:
+        gfile, gline, gdescription = result.global_auth_source
+        ide_link = _vscode_uri(target_path, gfile, gline)
+        global_auth_html = f"""
+      <p class="group-note global-auth-note">
+        Possible global auth coverage: <a class="ide-link" href="{_esc(ide_link)}">{_esc(gfile)}:{gline}</a>
+        &mdash; {_esc(gdescription)}. Verify affected AUTH-001 findings below before treating them as real gaps.
+      </p>"""
+
     return f"""
     <section class="group" data-lang="{_esc(result.language)}">
       <h2 class="group-title">{_esc(result.language)} / {_esc(result.framework)}
         <span class="count">{len(result.routes)} route{"s" if len(result.routes) != 1 else ""}</span>
       </h2>
       {notes_html}
+      {global_auth_html}
       {routes_html or '<p class="no-findings">No routes extracted.</p>'}
     </section>"""
 
@@ -454,6 +497,17 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 }
 .group-title .count { color: var(--text); font-size: 12px; text-transform: none; letter-spacing: 0; }
 .group-note { color: var(--text-muted); font-size: 12.5px; font-style: italic; margin: 0 0 10px; }
+.global-auth-note {
+  font-style: normal;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  padding: 10px 14px;
+  margin: 0 0 14px;
+}
+.global-auth-note .ide-link { font-family: var(--mono); }
 
 .route-card {
   background: var(--surface);
@@ -593,6 +647,12 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .code-block .hll {
   display: block;
   background: rgba(94, 200, 216, 0.12);
+}
+.param-highlight {
+  background: rgba(242, 169, 78, 0.16);
+  border-bottom: 1px dotted var(--sev-medium);
+  border-radius: 2px;
+  cursor: help;
 }
 
 @media (max-width: 860px) {

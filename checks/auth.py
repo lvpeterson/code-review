@@ -8,11 +8,12 @@ any of those on a given route.
 """
 from __future__ import annotations
 
-from core.models import Finding, Route
+from core.models import Finding, Route, ScanResult
 
 # Verbs that typically mutate or return sensitive data -- worth flagging
 # more loudly than a GET on public/static content.
 _SENSITIVE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
 
 
 def check_missing_auth_indicator(routes: list[Route], known_auth_indicators: set[str]) -> list[Finding]:
@@ -44,3 +45,29 @@ def check_missing_auth_indicator(routes: list[Route], known_auth_indicators: set
             )
         )
     return findings
+
+
+def apply_global_auth_note(result: ScanResult, file: str, line: int, description: str) -> None:
+    """Attach a "this project has some global auth mechanism" caveat to a
+    scan result: stored structurally on `result.global_auth_source` so the
+    HTML report can render a real "open in editor" link to it (the same way
+    it links route code), and appended in plain text -- file:line included,
+    so it's readable without cross-referencing anything -- to every AUTH-001
+    finding's description.
+
+    This is deliberately presence-only, not per-route -- we know *something*
+    that plausibly enforces auth globally exists at this exact location, not
+    which specific routes it actually covers (that needs simulating each
+    framework's real path-matching/registration-order semantics, which is a
+    lot of surface area for a heuristic tool to get wrong silently). Treat
+    this as "go check this file," not "this route is covered."
+    """
+    result.global_auth_source = (file, line, description)
+    caveat = (
+        f" Note: {file}:{line} defines what looks like a global auth mechanism "
+        f"({description}) -- verify this route isn't already covered by it "
+        f"before treating this as a real gap."
+    )
+    for finding in result.findings:
+        if finding.check_id == "AUTH-001":
+            finding.description += caveat

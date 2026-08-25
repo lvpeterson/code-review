@@ -37,6 +37,10 @@ def print_console(results: list[ScanResult]) -> None:
         for note in result.notes:
             print(f"note: {note}")
 
+        if result.global_auth_source:
+            gfile, gline, gdescription = result.global_auth_source
+            print(f"global auth: {gfile}:{gline} -- {gdescription}")
+
 
 def write_json(results: list[ScanResult], out_path: Path) -> None:
     payload = [asdict(result) for result in results]

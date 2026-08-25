@@ -13,7 +13,7 @@ from checks import auth as auth_checks
 from checks import idor as idor_checks
 from core.base import BaseFrameworkAnalyzer
 from core.fsutil import iter_files, read_text_safe
-from core.models import Finding, Route
+from core.models import Finding, Route, ScanResult
 from core.registry import register
 from languages.python._app_index import build_app_object_index
 from languages.python._ast_utils import (
@@ -36,6 +36,40 @@ KNOWN_AUTH_INDICATORS = {
     "oauth2_scheme",
     "get_current_active_user",
 }
+
+
+def _detect_global_dependencies(target_path) -> tuple[str, int, str] | None:
+    """FastAPI/APIRouter's `dependencies=[Depends(x), ...]` constructor
+    kwarg applies to every route registered on that app/router -- unlike
+    Flask's before_request, this is structurally explicit (no body-sniffing
+    needed), so it's a precise presence signal.
+    """
+    for py_file in iter_files(target_path, (".py",)):
+        text = read_text_safe(py_file)
+        tree = parse_source(text, str(py_file))
+        if tree is None:
+            continue
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            constructor = dotted_name(node.func)
+            if constructor is None or constructor.rsplit(".", 1)[-1] not in ("FastAPI", "APIRouter"):
+                continue
+
+            for kw in node.keywords:
+                if kw.arg != "dependencies" or not isinstance(kw.value, (ast.List, ast.Tuple)):
+                    continue
+                dep_names = []
+                for elt in kw.value.elts:
+                    if isinstance(elt, ast.Call) and dotted_name(elt.func) == "Depends" and elt.args:
+                        dep_name = dotted_name(elt.args[0])
+                        if dep_name:
+                            dep_names.append(dep_name)
+                if dep_names:
+                    relative_file = str(py_file.relative_to(target_path))
+                    return relative_file, node.lineno, f"dependencies={dep_names} passed to {constructor}(...)"
+    return None
 
 
 def _depends_targets(func) -> list[str]:
@@ -120,3 +154,10 @@ class FastAPIAnalyzer(BaseFrameworkAnalyzer):
         # TODO: FastAPI-specific checks -- e.g. Pydantic models that accept
         # extra/unvalidated fields, response_model leaking sensitive fields.
         return findings
+
+    def analyze(self) -> ScanResult:
+        result = super().analyze()
+        detected = _detect_global_dependencies(self.target_path)
+        if detected:
+            auth_checks.apply_global_auth_note(result, *detected)
+        return result

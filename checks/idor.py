@@ -12,13 +12,11 @@ from __future__ import annotations
 import re
 
 from core.models import Finding, Route
+from core.paths import extract_path_param_names
 
-# Path parameter names, e.g. /users/<id>, /users/{userId}, /users/:id,
-# /orders/{order_id}. The id/uuid/guid check itself happens in
-# _is_id_like() below -- kept as a whole-word check (not substring), since
+# The id/uuid/guid check is a whole-word check (not substring), since
 # "valid", "width", "hidden", "provider" etc all contain "id"/"uuid"-ish
 # substrings without being object identifiers at all.
-_PARAM_NAME_PATTERN = re.compile(r"[:{<]([a-zA-Z_][a-zA-Z0-9_]*)[}>]?")
 _ID_WORDS = {"id", "ids", "uuid", "guid"}
 _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
@@ -29,11 +27,7 @@ def _is_id_like(param_name: str) -> bool:
 
 
 def find_id_like_params(route: Route) -> list[str]:
-    return [
-        m.group(1)
-        for m in _PARAM_NAME_PATTERN.finditer(route.path)
-        if _is_id_like(m.group(1))
-    ]
+    return [name for name in extract_path_param_names(route.path) if _is_id_like(name)]
 
 
 def check_id_param_routes(routes: list[Route]) -> list[Finding]:

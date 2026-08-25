@@ -10,7 +10,7 @@ from checks import auth as auth_checks
 from checks import idor as idor_checks
 from core.base import BaseFrameworkAnalyzer
 from core.fsutil import iter_files, read_text_safe
-from core.models import Finding, Route
+from core.models import Finding, Route, ScanResult
 from core.registry import register
 from languages.python._app_index import build_app_object_index
 from languages.python._ast_utils import iter_functions, mock_import_names, parse_decorators, parse_source, source_range
@@ -36,6 +36,34 @@ KNOWN_AUTH_INDICATORS = {
     "permission_required",
     "roles_required",
 }
+
+# Textual markers inside a @before_request body that plausibly mean it's
+# enforcing auth rather than e.g. opening a DB connection or logging. This
+# is a presence check, not real behavioral analysis -- see
+# checks/auth.py:apply_global_auth_note for why it stays that shallow.
+_GLOBAL_AUTH_BODY_MARKERS = (
+    "abort(401", "abort(403", "current_user.is_authenticated", "g.user",
+    "unauthorized", "Unauthorized", *KNOWN_AUTH_INDICATORS,
+)
+
+
+def _detect_global_before_request_auth(target_path) -> tuple[str, int, str] | None:
+    for py_file in iter_files(target_path, (".py",)):
+        text = read_text_safe(py_file)
+        tree = parse_source(text, str(py_file))
+        if tree is None:
+            continue
+        lines = text.split("\n")
+
+        for func in iter_functions(tree):
+            if not any(d.name == "before_request" for d in parse_decorators(func)):
+                continue
+            start, end = source_range(func)
+            body_text = "\n".join(lines[start - 1:end])
+            if any(marker in body_text for marker in _GLOBAL_AUTH_BODY_MARKERS):
+                relative_file = str(py_file.relative_to(target_path))
+                return relative_file, func.lineno, f"@before_request '{func.name}', which appears to check auth"
+    return None
 
 
 @register("python", "flask")
@@ -107,3 +135,10 @@ class FlaskAnalyzer(BaseFrameworkAnalyzer):
         # request.args/json values directly in raw SQL, or debug=True in
         # app.run(), or missing CSRF protection on state-changing routes.
         return findings
+
+    def analyze(self) -> ScanResult:
+        result = super().analyze()
+        detected = _detect_global_before_request_auth(self.target_path)
+        if detected:
+            auth_checks.apply_global_auth_note(result, *detected)
+        return result
