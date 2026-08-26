@@ -14,11 +14,13 @@ def detect_language(target_path: Path) -> bool:
 
 
 def detect_frameworks(target_path: Path) -> list[str]:
-    """Return every framework detected -- currently just ["express"] or [].
+    """Return every framework detected: "express" and/or "nextjs".
 
     TODO: add detect for other JS frameworks (NestJS, Koa, Hapi, Fastify) --
     follow the same pattern as express below.
     """
+    found: set[str] = set()
+
     package_json = target_path / "package.json"
     if package_json.exists():
         try:
@@ -27,11 +29,19 @@ def detect_frameworks(target_path: Path) -> list[str]:
             data = {}
         deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
         if "express" in deps:
-            return ["express"]
+            found.add("express")
+        if "next" in deps:
+            found.add("nextjs")
+
+    if any_file_exists(target_path, "next.config.js", "next.config.mjs", "next.config.ts"):
+        found.add("nextjs")
+
+    if found:
+        return sorted(found)
 
     for src_file in iter_files(target_path, (".js", ".ts")):
         text = read_text_safe(src_file)
         if "require('express')" in text or 'require("express")' in text or "from 'express'" in text or 'from "express"' in text:
-            return ["express"]
+            found.add("express")
 
-    return []
+    return sorted(found)

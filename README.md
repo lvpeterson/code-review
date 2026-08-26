@@ -5,6 +5,24 @@ framework-specific "deep dive" that extracts routes and runs baseline
 IDOR/auth-coverage heuristics to point a human auditor at what to look at
 first. Nothing here proves a vulnerability -- it's triage tooling.
 
+## Testing
+
+```
+pip install -e ".[dev]"
+pytest
+```
+
+`tests/` has pure-logic unit tests for the framework-agnostic pieces
+(`checks/idor.py`, `checks/auth.py`, `core/paths.py`, `core/bodyscan.py`,
+`core/allowlist.py`) plus one integration test file per implemented analyzer
+that writes small fixture files into `tmp_path` and runs the real
+`find_routes()`/`run_baseline_checks()` pipeline -- these are what would
+have caught several of the bugs found and fixed along the way (the
+class-level `@RequestMapping` double-count, the `unittest.mock.patch`
+collision, the project-wide-vs-per-file supertest resolution bug) as actual
+regressions instead of one-off manual fixtures. `pyproject.toml` also makes
+this pip-installable (`appsec-review` console script via `main:main`).
+
 ## Usage
 
 ```
@@ -13,7 +31,20 @@ python main.py <target_path>
 python main.py <target_path> --json report.json
 python main.py <target_path> --html report.html
 python main.py <target_path> --language python --framework flask   # skip detection
+python main.py <target_path> --allow-path "/health" --allow-path "/api/public/*"
+python main.py <target_path> --fail-on medium   # exit 1 if any medium+ finding exists (CI use)
 ```
+
+`--allow-path` (repeatable, glob-style) suppresses AUTH-001 on routes you've
+already confirmed are intentionally public -- health checks, login itself,
+public webhooks -- so they don't get reflagged every run. It only suppresses
+AUTH-001; an allowlisted route's IDOR-001/CONFIG-* findings still show up,
+since "safe to be unauthenticated" doesn't mean "safe to have no ownership
+check" or "not a config problem." See `core/allowlist.py`.
+
+`--fail-on {high,medium,low,info}` exits 1 if any finding at or above that
+severity exists anywhere in the scan -- for wiring this into CI so a build
+actually fails on new findings instead of just printing them.
 
 `--html` writes a single self-contained HTML file (no external assets, so it
 opens fine offline) with one collapsible card per route, syntax-highlighted.
@@ -49,34 +80,43 @@ core/
   base.py                   BaseFrameworkAnalyzer -- every analyzer subclasses this
   registry.py                @register("language", "framework") decorator + lookup
   fsutil.py                   file-walking helpers shared by detectors/analyzers
-  report.py                    console + JSON output
+  report.py                    console + JSON output, --fail-on severity comparison
   html_report.py                self-contained interactive HTML report
+  paths.py                     path-param extraction + mount-prefix resolution (shared)
+  bodyscan.py                  regex scan for request.X/req.X field reads (shared)
+  allowlist.py                 --allow-path glob suppression of AUTH-001
 checks/                    framework-agnostic heuristics, operate on Route objects
-  idor.py                    flags routes with id-like path params
+  idor.py                    flags routes with id-like path or query/body params
   auth.py                    flags routes with no recognized auth decorator/middleware
+  config.py                  debug-mode / CORS-wildcard finding builders
 languages/<lang>/
   detector.py               detect_language() / detect_frameworks() for that language
   <framework>_analyzer.py    route extraction + baseline checks for one framework
+tests/                     pytest suite -- pure-logic unit tests + one integration
+                             test file per implemented analyzer (tmp_path fixtures)
 ```
 
 Currently implemented (route extraction + baseline checks):
 - **python**: flask, fastapi, django
 - **java**: spring
-- **javascript**: express
+- **javascript**: express, nextjs
+- **go**: gin, net_http
+- **dotnet**: aspnet
+- **ruby**: rails, sinatra
 
 `detect_frameworks()` returns a *list* -- a codebase can trip more than one
 framework in the same language (e.g. a Flask app that's grown FastAPI
-services alongside it mid-migration), and each gets its own deep-dive and
-its own section in the report, rather than one silently winning detection
-and the other's routes going unscanned. See "Multiple frameworks in one
-language" below for how Flask/FastAPI specifically avoid double-counting
-the same route when both are present.
+services alongside it mid-migration, or a Go service using gin for its main
+API plus a raw net/http health-check endpoint), and each gets its own
+deep-dive and its own section in the report, rather than one silently
+winning detection and the other's routes going unscanned. See "Multiple
+frameworks in one language" below for how Flask/FastAPI specifically avoid
+double-counting the same route when both are present.
 
-Detection-only stubs (framework gets identified but analyzer returns empty +
-a note -- fill these in following the pattern of an implemented one):
-- **go**: net/http, gin
-- **ruby**: rails, sinatra
-- **dotnet**: aspnet
+Nothing is a pure detection-only stub anymore, but feature depth varies --
+see "Feature depth by framework" below for exactly what each one does and
+doesn't have yet (mount-prefix composition, query/body param IDOR, debug/CORS
+checks, controller-to-source resolution).
 
 ## Adding a new framework to an existing language
 
@@ -108,14 +148,146 @@ relative to the route decorator.
   live in `languages/python/_ast_utils.py`.
 - **java** (`spring_analyzer.py`): the `javalang` package -- a pure-Python
   Java parser, so no JDK/Node is required to run this.
-- **javascript** (`express_analyzer.py`): `tree-sitter` with the
-  `tree-sitter-javascript`/`tree-sitter-typescript` grammars -- prebuilt
-  wheels, no Node.js or compiler required either.
+- **javascript** (`express_analyzer.py`, `nextjs_analyzer.py`): `tree-sitter`
+  with the `tree-sitter-javascript`/`tree-sitter-typescript` grammars --
+  prebuilt wheels, no Node.js or compiler required either.
+- **go** (`gin_analyzer.py`, `net_http_analyzer.py`): `tree-sitter-go`.
+- **dotnet** (`aspnet_analyzer.py`): `tree-sitter-c-sharp`. tree-sitter gives
+  real start/end positions natively here, unlike javalang for Spring, which
+  needed manual brace-counting (`_method_end_line()`).
+- **ruby** (`rails_analyzer.py`, `sinatra_analyzer.py`): `tree-sitter-ruby`.
 
-The stub languages (go, ruby, dotnet) don't have a parser wired in yet.
-Reasonable options when you get there: `go/ast` via a small Go helper
-binary for Go, `tree-sitter-ruby`/`tree-sitter-c-sharp` (same tree-sitter
-pattern as Express) for Ruby/.NET.
+All five tree-sitter grammars are prebuilt wheels (no JDK/Node/Go/.NET/Ruby
+toolchain needed on the machine actually running this tool) -- every
+`languages/<lang>/_ts_utils.py` is the same trivial node-text/walk-helper
+pattern duplicated per language rather than shared, matching this repo's
+existing convention (`_ast_utils.py` is the one deliberately shared module,
+for Python specifically).
+
+## Next.js: file-based routing is a different shape of problem
+
+Every other JS/Go/C#/Ruby framework here registers routes via an explicit
+call (`app.get(path, handler)`, `router.GET(path, handler)`, `[HttpGet(...)]`
+-- something to pattern-match against). Next.js doesn't: a route's URL comes
+from the *file's own path* in the tree, not from anything textually inside
+it. `nextjs_analyzer.py` supports both routing conventions:
+
+- **App Router** (`app/**/route.{js,ts}`): named exports `GET`/`POST`/...,
+  each becomes its own route. Dynamic segments (`[id]`, `[...slug]`,
+  `[[...slug]]`) become path params; route groups (`(group)`) are stripped
+  since they don't appear in the URL at all.
+- **Pages Router** (`pages/api/**/*.{js,ts}`): one default-export handler,
+  typically branching on `req.method` -- sniffed the same way Go's
+  net/http analyzer sniffs `r.Method` when there's no more explicit signal.
+
+Global auth is `middleware.ts`'s exported `middleware` function (Next.js's
+equivalent of Flask's `before_request`/Express's `app.use()`), detected the
+same presence-only way as every other framework's global-auth check.
+
+## Rails: routes.rb is a DSL, not a list of calls
+
+`config/routes.rb` wraps everything in `Rails.application.routes.draw do
+... end`, and most of it isn't "one call = one route" the way everything
+else here is: `resources :orders` alone expands to the 7 standard RESTful
+routes (index/new/create/show/edit/update/destroy), and `namespace`/`scope`
+blocks add a path prefix to everything nested inside them, so
+`rails_analyzer.py` walks the DSL recursively tracking an accumulated
+prefix stack rather than doing a flat scan. Global auth is a
+`before_action :authenticate_user!`-shaped call in
+`app/controllers/application_controller.rb`, which every controller
+inherits from by default -- same shape as Flask's `before_request` check,
+just Ruby's version of "runs before everything."
+
+## Route mount-prefix composition
+
+A route's *registered* path and its *real* path can differ once you mount
+routers/blueprints under a prefix -- `@items_router.get("/{id}")` mounted via
+`app.include_router(items_router, prefix="/api/v1")` really serves
+`/api/v1/{id}`, not `/{id}`. Reporting the bare path would be actively
+wrong, not just incomplete -- you could end up reviewing/testing the wrong
+endpoint. Each analyzer resolves this by recording every "this thing got
+mounted under this prefix" call project-wide, then walking the chain (a
+router can itself be mounted into another router, e.g. FastAPI
+`v1_router.include_router(items_router, prefix="/items")` then
+`app.include_router(v1_router, prefix="/v1")`) via the shared
+`core/paths.py:resolve_mount_prefix()`:
+
+- **FastAPI**: `parent.include_router(child, prefix="...")`
+- **Flask**: `Blueprint(..., url_prefix="...")` and/or
+  `app.register_blueprint(bp, url_prefix="...")` (the latter wins if both
+  are present, matching Flask's own precedence)
+- **Express**: `parent.use('/prefix', child)` -- matched by variable name
+  across files, same limitation as the handler-resolution index (a router
+  required under one name and re-exported under a different name won't
+  resolve)
+- **Spring**: doesn't need this -- class-level `@RequestMapping` + method-level
+  already live in the same file and were already being combined
+- **Rails**: `namespace`/`scope` blocks in routes.rb are this same concept in
+  DSL form -- `rails_analyzer.py` handles it directly as part of its
+  recursive walk rather than a separate resolution pass
+- **Not yet handled**: gin's `router.Group("/api")` (returns a sub-router
+  you then call `.GET`/`.POST` on, same shape as Express) and Next.js's App
+  Router (`route.js`'s directory path *is* the mount, so this doesn't apply
+  there at all) -- .NET's two conventions don't have an equivalent either
+  (Minimal API has no sub-router concept; attribute routing's `[Route]` is
+  already same-file, same as Spring)
+
+## Query/body parameters and IDOR
+
+`checks/idor.py`'s IDOR-001 originally only looked at path parameters
+(`/users/{user_id}`) -- but `/search?user_id=123` or a JSON body
+`{"user_id": 123}` is just as much an object reference. Each analyzer now
+also populates `Route.extra_param_names`, best-effort:
+
+- **FastAPI**: every handler parameter that isn't a path param and doesn't
+  have a `Depends(...)` default -- structurally precise, since FastAPI binds
+  query/body params directly as typed function parameters.
+- **Spring**: parameters annotated `@RequestParam`/`@RequestBody` -- also
+  signature-based and precise.
+- **Flask/Django/Express/Next.js/Go**: the same shared regex scan
+  (`core/bodyscan.py`) of the handler body, one accessor pattern added per
+  framework as it came up -- `request.args/form/json/GET/POST/data.get(...)`
+  (Flask/Django), `req.query/body.x` (Express, also Pages Router),
+  `searchParams.get(...)` (Next.js App Router), `.URL.Query().Get(...)` /
+  `.Query(...)` / `.PostForm(...)` (Go). Shallower than the signature-based
+  two above -- it can't see a field nested inside a larger dict/object/struct
+  -- but catches the common direct-access case.
+- **Not yet handled**: .NET (`[FromQuery]`/`[FromBody]` parameter
+  attributes -- structurally precise like Spring/FastAPI, just not built
+  yet) and Rails (routes.rb doesn't have a handler body to scan at all --
+  this needs the controller#action resolution mentioned below first).
+
+## Debug mode and CORS checks
+
+Two new project-level checks (not tied to a specific route, so
+`Finding.route` stays `None` for these) live in `checks/config.py`:
+
+- **CONFIG-001** (debug mode): `app.run(debug=True)` / `app.debug = True`
+  (Flask), `DEBUG = True` in settings.py (Django).
+- **CONFIG-002** (CORS wildcard): a bare `@CrossOrigin` or explicit
+  `origins="*"` (Spring), a bare `cors()` call or `origin: '*'`/`origin: true`
+  (Express). Flask-CORS isn't covered yet -- same pattern (`CORS(app)` with
+  no restriction defaults permissive) if you want to add it.
+
+Neither check exists yet for Next.js, Go, .NET, or Ruby -- each has its own
+version of both problems (Next.js CORS via `next.config.js` `headers()`;
+Go's own `cors` middleware packages; ASP.NET's `[EnableCors]`; Rails'
+`rack-cors` gem) but none of it's wired in.
+
+## Rails routes aren't resolved to their controller source yet
+
+Every other analyzer resolves a route's handler to its actual source
+location -- Django's urls.py entry to the real view in views.py, Express's
+named handler to wherever it's actually defined, even across files.
+`rails_analyzer.py` doesn't do this yet: routes.rb tells you `orders#show`
+maps to `/orders/:id`, but the report can only point you at the routes.rb
+registration line, not `app/controllers/orders_controller.rb`'s `show`
+method itself. This also means Rails routes get no per-route auth detection
+or query/body param scanning (both need the controller body to look at) --
+only the global `before_action` check and path-param IDOR currently apply.
+Building the resolution (matching `resource_name#action` to
+`app/controllers/<resource_name>_controller.rb`'s `def action`) would
+unlock all three at once, the same way it did for Django.
 
 ## Global auth mechanisms
 
@@ -201,10 +373,11 @@ routes at all yet.
   (`KNOWN_AUTH_INDICATORS`) -- tune those to match each codebase's actual
   auth decorators/middleware names, or you'll get noisy false positives on
   intentionally-public routes.
-- `checks/idor.py` only flags the presence of an id-like path param -- it
-  doesn't (yet) inspect the handler body for an ownership check. That's the
-  natural next thing to build now that route extraction is AST-precise.
-  It's also whole-word-aware (`_is_id_like()`), not substring matching --
+- `checks/idor.py` flags the presence of an id-like path *or* query/body
+  param -- it doesn't inspect the handler body for an actual ownership
+  check (`if resource.owner_id != current_user.id`). That's the natural
+  next thing to build now that route extraction is AST-precise. It's also
+  whole-word-aware (`_is_id_like()`), not substring matching --
   `valid`/`width`/`hidden`/`provider`/`guide` all *contain* "id"/"uuid"
   as a substring without being object identifiers, so a naive substring
   check drowns real findings in noise.

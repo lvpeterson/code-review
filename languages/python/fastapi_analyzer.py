@@ -14,11 +14,13 @@ from checks import idor as idor_checks
 from core.base import BaseFrameworkAnalyzer
 from core.fsutil import iter_files, read_text_safe
 from core.models import Finding, Route, ScanResult
+from core.paths import extract_path_param_names, join_path_segments, resolve_mount_prefix
 from core.registry import register
 from languages.python._app_index import build_app_object_index
 from languages.python._ast_utils import (
     dotted_name,
     iter_functions,
+    literal,
     mock_import_names,
     parse_decorators,
     parse_source,
@@ -72,6 +74,69 @@ def _detect_global_dependencies(target_path) -> tuple[str, int, str] | None:
     return None
 
 
+def _build_router_mounts(target_path) -> dict[str, tuple[str, str]]:
+    """Map child router variable name -> (parent object name, prefix) from
+    every `parent.include_router(child, prefix="...")` call in the project.
+
+    Without this, a route declared on a sub-router (`items_router.get(...)`)
+    that gets mounted elsewhere (`app.include_router(items_router,
+    prefix="/api/v1")`, often in a different file) would report its bare
+    "/items/{id}" path instead of the real "/api/v1/items/{id}" -- a very
+    common FastAPI pattern for versioning/module organization.
+    """
+    mounts: dict[str, tuple[str, str]] = {}
+    for py_file in iter_files(target_path, (".py",)):
+        text = read_text_safe(py_file)
+        tree = parse_source(text, str(py_file))
+        if tree is None:
+            continue
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func_dotted = dotted_name(node.func)
+            if func_dotted is None or not func_dotted.endswith(".include_router"):
+                continue
+            if not node.args:
+                continue
+            child_name = dotted_name(node.args[0])
+            if child_name is None:
+                continue
+
+            prefix = ""
+            for kw in node.keywords:
+                if kw.arg == "prefix":
+                    prefix = literal(kw.value) or ""
+
+            parent_name = func_dotted.rsplit(".", 1)[0]
+            mounts[child_name] = (parent_name, prefix)
+    return mounts
+
+
+def _params_with_depends_default(func) -> set[str]:
+    depends_names: set[str] = set()
+    positional = func.args.posonlyargs + func.args.args
+    for arg, default in zip(reversed(positional), reversed(func.args.defaults)):
+        if isinstance(default, ast.Call) and dotted_name(default.func) == "Depends":
+            depends_names.add(arg.arg)
+    for arg, default in zip(func.args.kwonlyargs, func.args.kw_defaults):
+        if default is not None and isinstance(default, ast.Call) and dotted_name(default.func) == "Depends":
+            depends_names.add(arg.arg)
+    return depends_names
+
+
+def _extra_param_names(func, path: str) -> list[str]:
+    """Handler parameters that are neither path params nor `Depends(...)`
+    injections -- FastAPI binds these from the query string (simple types)
+    or the JSON body (Pydantic model params), so an id-like one here is just
+    as much an IDOR candidate as one in the URL path.
+    """
+    path_names = set(extract_path_param_names(path))
+    depends_names = _params_with_depends_default(func)
+    all_names = [a.arg for a in (func.args.posonlyargs + func.args.args + func.args.kwonlyargs)]
+    return [n for n in all_names if n not in path_names and n not in depends_names and n != "self"]
+
+
 def _depends_targets(func) -> list[str]:
     """Return the callable name inside every `Depends(...)` default value on
     this function's parameters (positional, keyword-only, or annotated
@@ -94,6 +159,7 @@ class FastAPIAnalyzer(BaseFrameworkAnalyzer):
     def find_routes(self) -> list[Route]:
         routes: list[Route] = []
         app_index = build_app_object_index(self.target_path)
+        router_mounts = _build_router_mounts(self.target_path)
 
         for py_file in iter_files(self.target_path, (".py",)):
             text = read_text_safe(py_file)
@@ -127,7 +193,9 @@ class FastAPIAnalyzer(BaseFrameworkAnalyzer):
                 if app_index.get(base_name) == "flask":
                     continue
 
-                path = route_deco.args[0] if isinstance(route_deco.args[0], str) else "?"
+                sub_path = route_deco.args[0] if isinstance(route_deco.args[0], str) else "?"
+                mount_prefix = resolve_mount_prefix(base_name, router_mounts)
+                path = join_path_segments(mount_prefix, sub_path) if sub_path != "?" else sub_path
                 auth_decorators = _depends_targets(func)
                 start_line, end_line = source_range(func)
 
@@ -142,6 +210,7 @@ class FastAPIAnalyzer(BaseFrameworkAnalyzer):
                         raw_snippet=f"@{route_deco.dotted}(...) def {func.name}(...)",
                         source_start_line=start_line,
                         source_end_line=end_line,
+                        extra_param_names=_extra_param_names(func, path),
                     )
                 )
 

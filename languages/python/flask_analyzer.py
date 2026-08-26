@@ -6,14 +6,27 @@ order, and Flask 2.x shortcut decorators (@app.get/@app.post/...) for free.
 """
 from __future__ import annotations
 
+import ast
+
 from checks import auth as auth_checks
+from checks import config as config_checks
 from checks import idor as idor_checks
 from core.base import BaseFrameworkAnalyzer
+from core.bodyscan import extract_request_field_names
 from core.fsutil import iter_files, read_text_safe
 from core.models import Finding, Route, ScanResult
+from core.paths import join_path_segments
 from core.registry import register
 from languages.python._app_index import build_app_object_index
-from languages.python._ast_utils import iter_functions, mock_import_names, parse_decorators, parse_source, source_range
+from languages.python._ast_utils import (
+    dotted_name,
+    iter_functions,
+    literal,
+    mock_import_names,
+    parse_decorators,
+    parse_source,
+    source_range,
+)
 
 # For `@app.route(...)`, methods come from the `methods=` kwarg (default
 # GET). The shortcut decorators fix the method outright.
@@ -66,11 +79,87 @@ def _detect_global_before_request_auth(target_path) -> tuple[str, int, str] | No
     return None
 
 
+def _build_blueprint_prefixes(target_path) -> dict[str, str]:
+    """Map blueprint variable name -> url_prefix, from either the
+    `Blueprint(..., url_prefix="...")` constructor call or a later
+    `app.register_blueprint(bp, url_prefix="...")` (which takes precedence
+    if both are present, matching Flask's own behavior). Without this, every
+    route on a blueprint mounted under a prefix reports its bare path.
+    """
+    prefixes: dict[str, str] = {}
+
+    for py_file in iter_files(target_path, (".py",)):
+        text = read_text_safe(py_file)
+        tree = parse_source(text, str(py_file))
+        if tree is None:
+            continue
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+                continue
+            constructor = dotted_name(node.value.func)
+            if constructor is None or constructor.rsplit(".", 1)[-1] != "Blueprint":
+                continue
+            prefix = next((literal(kw.value) for kw in node.value.keywords if kw.arg == "url_prefix"), None)
+            if prefix:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        prefixes[target.id] = prefix
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func_dotted = dotted_name(node.func)
+            if func_dotted is None or not func_dotted.endswith(".register_blueprint") or not node.args:
+                continue
+            bp_name = dotted_name(node.args[0])
+            if bp_name is None:
+                continue
+            prefix = next((literal(kw.value) for kw in node.keywords if kw.arg == "url_prefix"), None)
+            if prefix:
+                prefixes[bp_name] = prefix
+
+    return prefixes
+
+
+def _detect_debug_mode(target_path) -> list[Finding]:
+    """`app.run(debug=True)` or `app.debug = True` -- Flask's dev server
+    debug mode, which exposes the interactive Werkzeug debugger/stack
+    traces to anyone who can trigger a 500.
+    """
+    findings: list[Finding] = []
+    for py_file in iter_files(target_path, (".py",)):
+        text = read_text_safe(py_file)
+        tree = parse_source(text, str(py_file))
+        if tree is None:
+            continue
+        relative_file = str(py_file.relative_to(target_path))
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func_dotted = dotted_name(node.func)
+                if func_dotted and func_dotted.rsplit(".", 1)[-1] == "run":
+                    for kw in node.keywords:
+                        if kw.arg == "debug" and literal(kw.value) is True:
+                            findings.append(
+                                config_checks.debug_mode_finding(relative_file, node.lineno, f"{func_dotted}(debug=True)")
+                            )
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    target_dotted = dotted_name(target)
+                    if target_dotted and target_dotted.rsplit(".", 1)[-1] == "debug" and literal(node.value) is True:
+                        findings.append(
+                            config_checks.debug_mode_finding(relative_file, node.lineno, f"{target_dotted} = True")
+                        )
+    return findings
+
+
 @register("python", "flask")
 class FlaskAnalyzer(BaseFrameworkAnalyzer):
     def find_routes(self) -> list[Route]:
         routes: list[Route] = []
         app_index = build_app_object_index(self.target_path)
+        blueprint_prefixes = _build_blueprint_prefixes(self.target_path)
 
         for py_file in iter_files(self.target_path, (".py",)):
             text = read_text_safe(py_file)
@@ -104,12 +193,16 @@ class FlaskAnalyzer(BaseFrameworkAnalyzer):
                 if app_index.get(base_name) == "fastapi":
                     continue
 
-                path = route_deco.args[0] if isinstance(route_deco.args[0], str) else "?"
+                sub_path = route_deco.args[0] if isinstance(route_deco.args[0], str) else "?"
+                prefix = blueprint_prefixes.get(base_name, "")
+                path = join_path_segments(prefix, sub_path) if sub_path != "?" else sub_path
                 fixed_methods = _ROUTE_DECORATOR_METHODS[route_deco.name]
                 methods = fixed_methods or route_deco.kwargs.get("methods") or ["GET"]
 
                 auth_decorators = [d.name for d in decorators if d is not route_deco]
                 start_line, end_line = source_range(func)
+                body_text = "\n".join(text.split("\n")[start_line - 1:end_line])
+                extra_params = extract_request_field_names(body_text)
 
                 routes.append(
                     Route(
@@ -122,6 +215,7 @@ class FlaskAnalyzer(BaseFrameworkAnalyzer):
                         raw_snippet=f"@{route_deco.dotted}(...) def {func.name}(...)",
                         source_start_line=start_line,
                         source_end_line=end_line,
+                        extra_param_names=extra_params,
                     )
                 )
 
@@ -131,9 +225,10 @@ class FlaskAnalyzer(BaseFrameworkAnalyzer):
         findings: list[Finding] = []
         findings += idor_checks.check_id_param_routes(routes)
         findings += auth_checks.check_missing_auth_indicator(routes, KNOWN_AUTH_INDICATORS)
+        findings += _detect_debug_mode(self.target_path)
         # TODO: Flask-specific checks -- e.g. flag routes using
-        # request.args/json values directly in raw SQL, or debug=True in
-        # app.run(), or missing CSRF protection on state-changing routes.
+        # request.args/json values directly in raw SQL, or missing CSRF
+        # protection on state-changing routes.
         return findings
 
     def analyze(self) -> ScanResult:

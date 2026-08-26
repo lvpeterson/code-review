@@ -1,8 +1,11 @@
 # Python's own analyzers (flask/fastapi/django) use the stdlib `ast` module
 # -- no dependency needed there.
 
-javalang==0.13.0          # Java AST parser, used by languages/java/spring_analyzer.py
-tree-sitter==0.26.0               # JS/TS parsing core, used by languages/javascript/express_analyzer.py
-tree-sitter-javascript==0.25.0    # JS grammar for tree-sitter
-tree-sitter-typescript==0.23.2    # TS grammar for tree-sitter (handles .ts files)
+javalang==0.13.0                  # Java AST parser, used by languages/java/spring_analyzer.py
+tree-sitter==0.26.0                       # JS/TS/Go/C#/Ruby parsing core
+tree-sitter-javascript==0.25.0            # JS grammar (Express, Next.js)
+tree-sitter-typescript==0.23.2            # TS grammar (Express, Next.js .ts files)
+tree-sitter-go==0.25.0                    # Go grammar (gin, net/http)
+tree-sitter-c-sharp==0.23.5               # C# grammar (ASP.NET Core)
+tree-sitter-ruby==0.23.1                  # Ruby grammar (Rails, Sinatra)
 pygments==2.21.0                  # syntax highlighting for the HTML report's code view

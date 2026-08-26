@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "appsec-review"
+version = "0.1.0"
+description = "Baseline appsec code review scaffold -- framework-aware route/auth discovery for Flask, FastAPI, Django, Spring, Express, Next.js, Gin/net-http, ASP.NET Core, and Rails/Sinatra"
+requires-python = ">=3.10"
+dependencies = [
+    "javalang==0.13.0",
+    "tree-sitter==0.26.0",
+    "tree-sitter-javascript==0.25.0",
+    "tree-sitter-typescript==0.23.2",
+    "tree-sitter-go==0.25.0",
+    "tree-sitter-c-sharp==0.23.5",
+    "tree-sitter-ruby==0.23.1",
+    "pygments==2.21.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+appsec-review = "main:main"
+
+[tool.setuptools]
+py-modules = ["main", "enumerator"]
+packages = [
+    "core",
+    "checks",
+    "languages",
+    "languages.python",
+    "languages.java",
+    "languages.javascript",
+    "languages.go",
+    "languages.ruby",
+    "languages.dotnet",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

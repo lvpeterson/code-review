@@ -17,6 +17,15 @@ class Route:
     auth_decorators: list[str] = field(default_factory=list)
     raw_snippet: str = ""
 
+    # Best-effort names of query-string/body/form parameters the handler
+    # reads (FastAPI: extra signature params; Spring: @RequestParam/
+    # @RequestBody fields; Flask/Express/Django: request.args/request.json/
+    # req.query/req.body accesses in the handler body). Path params are
+    # tracked separately via `path` itself (core/paths.py extracts them) --
+    # this exists so checks/idor.py can also catch an id-like value passed
+    # via query string or JSON body, not just in the URL path.
+    extra_param_names: list[str] = field(default_factory=list)
+
     # Full source range of the handler implementation, for the HTML report's
     # expandable code view. `source_file` defaults to `file` when unset --
     # only set it when the handler lives elsewhere (e.g. Django's urls.py

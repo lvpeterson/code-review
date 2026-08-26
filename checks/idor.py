@@ -27,29 +27,47 @@ def _is_id_like(param_name: str) -> bool:
 
 
 def find_id_like_params(route: Route) -> list[str]:
+    """Id-like names from the path only -- kept for anything that still
+    wants just that (e.g. the HTML report highlights path params
+    specifically, since those are the ones it can underline in the URL).
+    """
     return [name for name in extract_path_param_names(route.path) if _is_id_like(name)]
 
 
 def check_id_param_routes(routes: list[Route]) -> list[Finding]:
-    """Flag routes whose path takes an object id -- classic IDOR candidates.
+    """Flag routes that take an object id via the path *or* a query-string/
+    body/form field -- classic IDOR candidates either way. `Route.path`
+    covers the former; `Route.extra_param_names` (best-effort, populated per
+    analyzer -- see each `_extract_extra_params`-style helper) covers the
+    latter, since `/search?user_id=123` or a JSON body `{"user_id": 123}`
+    is just as much an object reference as `/users/<user_id>`.
 
     TODO: extend this to inspect the handler body (once analyzers capture
     it) for an ownership check like `if resource.owner_id != current_user.id`.
     """
     findings: list[Finding] = []
     for route in routes:
-        id_params = find_id_like_params(route)
-        if not id_params:
+        path_ids = [name for name in extract_path_param_names(route.path) if _is_id_like(name)]
+        extra_ids = [name for name in route.extra_param_names if _is_id_like(name)]
+        if not path_ids and not extra_ids:
             continue
+
+        if path_ids and extra_ids:
+            where = f"path parameter(s) {', '.join(path_ids)} and query/body field(s) {', '.join(extra_ids)}"
+        elif path_ids:
+            where = f"path parameter(s) {', '.join(path_ids)}"
+        else:
+            where = f"query/body field(s) {', '.join(extra_ids)}"
+
         findings.append(
             Finding(
                 check_id="IDOR-001",
                 severity="info",
-                title=f"Route takes object identifier(s): {', '.join(id_params)}",
+                title=f"Route takes object identifier(s) via {where}",
                 description=(
-                    "Path includes an id-like parameter. Verify the handler checks "
-                    "that the authenticated user actually owns/may access the "
-                    "referenced object before returning or mutating it."
+                    "Verify the handler checks that the authenticated user actually "
+                    "owns/may access the referenced object before returning or "
+                    "mutating it."
                 ),
                 file=route.file,
                 line=route.line,

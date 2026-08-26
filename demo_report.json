@@ -1,0 +1,320 @@
+[
+  {
+    "language": "python",
+    "framework": "flask",
+    "routes": [
+      {
+        "path": "/invoices/<int:invoice_id>",
+        "methods": [
+          "GET"
+        ],
+        "handler_name": "get_invoice",
+        "file": "app.py",
+        "line": 6,
+        "auth_decorators": [],
+        "raw_snippet": "@app.route(...) def get_invoice(...)",
+        "extra_param_names": [],
+        "source_file": null,
+        "source_start_line": 6,
+        "source_end_line": 10,
+        "meta": {}
+      },
+      {
+        "path": "/invoices/<int:invoice_id>",
+        "methods": [
+          "DELETE"
+        ],
+        "handler_name": "delete_invoice",
+        "file": "app.py",
+        "line": 13,
+        "auth_decorators": [],
+        "raw_snippet": "@app.route(...) def delete_invoice(...)",
+        "extra_param_names": [],
+        "source_file": null,
+        "source_start_line": 13,
+        "source_end_line": 17,
+        "meta": {}
+      },
+      {
+        "path": "/account/profile",
+        "methods": [
+          "GET"
+        ],
+        "handler_name": "get_profile",
+        "file": "app.py",
+        "line": 20,
+        "auth_decorators": [
+          "login_required"
+        ],
+        "raw_snippet": "@app.route(...) def get_profile(...)",
+        "extra_param_names": [],
+        "source_file": null,
+        "source_start_line": 20,
+        "source_end_line": 23,
+        "meta": {}
+      },
+      {
+        "path": "/account/profile",
+        "methods": [
+          "POST"
+        ],
+        "handler_name": "update_profile",
+        "file": "app.py",
+        "line": 26,
+        "auth_decorators": [
+          "login_required"
+        ],
+        "raw_snippet": "@app.route(...) def update_profile(...)",
+        "extra_param_names": [],
+        "source_file": null,
+        "source_start_line": 26,
+        "source_end_line": 32,
+        "meta": {}
+      },
+      {
+        "path": "/healthz",
+        "methods": [
+          "GET"
+        ],
+        "handler_name": "health_check",
+        "file": "app.py",
+        "line": 35,
+        "auth_decorators": [],
+        "raw_snippet": "@app.route(...) def health_check(...)",
+        "extra_param_names": [],
+        "source_file": null,
+        "source_start_line": 35,
+        "source_end_line": 37,
+        "meta": {}
+      }
+    ],
+    "findings": [
+      {
+        "check_id": "IDOR-001",
+        "severity": "info",
+        "title": "Route takes object identifier(s) via path parameter(s) invoice_id",
+        "description": "Verify the handler checks that the authenticated user actually owns/may access the referenced object before returning or mutating it.",
+        "file": "app.py",
+        "line": 6
+      },
+      {
+        "check_id": "IDOR-001",
+        "severity": "info",
+        "title": "Route takes object identifier(s) via path parameter(s) invoice_id",
+        "description": "Verify the handler checks that the authenticated user actually owns/may access the referenced object before returning or mutating it.",
+        "file": "app.py",
+        "line": 13
+      },
+      {
+        "check_id": "AUTH-001",
+        "severity": "low",
+        "title": "No recognized auth control detected on route",
+        "description": "No known auth decorator/middleware/annotation was found on this route. Confirm whether it's intentionally public; if not, check for auth enforced elsewhere (global middleware, gateway, base class).",
+        "file": "app.py",
+        "line": 6
+      },
+      {
+        "check_id": "AUTH-001",
+        "severity": "medium",
+        "title": "No recognized auth control detected on route",
+        "description": "No known auth decorator/middleware/annotation was found on this route. Confirm whether it's intentionally public; if not, check for auth enforced elsewhere (global middleware, gateway, base class).",
+        "file": "app.py",
+        "line": 13
+      },
+      {
+        "check_id": "AUTH-001",
+        "severity": "low",
+        "title": "No recognized auth control detected on route",
+        "description": "No known auth decorator/middleware/annotation was found on this route. Confirm whether it's intentionally public; if not, check for auth enforced elsewhere (global middleware, gateway, base class).",
+        "file": "app.py",
+        "line": 35
+      }
+    ],
+    "notes": [],
+    "global_auth_source": null
+  },
+  {
+    "language": "java",
+    "framework": "spring",
+    "routes": [
+      {
+        "path": "/api/orders/{orderId}",
+        "methods": [
+          "GET"
+        ],
+        "handler_name": "getOrder",
+        "file": "OrderController.java",
+        "line": 10,
+        "auth_decorators": [],
+        "raw_snippet": "@GetMapping(...) getOrder(...)",
+        "extra_param_names": [],
+        "source_file": null,
+        "source_start_line": 9,
+        "source_end_line": 13,
+        "meta": {}
+      },
+      {
+        "path": "/api/orders/{orderId}/refund",
+        "methods": [
+          "POST"
+        ],
+        "handler_name": "refundOrder",
+        "file": "OrderController.java",
+        "line": 17,
+        "auth_decorators": [
+          "PreAuthorize"
+        ],
+        "raw_snippet": "@PostMapping(...) refundOrder(...)",
+        "extra_param_names": [],
+        "source_file": null,
+        "source_start_line": 15,
+        "source_end_line": 20,
+        "meta": {}
+      },
+      {
+        "path": "/api/orders/status",
+        "methods": [
+          "GET"
+        ],
+        "handler_name": "status",
+        "file": "OrderController.java",
+        "line": 23,
+        "auth_decorators": [],
+        "raw_snippet": "@GetMapping(...) status(...)",
+        "extra_param_names": [],
+        "source_file": null,
+        "source_start_line": 22,
+        "source_end_line": 25,
+        "meta": {}
+      }
+    ],
+    "findings": [
+      {
+        "check_id": "IDOR-001",
+        "severity": "info",
+        "title": "Route takes object identifier(s) via path parameter(s) orderId",
+        "description": "Verify the handler checks that the authenticated user actually owns/may access the referenced object before returning or mutating it.",
+        "file": "OrderController.java",
+        "line": 10
+      },
+      {
+        "check_id": "IDOR-001",
+        "severity": "info",
+        "title": "Route takes object identifier(s) via path parameter(s) orderId",
+        "description": "Verify the handler checks that the authenticated user actually owns/may access the referenced object before returning or mutating it.",
+        "file": "OrderController.java",
+        "line": 17
+      },
+      {
+        "check_id": "AUTH-001",
+        "severity": "low",
+        "title": "No recognized auth control detected on route",
+        "description": "No known auth decorator/middleware/annotation was found on this route. Confirm whether it's intentionally public; if not, check for auth enforced elsewhere (global middleware, gateway, base class).",
+        "file": "OrderController.java",
+        "line": 10
+      },
+      {
+        "check_id": "AUTH-001",
+        "severity": "low",
+        "title": "No recognized auth control detected on route",
+        "description": "No known auth decorator/middleware/annotation was found on this route. Confirm whether it's intentionally public; if not, check for auth enforced elsewhere (global middleware, gateway, base class).",
+        "file": "OrderController.java",
+        "line": 23
+      }
+    ],
+    "notes": [],
+    "global_auth_source": null
+  },
+  {
+    "language": "javascript",
+    "framework": "express",
+    "routes": [
+      {
+        "path": "/accounts/:accountId/balance",
+        "methods": [
+          "GET"
+        ],
+        "handler_name": "<inline handler>",
+        "file": "server.js",
+        "line": 5,
+        "auth_decorators": [],
+        "raw_snippet": "app.get('/accounts/:accountId/balance', function (req, res) {\n  const balance = ledger.getBalance(req.params.accountId);",
+        "extra_param_names": [],
+        "source_file": "server.js",
+        "source_start_line": 5,
+        "source_end_line": 8,
+        "meta": {}
+      },
+      {
+        "path": "/accounts/:accountId/transfer",
+        "methods": [
+          "POST"
+        ],
+        "handler_name": "accounts.transfer",
+        "file": "server.js",
+        "line": 10,
+        "auth_decorators": [
+          "requireAuth"
+        ],
+        "raw_snippet": "app.post('/accounts/:accountId/transfer', requireAuth, accounts.transfer)",
+        "extra_param_names": [],
+        "source_file": "accounts.js",
+        "source_start_line": 1,
+        "source_end_line": 5,
+        "meta": {}
+      },
+      {
+        "path": "/ping",
+        "methods": [
+          "GET"
+        ],
+        "handler_name": "<inline handler>",
+        "file": "server.js",
+        "line": 12,
+        "auth_decorators": [],
+        "raw_snippet": "app.get('/ping', function (req, res) {\n  res.send('pong');\n})",
+        "extra_param_names": [],
+        "source_file": "server.js",
+        "source_start_line": 12,
+        "source_end_line": 14,
+        "meta": {}
+      }
+    ],
+    "findings": [
+      {
+        "check_id": "IDOR-001",
+        "severity": "info",
+        "title": "Route takes object identifier(s) via path parameter(s) accountId",
+        "description": "Verify the handler checks that the authenticated user actually owns/may access the referenced object before returning or mutating it.",
+        "file": "server.js",
+        "line": 5
+      },
+      {
+        "check_id": "IDOR-001",
+        "severity": "info",
+        "title": "Route takes object identifier(s) via path parameter(s) accountId",
+        "description": "Verify the handler checks that the authenticated user actually owns/may access the referenced object before returning or mutating it.",
+        "file": "server.js",
+        "line": 10
+      },
+      {
+        "check_id": "AUTH-001",
+        "severity": "low",
+        "title": "No recognized auth control detected on route",
+        "description": "No known auth decorator/middleware/annotation was found on this route. Confirm whether it's intentionally public; if not, check for auth enforced elsewhere (global middleware, gateway, base class).",
+        "file": "server.js",
+        "line": 5
+      },
+      {
+        "check_id": "AUTH-001",
+        "severity": "low",
+        "title": "No recognized auth control detected on route",
+        "description": "No known auth decorator/middleware/annotation was found on this route. Confirm whether it's intentionally public; if not, check for auth enforced elsewhere (global middleware, gateway, base class).",
+        "file": "server.js",
+        "line": 12
+      }
+    ],
+    "notes": [],
+    "global_auth_source": null
+  }
+]

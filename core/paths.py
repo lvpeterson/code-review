@@ -30,3 +30,34 @@ def extract_path_param_names(path: str) -> list[str]:
     for m in _PARAM_NAME_PATTERN.finditer(path):
         names.append(m.group(1) or m.group(2) or m.group(3))
     return names
+
+
+def join_path_segments(*segments: str) -> str:
+    """Join route-path segments (a mount prefix chain + the route's own
+    sub-path) into one normalized path, regardless of which segments do or
+    don't have leading/trailing slashes.
+    """
+    parts = [s.strip("/") for s in segments if s and s.strip("/")]
+    return "/" + "/".join(parts) if parts else "/"
+
+
+def resolve_mount_prefix(base_name: str, mounts: dict[str, tuple[str, str]]) -> str:
+    """Walk a chain of `child -> (parent, prefix)` mount records (built by
+    each analyzer from its own framework's "include this router/blueprint
+    under this prefix" call) starting at `base_name`, and return the full
+    accumulated prefix -- root-most segment first.
+
+    Shared because FastAPI (`include_router`), Express
+    (`app.use(path, router)`), and Flask (`register_blueprint`/`Blueprint`)
+    all have the same shape of problem even though the call that produces
+    the mount looks different in each.
+    """
+    prefix_parts = []
+    current = base_name
+    seen = set()
+    while current in mounts and current not in seen:
+        seen.add(current)
+        parent, prefix = mounts[current]
+        prefix_parts.append(prefix)
+        current = parent
+    return join_path_segments(*reversed(prefix_parts))

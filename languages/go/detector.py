@@ -13,14 +13,23 @@ def detect_language(target_path: Path) -> bool:
 
 
 def detect_frameworks(target_path: Path) -> list[str]:
-    """Return every framework detected: "gin" and/or "net_http".
+    """Return every framework detected: "gin" and/or "net_http" -- not
+    mutually exclusive, since a real app can use gin for its main API and
+    still register a raw net/http handler somewhere (a health check, a
+    pprof endpoint, ...).
 
-    TODO: this is a stub -- only distinguishes gin vs stdlib net/http via
-    go.mod. Add gorilla/mux, echo, fiber, etc following this same pattern.
+    TODO: add gorilla/mux, echo, fiber, etc following this same pattern.
     """
+    found: set[str] = set()
+
     mod_text = read_text_safe(target_path / "go.mod").lower()
     if "gin-gonic/gin" in mod_text:
-        return ["gin"]
-    if any(True for _ in iter_files(target_path, (".go",))):
-        return ["net_http"]
-    return []
+        found.add("gin")
+
+    for go_file in iter_files(target_path, (".go",)):
+        text = read_text_safe(go_file)
+        if ".HandleFunc(" in text or "http.NewServeMux" in text:
+            found.add("net_http")
+            break
+
+    return sorted(found)

@@ -11,6 +11,7 @@ from __future__ import annotations
 import javalang
 
 from checks import auth as auth_checks
+from checks import config as config_checks
 from checks import idor as idor_checks
 from core.base import BaseFrameworkAnalyzer
 from core.fsutil import iter_files, read_text_safe
@@ -152,6 +153,44 @@ def _detect_global_security_filter_chain(target_path) -> tuple[str, int, str] | 
     return None
 
 
+def _extra_param_names(member) -> list[str]:
+    """Method parameters annotated @RequestParam/@RequestBody -- Spring
+    binds these from the query string / JSON body respectively, so an
+    id-like one here is just as much an IDOR candidate as one in the path.
+    """
+    names = []
+    for param in member.parameters:
+        ann_names = {a.name for a in param.annotations}
+        if "RequestParam" in ann_names or "RequestBody" in ann_names:
+            names.append(param.name)
+    return names
+
+
+def _detect_cors_wildcards(target_path) -> list[Finding]:
+    """@CrossOrigin with no explicit origins (Spring's own default in that
+    case is to allow all) or an explicit "*" -- both mean any site can make
+    a cross-origin request against this controller/method.
+    """
+    findings: list[Finding] = []
+    for java_file in iter_files(target_path, (".java",)):
+        text = read_text_safe(java_file)
+        try:
+            tree = javalang.parse.parse(text)
+        except Exception:
+            continue
+        relative_file = str(java_file.relative_to(target_path))
+
+        for _, node in tree.filter(javalang.tree.Annotation):
+            if node.name != "CrossOrigin" or not node.position:
+                continue
+            values = _annotation_values(node)
+            origins = values.get("value") or values.get("origins")
+            if origins is None or "*" in origins:
+                description = f"@CrossOrigin{'(origins=' + origins + ')' if origins else ''}".strip()
+                findings.append(config_checks.cors_wildcard_finding(relative_file, node.position.line, description))
+    return findings
+
+
 @register("java", "spring")
 class SpringAnalyzer(BaseFrameworkAnalyzer):
     def find_routes(self) -> list[Route]:
@@ -213,6 +252,7 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
                             raw_snippet=f"@{mapping_annotation.name}(...) {member.name}(...)",
                             source_start_line=start_line or None,
                             source_end_line=end_line or None,
+                            extra_param_names=_extra_param_names(member),
                         )
                     )
 
@@ -222,9 +262,10 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
         findings: list[Finding] = []
         findings += idor_checks.check_id_param_routes(routes)
         findings += auth_checks.check_missing_auth_indicator(routes, KNOWN_AUTH_INDICATORS)
-        # TODO: Spring-specific checks -- e.g. @CrossOrigin("*"), missing
-        # CSRF config, JPA repository methods exposed directly (Spring Data
-        # REST) without ownership filtering.
+        findings += _detect_cors_wildcards(self.target_path)
+        # TODO: Spring-specific checks -- e.g. missing CSRF config, JPA
+        # repository methods exposed directly (Spring Data REST) without
+        # ownership filtering.
         return findings
 
     def analyze(self) -> ScanResult:

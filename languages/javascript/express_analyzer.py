@@ -22,10 +22,13 @@ import tree_sitter_typescript as tsts
 from tree_sitter import Language, Node, Parser
 
 from checks import auth as auth_checks
+from checks import config as config_checks
 from checks import idor as idor_checks
 from core.base import BaseFrameworkAnalyzer
+from core.bodyscan import extract_request_field_names
 from core.fsutil import iter_files, read_text_safe
 from core.models import Finding, Route, ScanResult
+from core.paths import join_path_segments, resolve_mount_prefix
 from core.registry import register
 
 _JS_LANGUAGE = Language(tsjs.language())
@@ -239,6 +242,84 @@ def _detect_global_use_middleware(target_path: Path) -> tuple[str, int, str] | N
     return None
 
 
+def _build_router_mounts(target_path: Path) -> dict[str, tuple[str, str]]:
+    """Map child router variable name -> (parent object name, prefix) from
+    every `parent.use('/prefix', ..., childRouter)` call in the project --
+    matched by variable name across files, same limitation as
+    _build_handler_index (a router required under one name in one file and
+    exported/required under the same name elsewhere resolves fine; a
+    renaming import doesn't). Without this, `app.use('/api', apiRouter)`
+    mounted routes report their bare sub-path instead of "/api/...".
+    """
+    mounts: dict[str, tuple[str, str]] = {}
+    for src_file in iter_files(target_path, (".js", ".ts")):
+        src = read_text_safe(src_file).encode("utf-8")
+        if not src:
+            continue
+        tree = _parser_for(src_file).parse(src)
+
+        for node in _iter_nodes(tree.root_node):
+            if node.type != "call_expression":
+                continue
+            func = node.child_by_field_name("function")
+            if func is None or func.type != "member_expression":
+                continue
+            obj = func.child_by_field_name("object")
+            prop = func.child_by_field_name("property")
+            if obj is None or prop is None or obj.type != "identifier" or _node_text(prop, src) != "use":
+                continue
+
+            args_node = node.child_by_field_name("arguments")
+            if args_node is None:
+                continue
+            args = args_node.named_children
+            # `app.use('/prefix', ...middleware, router)` -- a path string
+            # followed by one or more args, the last of which is the router.
+            if len(args) < 2 or args[0].type != "string":
+                continue
+            router_arg = args[-1]
+            if router_arg.type != "identifier":
+                continue
+
+            prefix = _string_value(args[0], src) or ""
+            mounts[_node_text(router_arg, src)] = (_node_text(obj, src), prefix)
+    return mounts
+
+
+def _detect_cors_wildcards(target_path: Path) -> list[Finding]:
+    """A bare `cors()` call (no options object) defaults to allowing any
+    origin -- same for `cors({ origin: '*' })` / `cors({ origin: true })`
+    written out explicitly.
+    """
+    findings: list[Finding] = []
+    for src_file in iter_files(target_path, (".js", ".ts")):
+        src = read_text_safe(src_file).encode("utf-8")
+        if not src:
+            continue
+        tree = _parser_for(src_file).parse(src)
+        relative_file = str(src_file.relative_to(target_path))
+
+        for node in _iter_nodes(tree.root_node):
+            if node.type != "call_expression":
+                continue
+            func = node.child_by_field_name("function")
+            if func is None or _node_text(func, src) != "cors":
+                continue
+
+            args_node = node.child_by_field_name("arguments")
+            args = args_node.named_children if args_node else []
+            line = node.start_point[0] + 1
+
+            if not args:
+                findings.append(config_checks.cors_wildcard_finding(relative_file, line, "cors() called with no options"))
+                continue
+
+            call_text = _node_text(node, src)
+            if "origin:" in call_text and ("'*'" in call_text or '"*"' in call_text or "origin: true" in call_text):
+                findings.append(config_checks.cors_wildcard_finding(relative_file, line, call_text[:120]))
+    return findings
+
+
 def _build_handler_index(target_path: Path) -> dict[str, tuple[str, int, int]]:
     """Project-wide map of function name -> (file, start_line, end_line),
     used to resolve a named handler passed by reference to its real body.
@@ -260,6 +341,7 @@ class ExpressAnalyzer(BaseFrameworkAnalyzer):
     def find_routes(self) -> list[Route]:
         routes: list[Route] = []
         handler_index = _build_handler_index(self.target_path)
+        router_mounts = _build_router_mounts(self.target_path)
 
         for src_file in iter_files(self.target_path, (".js", ".ts")):
             text = read_text_safe(src_file)
@@ -275,7 +357,9 @@ class ExpressAnalyzer(BaseFrameworkAnalyzer):
                 extracted = _extract_route_call(node, src)
                 if extracted is None:
                     continue
-                obj_name, verb, path, rest_args = extracted
+                obj_name, verb, sub_path, rest_args = extracted
+                mount_prefix = resolve_mount_prefix(obj_name, router_mounts)
+                path = join_path_segments(mount_prefix, sub_path)
 
                 # Only skip when this *same file* shadows the name with
                 # something that's provably not an express()/Router() AND
@@ -298,10 +382,20 @@ class ExpressAnalyzer(BaseFrameworkAnalyzer):
 
                 route_line = node.start_point[0] + 1
                 if handler_name == "<inline handler>":
-                    # The call itself already spans the whole inline body.
+                    # The call itself already spans the whole inline body --
+                    # scan it directly for req.query/req.body reads.
                     source_file = str(src_file.relative_to(self.target_path))
                     source_start = route_line
                     source_end = node.end_point[0] + 1
+                    extra_params = extract_request_field_names(_node_text(node, src))
+                elif source_file is not None:
+                    # Named handler resolved to a body elsewhere (possibly a
+                    # different file) -- re-read that range to scan it too.
+                    handler_text = read_text_safe(self.target_path / source_file)
+                    handler_lines = handler_text.split("\n")[source_start - 1:source_end]
+                    extra_params = extract_request_field_names("\n".join(handler_lines))
+                else:
+                    extra_params = []
 
                 routes.append(
                     Route(
@@ -315,6 +409,7 @@ class ExpressAnalyzer(BaseFrameworkAnalyzer):
                         source_file=source_file,
                         source_start_line=source_start,
                         source_end_line=source_end,
+                        extra_param_names=extra_params,
                     )
                 )
 
@@ -324,8 +419,9 @@ class ExpressAnalyzer(BaseFrameworkAnalyzer):
         findings: list[Finding] = []
         findings += idor_checks.check_id_param_routes(routes)
         findings += auth_checks.check_missing_auth_indicator(routes, KNOWN_AUTH_INDICATORS)
-        # TODO: Express-specific checks -- e.g. cors() with no origin
-        # restriction, missing helmet(), body-parser without size limits.
+        findings += _detect_cors_wildcards(self.target_path)
+        # TODO: Express-specific checks -- e.g. missing helmet(),
+        # body-parser without size limits.
         return findings
 
     def analyze(self) -> ScanResult:

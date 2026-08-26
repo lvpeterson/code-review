@@ -13,8 +13,10 @@ import ast
 from dataclasses import dataclass, field
 
 from checks import auth as auth_checks
+from checks import config as config_checks
 from checks import idor as idor_checks
 from core.base import BaseFrameworkAnalyzer
+from core.bodyscan import extract_request_field_names
 from core.fsutil import iter_files, read_text_safe
 from core.models import Finding, Route, ScanResult
 from core.registry import register
@@ -42,6 +44,7 @@ class _ViewInfo:
     start_line: int
     end_line: int
     auth_tokens: list[str] = field(default_factory=list)
+    extra_param_names: list[str] = field(default_factory=list)
 
 
 def _describe_view(node: ast.AST) -> tuple[str, str]:
@@ -76,11 +79,15 @@ def _build_view_index(target_path) -> dict[str, _ViewInfo]:
             continue
         relative_file = str(py_file.relative_to(target_path))
 
+        lines = text.split("\n")
+
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 tokens = [d.name for d in parse_decorators(node) if d.name in KNOWN_AUTH_INDICATORS]
                 start_line, end_line = source_range(node)
-                index[node.name] = _ViewInfo(relative_file, start_line, end_line, tokens)
+                body_text = "\n".join(lines[start_line - 1:end_line])
+                extra_params = extract_request_field_names(body_text)
+                index[node.name] = _ViewInfo(relative_file, start_line, end_line, tokens, extra_params)
 
             elif isinstance(node, ast.ClassDef):
                 tokens = [d.name for d in parse_decorators(node) if d.name in KNOWN_AUTH_INDICATORS]
@@ -100,7 +107,9 @@ def _build_view_index(target_path) -> dict[str, _ViewInfo]:
                         tokens.append("permission_classes")
 
                 start_line, end_line = source_range(node)
-                index[node.name] = _ViewInfo(relative_file, start_line, end_line, tokens)
+                body_text = "\n".join(lines[start_line - 1:end_line])
+                extra_params = extract_request_field_names(body_text)
+                index[node.name] = _ViewInfo(relative_file, start_line, end_line, tokens, extra_params)
 
     return index
 
@@ -154,6 +163,30 @@ def _detect_drf_default_permissions(target_path) -> tuple[str, int, str] | None:
     return None
 
 
+def _detect_debug_mode(target_path) -> list[Finding]:
+    """`DEBUG = True` in settings.py -- Django's debug page dumps full
+    stack traces, local variable values, and request data to any error.
+    """
+    findings: list[Finding] = []
+    for py_file in iter_files(target_path, (".py",)):
+        if py_file.name != "settings.py":
+            continue
+        text = read_text_safe(py_file)
+        tree = parse_source(text, str(py_file))
+        if tree is None:
+            continue
+        relative_file = str(py_file.relative_to(target_path))
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            if not any(isinstance(t, ast.Name) and t.id == "DEBUG" for t in node.targets):
+                continue
+            if literal(node.value) is True:
+                findings.append(config_checks.debug_mode_finding(relative_file, node.lineno, "DEBUG = True"))
+    return findings
+
+
 @register("python", "django")
 class DjangoAnalyzer(BaseFrameworkAnalyzer):
     def find_routes(self) -> list[Route]:
@@ -196,6 +229,7 @@ class DjangoAnalyzer(BaseFrameworkAnalyzer):
                         source_file=view_info.file if view_info else None,
                         source_start_line=view_info.start_line if view_info else None,
                         source_end_line=view_info.end_line if view_info else None,
+                        extra_param_names=view_info.extra_param_names if view_info else [],
                     )
                 )
 
@@ -205,9 +239,10 @@ class DjangoAnalyzer(BaseFrameworkAnalyzer):
         findings: list[Finding] = []
         findings += idor_checks.check_id_param_routes(routes)
         findings += auth_checks.check_missing_auth_indicator(routes, KNOWN_AUTH_INDICATORS)
-        # TODO: Django-specific checks -- e.g. DEBUG=True in settings.py,
-        # missing @csrf_protect on state-changing views, raw SQL via .raw()/
-        # extra() with unsanitized input.
+        findings += _detect_debug_mode(self.target_path)
+        # TODO: Django-specific checks -- e.g. missing @csrf_protect on
+        # state-changing views, raw SQL via .raw()/extra() with unsanitized
+        # input.
         return findings
 
     def analyze(self) -> ScanResult:
