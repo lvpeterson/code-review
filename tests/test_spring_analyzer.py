@@ -92,3 +92,91 @@ def test_cross_origin_with_specific_origin_is_not_flagged(tmp_path):
     analyzer = SpringAnalyzer(tmp_path)
     findings = analyzer.run_baseline_checks(analyzer.find_routes())
     assert not any(f.check_id == "CONFIG-002" for f in findings)
+
+
+def test_path_variable_constraint_captured_and_class_validated_detected(tmp_path):
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n"
+        "import org.springframework.validation.annotation.Validated;\n"
+        "import jakarta.validation.constraints.Positive;\n\n"
+        "@RestController\n"
+        "@Validated\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @GetMapping(\"/{orderId}\")\n"
+        "    public Order getOrder(@PathVariable @Positive Long orderId) { return null; }\n"
+        "}\n",
+    )
+    routes = SpringAnalyzer(tmp_path).find_routes()
+    assert routes[0].class_validated is True
+    assert routes[0].param_validations == {"orderId": ["Positive"]}
+
+
+def test_constraint_without_class_validated_is_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n"
+        "import jakarta.validation.constraints.Positive;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @GetMapping(\"/{orderId}\")\n"
+        "    public Order getOrder(@PathVariable @Positive Long orderId) { return null; }\n"
+        "}\n",
+    )
+    analyzer = SpringAnalyzer(tmp_path)
+    findings = analyzer.run_baseline_checks(analyzer.find_routes())
+    assert any(f.check_id == "VALID-001" for f in findings)
+
+
+def test_path_variable_without_any_constraint_is_not_flagged_by_valid_001(tmp_path):
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @GetMapping(\"/{orderId}\")\n"
+        "    public Order getOrder(@PathVariable Long orderId) { return null; }\n"
+        "}\n",
+    )
+    analyzer = SpringAnalyzer(tmp_path)
+    findings = analyzer.run_baseline_checks(analyzer.find_routes())
+    assert not any(f.check_id == "VALID-001" for f in findings)
+
+
+def test_spring_boot_version_detected_from_parent_pom(tmp_path):
+    _write(
+        tmp_path,
+        "pom.xml",
+        "<project>\n"
+        "  <parent>\n"
+        "    <groupId>org.springframework.boot</groupId>\n"
+        "    <artifactId>spring-boot-starter-parent</artifactId>\n"
+        "    <version>2.1.0.RELEASE</version>\n"
+        "  </parent>\n"
+        "</project>\n",
+    )
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @GetMapping(\"/\")\n"
+        "    public String list() { return \"\"; }\n"
+        "}\n",
+    )
+    result = SpringAnalyzer(tmp_path).analyze()
+    assert result.framework_version == "2.1.0.RELEASE"
+    assert result.framework_version_label == "Spring Boot"
+    assert any(f.check_id == "CONFIG-003" and f.severity == "medium" for f in result.findings)

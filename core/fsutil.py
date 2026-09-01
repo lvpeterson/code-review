@@ -24,6 +24,19 @@ def iter_files(root: Path, extensions: tuple[str, ...]) -> Iterator[Path]:
             yield path
 
 
+def iter_named_files(root: Path, names: tuple[str, ...]) -> Iterator[Path]:
+    """Yield files under root whose exact filename matches one of `names`,
+    skipping the same noise dirs as iter_files. Build files (pom.xml,
+    build.gradle, ...) don't have a useful extension to filter on."""
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if any(part in _SKIP_DIRS for part in path.parts):
+            continue
+        if path.name in names:
+            yield path
+
+
 def read_text_safe(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8", errors="ignore")

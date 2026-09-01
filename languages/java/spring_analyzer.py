@@ -8,13 +8,16 @@ mapping annotation it's paired with.
 """
 from __future__ import annotations
 
+import re
+
 import javalang
 
 from checks import auth as auth_checks
 from checks import config as config_checks
 from checks import idor as idor_checks
+from checks import validation as validation_checks
 from core.base import BaseFrameworkAnalyzer
-from core.fsutil import iter_files, read_text_safe
+from core.fsutil import iter_files, iter_named_files, read_text_safe
 from core.models import Finding, Route, ScanResult
 from core.registry import register
 
@@ -34,6 +37,16 @@ KNOWN_AUTH_INDICATORS = {
     "Secured",
     "RolesAllowed",
     "PostAuthorize",
+}
+
+# Bean Validation (JSR 380) constraint annotations -- javax.validation.constraints
+# and jakarta.validation.constraints alike, since javalang only exposes the bare
+# annotation name, not its resolved package.
+KNOWN_VALIDATION_CONSTRAINTS = {
+    "NotNull", "NotBlank", "NotEmpty", "Min", "Max", "DecimalMin", "DecimalMax",
+    "Digits", "Size", "Pattern", "Email", "Positive", "PositiveOrZero",
+    "Negative", "NegativeOrZero", "Future", "FutureOrPresent", "Past",
+    "PastOrPresent", "AssertTrue", "AssertFalse",
 }
 
 
@@ -166,6 +179,103 @@ def _extra_param_names(member) -> list[str]:
     return names
 
 
+def _param_validations(member) -> dict[str, list[str]]:
+    """Bean Validation constraint annotations on each @PathVariable/
+    @RequestParam of `member`, keyed by param name -- an empty list means
+    the param was seen but carries no recognized constraint annotation.
+    Deliberately scoped to these two (rather than every parameter): they're
+    the ones Spring only validates via the class-level @Validated AOP path,
+    unlike a @Valid @RequestBody DTO, which validates independently of it.
+    """
+    result: dict[str, list[str]] = {}
+    for param in member.parameters:
+        ann_names = {a.name for a in param.annotations}
+        if "PathVariable" not in ann_names and "RequestParam" not in ann_names:
+            continue
+        result[param.name] = sorted(ann_names & KNOWN_VALIDATION_CONSTRAINTS)
+    return result
+
+
+_POM_PARENT_RE = re.compile(r"<parent>(?P<block>.*?)</parent>", re.DOTALL)
+_POM_VERSION_TAG_RE = re.compile(r"<version>\s*([^<\s]+)\s*</version>")
+_POM_PROPERTY_VERSION_RE = re.compile(
+    r"<(spring-boot\.version|spring\.version)>\s*([^<\s]+)\s*</\1>"
+)
+_GRADLE_BOOT_PLUGIN_RE = re.compile(
+    r"org\.springframework\.boot[\"']\s*\)?\s*version\s*[\"']([^\"']+)[\"']"
+)
+
+
+def _line_of(text: str, index: int) -> int:
+    return text.count("\n", 0, index) + 1
+
+
+def _detect_spring_version(target_path) -> tuple[str, str, str, int, str] | None:
+    """Best-effort Spring Boot/Framework version detection from the
+    project's build file, so the report can flag an obviously outdated
+    runtime. Checked in order of how authoritative the signal is: an
+    explicit version property overrides whatever the parent POM/Gradle
+    plugin declares by default, since a project can (and often does) pin a
+    different version than its parent.
+
+    Returns (label, version, file, line, description) or None if nothing
+    was found. `label` distinguishes "Spring Boot" from bare
+    "Spring Framework", since they have separate support timelines.
+    """
+    for pom in iter_named_files(target_path, ("pom.xml",)):
+        text = read_text_safe(pom)
+        relative_file = str(pom.relative_to(target_path))
+
+        prop_match = _POM_PROPERTY_VERSION_RE.search(text)
+        if prop_match:
+            prop_name, version = prop_match.group(1), prop_match.group(2)
+            label = "Spring Boot" if "boot" in prop_name else "Spring Framework"
+            return label, version, relative_file, _line_of(text, prop_match.start()), f"<{prop_name}> property"
+
+        parent_match = _POM_PARENT_RE.search(text)
+        if parent_match and "spring-boot-starter-parent" in parent_match.group("block"):
+            version_match = _POM_VERSION_TAG_RE.search(parent_match.group("block"))
+            if version_match:
+                offset = parent_match.start() + version_match.start()
+                return "Spring Boot", version_match.group(1), relative_file, _line_of(text, offset), "spring-boot-starter-parent parent POM"
+
+    for build_file in iter_named_files(target_path, ("build.gradle", "build.gradle.kts")):
+        text = read_text_safe(build_file)
+        relative_file = str(build_file.relative_to(target_path))
+        match = _GRADLE_BOOT_PLUGIN_RE.search(text)
+        if match:
+            return "Spring Boot", match.group(1), relative_file, _line_of(text, match.start()), "org.springframework.boot Gradle plugin"
+
+    return None
+
+
+def _classify_spring_version(label: str, version: str) -> tuple[str, str]:
+    """Not a CVE feed -- just a coarse, major-version-bucketed staleness
+    check against Spring's own published support timeline, so a clearly
+    ancient runtime gets flagged loudly and a current-looking one still
+    gets a nudge to verify the exact minor/patch line's status.
+    """
+    leading = version.split(".", 1)[0]
+    major = int(leading) if leading.isdigit() else None
+    support_url = (
+        "https://spring.io/projects/spring-boot#support"
+        if label == "Spring Boot"
+        else "https://spring.io/projects/spring-framework#support"
+    )
+
+    if major is None:
+        return "info", f"Could not parse a major version from '{version}' -- verify manually at {support_url}."
+
+    eol_major = 1 if label == "Spring Boot" else 4
+    tail_major = 2 if label == "Spring Boot" else 5
+
+    if major <= eol_major:
+        return "high", f"{label} {major}.x is end of life and receives no security patches -- upgrading is strongly recommended."
+    if major == tail_major:
+        return "medium", f"{label} {major}.x is on or past the tail of its OSS support window -- confirm this minor/patch line still receives security patches at {support_url}, and cross-check for known CVEs (NVD, Spring Security Advisories)."
+    return "info", f"{label} {version} detected -- confirm this specific minor/patch line is still within Spring's active support window ({support_url}) and check for known CVEs."
+
+
 def _detect_cors_wildcards(target_path) -> list[Finding]:
     """@CrossOrigin with no explicit origins (Spring's own default in that
     case is to allow all) or an explicit "*" -- both mean any site can make
@@ -211,6 +321,7 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
                 if not ({"RestController", "Controller"} & class_annotation_names):
                     continue
 
+                class_validated = "Validated" in class_annotation_names
                 base_path = ""
                 for annotation in class_node.annotations:
                     if annotation.name == "RequestMapping":
@@ -253,6 +364,8 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
                             source_start_line=start_line or None,
                             source_end_line=end_line or None,
                             extra_param_names=_extra_param_names(member),
+                            param_validations=_param_validations(member),
+                            class_validated=class_validated,
                         )
                     )
 
@@ -262,6 +375,7 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
         findings: list[Finding] = []
         findings += idor_checks.check_id_param_routes(routes)
         findings += auth_checks.check_missing_auth_indicator(routes, KNOWN_AUTH_INDICATORS)
+        findings += validation_checks.check_validation_without_class_annotation(routes)
         findings += _detect_cors_wildcards(self.target_path)
         # TODO: Spring-specific checks -- e.g. missing CSRF config, JPA
         # repository methods exposed directly (Spring Data REST) without
@@ -273,4 +387,15 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
         detected = _detect_global_security_filter_chain(self.target_path)
         if detected:
             auth_checks.apply_global_auth_note(result, *detected)
+
+        version_info = _detect_spring_version(self.target_path)
+        if version_info:
+            label, version, file, line, description = version_info
+            result.framework_version = version
+            result.framework_version_label = label
+            result.framework_version_source = (file, line, description)
+            severity, note = _classify_spring_version(label, version)
+            result.findings.append(
+                config_checks.outdated_framework_finding(file, line, severity, label, version, note)
+            )
         return result

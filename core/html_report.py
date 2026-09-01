@@ -154,6 +154,28 @@ def _render_finding(finding: Finding) -> str:
     </div>"""
 
 
+def _render_validation_note(route: Route) -> str:
+    """"validation: @Validated (class-wide) · orderId: @Positive · note: none"
+    -- a quick-glance line, parallel to the auth-note, so a reviewer can see
+    both halves of Bean Validation coverage at once: is the class actually
+    wired up to enforce @PathVariable/@RequestParam constraints, and does
+    each such param actually carry one. Only rendered when the analyzer
+    populated `param_validations` (currently just Spring); silently omitted
+    for every other framework.
+    """
+    if not route.param_validations:
+        return ""
+
+    gap = any(anns for anns in route.param_validations.values()) and not route.class_validated
+    class_label = "@Validated (class-wide)" if route.class_validated else "NOT @Validated"
+    params = " &middot; ".join(
+        f"{_esc(name)}: {' '.join('@' + _esc(a) for a in anns) if anns else 'no constraint'}"
+        for name, anns in sorted(route.param_validations.items())
+    )
+    css_class = "validation-note validation-warn" if gap else "validation-note"
+    return f'<p class="{css_class}">validation: {class_label} &middot; {params}</p>'
+
+
 def _route_search_blob(route: Route) -> str:
     return _esc(" ".join([route.path, route.handler_name, route.file, " ".join(route.methods)]).lower())
 
@@ -168,6 +190,7 @@ def _render_route(route: Route, findings: list[Finding], target_path: Path, lang
         f'<span class="tag sev-{_esc(f.severity)}">{_esc(f.check_id)}</span>' for f in route_findings
     )
     auth_note = ", ".join(route.auth_decorators) if route.auth_decorators else "none detected"
+    validation_html = _render_validation_note(route)
 
     findings_html = "".join(_render_finding(f) for f in route_findings) or '<p class="no-findings">No baseline findings on this route.</p>'
     code_html = _render_code_block(target_path, route, language)
@@ -184,6 +207,7 @@ def _render_route(route: Route, findings: list[Finding], target_path: Path, lang
         </summary>
         <div class="route-body">
           <p class="auth-note">auth: {_esc(auth_note)}</p>
+          {validation_html}
           <div class="findings">{findings_html}</div>
           {code_html}
         </div>
@@ -216,9 +240,25 @@ def _render_group(result: ScanResult, target_path: Path, route_ids: itertools.co
         &mdash; {_esc(gdescription)}. Verify affected AUTH-001 findings below before treating them as real gaps.
       </p>"""
 
+    version_html = ""
+    if result.framework_version:
+        vfile, vline, vdescription = result.framework_version_source
+        ide_link = _vscode_uri(target_path, vfile, vline)
+        version_finding = next(
+            (f for f in result.findings if f.check_id == "CONFIG-003" and f.file == vfile and f.line == vline),
+            None,
+        )
+        sev = version_finding.severity if version_finding else "info"
+        version_html = (
+            f'<a class="version-badge sev-{_esc(sev)}" href="{_esc(ide_link)}" '
+            f'title="{_esc(vdescription)} ({_esc(vfile)}:{vline})">'
+            f'{_esc(result.framework_version_label)} {_esc(result.framework_version)}</a>'
+        )
+
     return f"""
     <section class="group" data-lang="{_esc(result.language)}">
       <h2 class="group-title">{_esc(result.language)} / {_esc(result.framework)}
+        {version_html}
         <span class="count">{len(result.routes)} route{"s" if len(result.routes) != 1 else ""}</span>
       </h2>
       {notes_html}
@@ -496,6 +536,21 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   gap: 10px;
 }
 .group-title .count { color: var(--text); font-size: 12px; text-transform: none; letter-spacing: 0; }
+.version-badge {
+  font-family: var(--mono);
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: 0;
+  padding: 2px 8px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  color: var(--sev-info);
+  text-decoration: none;
+}
+.version-badge:hover { text-decoration: underline; }
+.version-badge.sev-high { color: var(--sev-high); border-color: var(--sev-high); }
+.version-badge.sev-medium { color: var(--sev-medium); border-color: var(--sev-medium); }
+.version-badge.sev-low { color: var(--sev-low); border-color: var(--sev-low); }
 .group-note { color: var(--text-muted); font-size: 12.5px; font-style: italic; margin: 0 0 10px; }
 .global-auth-note {
   font-style: normal;
@@ -584,7 +639,9 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   background: var(--bg);
 }
 
-.auth-note { font-family: var(--mono); font-size: 12px; color: var(--text-muted); margin: 0 0 12px; }
+.auth-note { font-family: var(--mono); font-size: 12px; color: var(--text-muted); margin: 0 0 4px; }
+.validation-note { font-family: var(--mono); font-size: 12px; color: var(--text-muted); margin: 0 0 12px; }
+.validation-note.validation-warn { color: var(--sev-medium); }
 .findings { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
 .finding {
   border: 1px solid var(--border);

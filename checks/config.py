@@ -37,3 +37,16 @@ def cors_wildcard_finding(file: str, line: int, description: str) -> Finding:
         file=file,
         line=line,
     )
+
+
+def outdated_framework_finding(
+    file: str, line: int, severity: str, framework_label: str, version: str, note: str
+) -> Finding:
+    return Finding(
+        check_id="CONFIG-003",
+        severity=severity,
+        title=f"{framework_label} {version} detected",
+        description=note,
+        file=file,
+        line=line,
+    )

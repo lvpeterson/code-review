@@ -42,6 +42,21 @@ class Route:
     # analyzers can stash whatever they need here without changing the schema.
     meta: dict = field(default_factory=dict)
 
+    # Bean Validation (JSR 380) constraint annotations found on each
+    # @PathVariable/@RequestParam of the handler, keyed by param name --
+    # e.g. {"orderId": ["Positive"], "email": []}. An empty list means the
+    # param was seen but carries no recognized constraint annotation. Only
+    # populated by analyzers that support per-parameter validation
+    # annotations (currently just Spring); empty dict elsewhere.
+    param_validations: dict[str, list[str]] = field(default_factory=dict)
+
+    # Whether the containing class carries @Validated. Spring only enforces
+    # @PathVariable/@RequestParam constraint annotations (@NotBlank,
+    # @Digits, etc) when the controller itself is @Validated -- without it
+    # those annotations are silently never checked. None when the analyzer
+    # has no such concept (non-Spring frameworks).
+    class_validated: Optional[bool] = None
+
 
 @dataclass
 class Finding:
@@ -76,3 +91,13 @@ class ScanResult:
     # render a real "open in editor" link to it instead of just naming it in
     # text. None when no such mechanism was detected in this scan.
     global_auth_source: Optional[tuple[str, int, str]] = None  # (file, line, description)
+
+    # Framework runtime version detected from the target's build file (e.g.
+    # Spring Boot's version from pom.xml/build.gradle), so the HTML report
+    # can flag an obviously outdated/EOL version. `framework_version_label`
+    # distinguishes what was actually pinned (e.g. "Spring Boot" vs the bare
+    # "Spring Framework"), since they have separate support timelines. None
+    # when no build file / version declaration was found.
+    framework_version: Optional[str] = None
+    framework_version_label: Optional[str] = None
+    framework_version_source: Optional[tuple[str, int, str]] = None  # (file, line, description)
