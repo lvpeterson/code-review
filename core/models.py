@@ -57,6 +57,14 @@ class Route:
     # has no such concept (non-Spring frameworks).
     class_validated: Optional[bool] = None
 
+    # @RequestBody parameters, keyed by name, valued True if the parameter
+    # itself carries @Valid/@Validated -- the separate trigger Spring needs
+    # to cascade Bean Validation into the DTO's own field constraints
+    # (unrelated to the class-level @Validated gate above, which only
+    # governs @PathVariable/@RequestParam). Empty dict when the analyzer
+    # doesn't populate it or the route has no @RequestBody param.
+    request_body_validations: dict[str, bool] = field(default_factory=dict)
+
 
 @dataclass
 class Finding:

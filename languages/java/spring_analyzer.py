@@ -179,6 +179,24 @@ def _extra_param_names(member) -> list[str]:
     return names
 
 
+def _request_body_param_validations(member) -> dict[str, bool]:
+    """@RequestBody params, keyed by name, valued True if the parameter
+    itself carries @Valid or @Validated -- the trigger Spring needs to
+    cascade Bean Validation into the DTO's own field constraints. Without
+    it, whatever @NotBlank/@Size/etc constraints live on the DTO class are
+    silently never checked -- same failure mode as the class-level
+    @Validated gate below, but for request bodies instead of path/query
+    params.
+    """
+    result: dict[str, bool] = {}
+    for param in member.parameters:
+        ann_names = {a.name for a in param.annotations}
+        if "RequestBody" not in ann_names:
+            continue
+        result[param.name] = bool({"Valid", "Validated"} & ann_names)
+    return result
+
+
 def _param_validations(member) -> dict[str, list[str]]:
     """Bean Validation constraint annotations on each @PathVariable/
     @RequestParam of `member`, keyed by param name -- an empty list means
@@ -204,10 +222,28 @@ _POM_PROPERTY_VERSION_RE = re.compile(
 _GRADLE_BOOT_PLUGIN_RE = re.compile(
     r"org\.springframework\.boot[\"']\s*\)?\s*version\s*[\"']([^\"']+)[\"']"
 )
+# A Gradle version-catalog alias (`alias(libs.plugins.spring.boot)`) has no
+# literal version in build.gradle at all -- the version lives in
+# gradle/libs.versions.toml instead, keyed under [versions] or [plugins].
+_GRADLE_BOOT_PLUGIN_REFERENCED_RE = re.compile(r"springframework\.boot|spring[.\-]boot", re.IGNORECASE)
+_VERSION_CATALOG_SPRING_BOOT_RE = re.compile(
+    r"(?im)^\s*([\w.-]*spring[\w.-]*boot[\w.-]*)\s*=\s*[\"']([^\"']+)[\"']"
+)
 
 
 def _line_of(text: str, index: int) -> int:
     return text.count("\n", 0, index) + 1
+
+
+def _by_depth(target_path, paths) -> list:
+    """Root-first ordering for build files -- in a multi-module Maven repo
+    the root pom.xml is what actually declares the Spring Boot parent/
+    version almost always; child module poms just inherit it. `rglob`
+    doesn't guarantee traversal order, so without this a child pom could
+    get checked (and, if it happens to have its own unrelated <version> tag
+    inside its own <parent> block, wrongly matched) before the root one.
+    """
+    return sorted(paths, key=lambda p: (len(p.relative_to(target_path).parts), str(p)))
 
 
 def _detect_spring_version(target_path) -> tuple[str, str, str, int, str] | None:
@@ -222,7 +258,7 @@ def _detect_spring_version(target_path) -> tuple[str, str, str, int, str] | None
     was found. `label` distinguishes "Spring Boot" from bare
     "Spring Framework", since they have separate support timelines.
     """
-    for pom in iter_named_files(target_path, ("pom.xml",)):
+    for pom in _by_depth(target_path, iter_named_files(target_path, ("pom.xml",))):
         text = read_text_safe(pom)
         relative_file = str(pom.relative_to(target_path))
 
@@ -239,12 +275,23 @@ def _detect_spring_version(target_path) -> tuple[str, str, str, int, str] | None
                 offset = parent_match.start() + version_match.start()
                 return "Spring Boot", version_match.group(1), relative_file, _line_of(text, offset), "spring-boot-starter-parent parent POM"
 
-    for build_file in iter_named_files(target_path, ("build.gradle", "build.gradle.kts")):
+    gradle_files = _by_depth(target_path, iter_named_files(target_path, ("build.gradle", "build.gradle.kts")))
+    references_boot_plugin = False
+    for build_file in gradle_files:
         text = read_text_safe(build_file)
         relative_file = str(build_file.relative_to(target_path))
         match = _GRADLE_BOOT_PLUGIN_RE.search(text)
         if match:
             return "Spring Boot", match.group(1), relative_file, _line_of(text, match.start()), "org.springframework.boot Gradle plugin"
+        references_boot_plugin = references_boot_plugin or bool(_GRADLE_BOOT_PLUGIN_REFERENCED_RE.search(text))
+
+    if references_boot_plugin:
+        for catalog in _by_depth(target_path, iter_named_files(target_path, ("libs.versions.toml",))):
+            text = read_text_safe(catalog)
+            match = _VERSION_CATALOG_SPRING_BOOT_RE.search(text)
+            if match:
+                relative_file = str(catalog.relative_to(target_path))
+                return "Spring Boot", match.group(2), relative_file, _line_of(text, match.start()), f"[{match.group(1)}] in Gradle version catalog"
 
     return None
 
@@ -366,6 +413,7 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
                             extra_param_names=_extra_param_names(member),
                             param_validations=_param_validations(member),
                             class_validated=class_validated,
+                            request_body_validations=_request_body_param_validations(member),
                         )
                     )
 
@@ -376,6 +424,7 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
         findings += idor_checks.check_id_param_routes(routes)
         findings += auth_checks.check_missing_auth_indicator(routes, KNOWN_AUTH_INDICATORS)
         findings += validation_checks.check_validation_without_class_annotation(routes)
+        findings += validation_checks.check_request_body_without_valid(routes)
         findings += _detect_cors_wildcards(self.target_path)
         # TODO: Spring-specific checks -- e.g. missing CSRF config, JPA
         # repository methods exposed directly (Spring Data REST) without

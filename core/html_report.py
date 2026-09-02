@@ -154,26 +154,76 @@ def _render_finding(finding: Finding) -> str:
     </div>"""
 
 
-def _render_validation_note(route: Route) -> str:
-    """"validation: @Validated (class-wide) · orderId: @Positive · note: none"
-    -- a quick-glance line, parallel to the auth-note, so a reviewer can see
-    both halves of Bean Validation coverage at once: is the class actually
-    wired up to enforce @PathVariable/@RequestParam constraints, and does
-    each such param actually carry one. Only rendered when the analyzer
-    populated `param_validations` (currently just Spring); silently omitted
-    for every other framework.
+def _render_input_note(route: Route) -> str:
+    """"user input: orderId (path) · region (query)" -- an always-present,
+    quick-glance callout of every attacker-controlled value flowing into the
+    handler, regardless of whether it looks like an object id (IDOR-001 only
+    fires for id-like names) or is otherwise interesting. The code view
+    already visually underlines path params on expand (see
+    `_highlight_params`), but that requires opening the card and hovering;
+    this puts the same fact in plain text at the top of the route body.
+    Framework-agnostic: `route.path` template params and
+    `route.extra_param_names` are populated by every analyzer, not just
+    Spring's.
     """
-    if not route.param_validations:
+    path_params = extract_path_param_names(route.path)
+    if not path_params and not route.extra_param_names:
         return ""
 
-    gap = any(anns for anns in route.param_validations.values()) and not route.class_validated
-    class_label = "@Validated (class-wide)" if route.class_validated else "NOT @Validated"
-    params = " &middot; ".join(
-        f"{_esc(name)}: {' '.join('@' + _esc(a) for a in anns) if anns else 'no constraint'}"
-        for name, anns in sorted(route.param_validations.items())
-    )
+    # `class_validated` is only ever set (to True/False, never left None) by
+    # the Spring analyzer, so its presence is a cheap "this route came from
+    # Spring" signal -- letting us label @RequestParam vs @RequestBody
+    # precisely there while other frameworks fall back to the honest,
+    # unresolved "query/body" label.
+    is_spring_route = route.class_validated is not None
+
+    parts = [f"{_esc(name)} (path)" for name in path_params]
+    for name in route.extra_param_names:
+        if name in route.request_body_validations:
+            label = "body"
+        elif is_spring_route:
+            label = "query"
+        else:
+            label = "query/body"
+        parts.append(f"{_esc(name)} ({label})")
+
+    return f'<p class="input-note">user input: {" &middot; ".join(parts)}</p>'
+
+
+def _render_validation_note(route: Route) -> str:
+    """"validation: @Validated (class-wide) · orderId: @Positive · dto (body): @Valid"
+    -- a quick-glance line, parallel to the auth-note, so a reviewer can see
+    every half of Bean Validation coverage at once: is the class wired up to
+    enforce @PathVariable/@RequestParam constraints, does each such param
+    actually carry one, and does each @RequestBody param carry the @Valid
+    that's needed to cascade into its own field constraints. Only rendered
+    when the analyzer populated `param_validations`/`request_body_validations`
+    (currently just Spring); silently omitted for every other framework.
+    """
+    if not route.param_validations and not route.request_body_validations:
+        return ""
+
+    parts: list[str] = []
+    gap = False
+
+    if route.param_validations:
+        gap = gap or (any(anns for anns in route.param_validations.values()) and not route.class_validated)
+        class_label = "@Validated (class-wide)" if route.class_validated else "NOT @Validated"
+        parts.append(class_label)
+        parts += [
+            f"{_esc(name)}: {' '.join('@' + _esc(a) for a in anns) if anns else 'no constraint'}"
+            for name, anns in sorted(route.param_validations.items())
+        ]
+
+    if route.request_body_validations:
+        gap = gap or any(not has_valid for has_valid in route.request_body_validations.values())
+        parts += [
+            f"{_esc(name)} (body): {'@Valid' if has_valid else 'NOT @Valid'}"
+            for name, has_valid in sorted(route.request_body_validations.items())
+        ]
+
     css_class = "validation-note validation-warn" if gap else "validation-note"
-    return f'<p class="{css_class}">validation: {class_label} &middot; {params}</p>'
+    return f'<p class="{css_class}">validation: {" &middot; ".join(parts)}</p>'
 
 
 def _route_search_blob(route: Route) -> str:
@@ -190,22 +240,23 @@ def _render_route(route: Route, findings: list[Finding], target_path: Path, lang
         f'<span class="tag sev-{_esc(f.severity)}">{_esc(f.check_id)}</span>' for f in route_findings
     )
     auth_note = ", ".join(route.auth_decorators) if route.auth_decorators else "none detected"
+    input_html = _render_input_note(route)
     validation_html = _render_validation_note(route)
 
     findings_html = "".join(_render_finding(f) for f in route_findings) or '<p class="no-findings">No baseline findings on this route.</p>'
     code_html = _render_code_block(target_path, route, language)
 
     return f"""
-      <details class="route-card sev-{worst}" data-severity="{worst}" data-methods="{_esc(methods_attr)}" data-search="{_route_search_blob(route)}">
+      <details class="route-card sev-{worst}" data-severity="{worst}" data-methods="{_esc(methods_attr)}" data-file="{_esc(route.file)}" data-search="{_route_search_blob(route)}">
         <summary>
           <input type="checkbox" class="review-toggle" data-route-id="{_esc(route_id)}" title="Mark reviewed" aria-label="Mark this route reviewed">
           <span class="methods">{method_badges}</span>
           <span class="path">{_esc(route.path)}</span>
           <span class="handler">{_esc(route.handler_name)}</span>
-          <span class="loc">{_esc(route.file)}:{route.line}</span>
           <span class="tags">{finding_tags}</span>
         </summary>
         <div class="route-body">
+          {input_html}
           <p class="auth-note">auth: {_esc(auth_note)}</p>
           {validation_html}
           <div class="findings">{findings_html}</div>
@@ -619,9 +670,8 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .path { color: var(--accent); flex-shrink: 0; }
 .handler { color: var(--text-muted); flex-shrink: 0; }
 .handler::before { content: "\\2192"; margin-right: 6px; }
-.loc { color: var(--text-muted); margin-left: auto; flex-shrink: 0; }
 
-.tags { display: flex; gap: 4px; flex-shrink: 0; }
+.tags { display: flex; gap: 4px; flex-shrink: 0; margin-left: auto; }
 .tag {
   font-size: 10px;
   padding: 1px 6px;
@@ -639,6 +689,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   background: var(--bg);
 }
 
+.input-note { font-family: var(--mono); font-size: 12px; color: var(--sev-medium); margin: 0 0 4px; }
 .auth-note { font-family: var(--mono); font-size: 12px; color: var(--text-muted); margin: 0 0 4px; }
 .validation-note { font-family: var(--mono); font-size: 12px; color: var(--text-muted); margin: 0 0 12px; }
 .validation-note.validation-warn { color: var(--sev-medium); }
@@ -716,7 +767,6 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   .layout { flex-direction: column; }
   .sidebar { width: 100%; position: static; border-right: none; border-bottom: 1px solid var(--border); }
   .route-card summary { flex-wrap: wrap; }
-  .loc { margin-left: 0; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -776,7 +826,7 @@ function sortValue(card, key) {
   if (key === 'severity') return SORT_SEVERITY_RANK[card.dataset.severity] ?? 9;
   if (key === 'path') return card.querySelector('.path').textContent.trim().toLowerCase();
   if (key === 'method') return (card.dataset.methods || '').split(' ')[0] || '';
-  if (key === 'file') return card.querySelector('.loc').textContent.trim().toLowerCase();
+  if (key === 'file') return (card.dataset.file || '').toLowerCase();
   return 0;
 }
 
