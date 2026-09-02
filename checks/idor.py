@@ -17,12 +17,15 @@ from core.paths import extract_path_param_names
 # The id/uuid/guid check is a whole-word check (not substring), since
 # "valid", "width", "hidden", "provider" etc all contain "id"/"uuid"-ish
 # substrings without being object identifiers at all.
-_ID_WORDS = {"id", "ids", "uuid", "guid"}
+_ID_WORDS = {"id", "ids", "uid", "uuid", "guid"}
 _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
 
 def _is_id_like(param_name: str) -> bool:
-    words = _CAMEL_BOUNDARY.sub("_", param_name).split("_")
+    # kebab-case is a common URL path-segment convention (`{order-id}`), so
+    # split on hyphens too -- otherwise "order-id" is treated as one opaque
+    # word and never matches "id", even though it plainly is one.
+    words = _CAMEL_BOUNDARY.sub("_", param_name).replace("-", "_").split("_")
     return any(w.lower() in _ID_WORDS for w in words if w)
 
 

@@ -26,6 +26,18 @@ class Route:
     # via query string or JSON body, not just in the URL path.
     extra_param_names: list[str] = field(default_factory=list)
 
+    # The actual code identifier bound to each path variable -- always a
+    # valid identifier, unlike the URL segment name itself (`path`), which
+    # can differ from it (e.g. Spring: a kebab-case URL segment like
+    # `{order-id}` requires an explicit `@PathVariable("order-id") Long
+    # orderId` binding, since Java identifiers can't contain hyphens). The
+    # report's code-view highlighting needs this to find where the value is
+    # actually used in the handler body -- the URL-side name never appears
+    # there as a bare identifier, only inside the annotation's string
+    # literal. Empty when an analyzer doesn't populate it or names never
+    # diverge for that framework.
+    path_variable_binding_names: list[str] = field(default_factory=list)
+
     # Full source range of the handler implementation, for the HTML report's
     # expandable code view. `source_file` defaults to `file` when unset --
     # only set it when the handler lives elsewhere (e.g. Django's urls.py

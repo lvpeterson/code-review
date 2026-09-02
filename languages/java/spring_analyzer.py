@@ -111,26 +111,44 @@ def _method_end_line(text: str, start_line: int) -> int:
     return start_line
 
 
+def _first_literal_value(element) -> str | None:
+    """Best-effort single string out of an annotation element -- a bare
+    literal, an enum constant reference (`RequestMethod.POST`), or an array
+    of either (`@GetMapping({"/a", "/b"})` -- Spring registers every entry
+    as an equivalent route, but this tool models one route per handler, so
+    the first is used as representative; better than dropping the whole
+    mapping, which silently truncated the route down to just the class-level
+    base path).
+    """
+    if isinstance(element, javalang.tree.Literal):
+        return _clean_literal(element.value)
+    if isinstance(element, javalang.tree.MemberReference):
+        return element.member
+    if isinstance(element, javalang.tree.ElementArrayValue) and element.values:
+        return _first_literal_value(element.values[0])
+    return None
+
+
 def _annotation_values(annotation) -> dict[str, str]:
-    """Normalize `@X("path")` and `@X(value="path", method=RequestMethod.POST)`
-    into a {"value": "path", "method": "POST"} dict.
+    """Normalize `@X("path")`, `@X(value="path", method=RequestMethod.POST)`,
+    and `@X({"path1", "path2"})` into a {"value": "path", "method": "POST"}
+    dict.
     """
     element = annotation.element
     if element is None:
         return {}
-    if isinstance(element, javalang.tree.Literal):
-        return {"value": _clean_literal(element.value)}
+    if isinstance(element, (javalang.tree.Literal, javalang.tree.ElementArrayValue)):
+        value = _first_literal_value(element)
+        return {"value": value} if value is not None else {}
 
     result: dict[str, str] = {}
     if isinstance(element, list):
         for pair in element:
             if not isinstance(pair, javalang.tree.ElementValuePair):
                 continue
-            value = pair.value
-            if isinstance(value, javalang.tree.Literal):
-                result[pair.name] = _clean_literal(value.value)
-            elif isinstance(value, javalang.tree.MemberReference):
-                result[pair.name] = value.member
+            value = _first_literal_value(pair.value)
+            if value is not None:
+                result[pair.name] = value
     return result
 
 
@@ -177,6 +195,16 @@ def _extra_param_names(member) -> list[str]:
         if "RequestParam" in ann_names or "RequestBody" in ann_names:
             names.append(param.name)
     return names
+
+
+def _path_variable_binding_names(member) -> list[str]:
+    """The Java identifier for every @PathVariable-annotated parameter,
+    regardless of whether its explicit binding name (`@PathVariable("order-
+    id")`) matches the URL segment name or not. See `Route.
+    path_variable_binding_names` for why the report needs this separately
+    from the URL-side name.
+    """
+    return [param.name for param in member.parameters if "PathVariable" in {a.name for a in param.annotations}]
 
 
 def _request_body_param_validations(member) -> dict[str, bool]:
@@ -392,7 +420,8 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
                 base_path = ""
                 for annotation in class_node.annotations:
                     if annotation.name == "RequestMapping":
-                        base_path = _annotation_values(annotation).get("value", "")
+                        base_values = _annotation_values(annotation)
+                        base_path = base_values.get("value") or base_values.get("path") or ""
 
                 for member in class_node.body:
                     if not isinstance(member, javalang.tree.MethodDeclaration):
@@ -405,7 +434,14 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
                         continue
 
                     values = _annotation_values(mapping_annotation)
-                    sub_path = values.get("value", "")
+                    # `path` is Spring's own alias for `value` -- functionally
+                    # identical, but required (or just commonly used) instead
+                    # of the bare/positional `value` as soon as another named
+                    # attribute like `produces`/`method` is also set, e.g.
+                    # `@GetMapping(path = "/{id}", produces = "...")`. Missing
+                    # this silently truncated the whole sub-path -- not just
+                    # one param -- down to the class-level base path.
+                    sub_path = values.get("value") or values.get("path") or ""
                     full_path = (base_path.rstrip("/") + "/" + sub_path.lstrip("/")).rstrip("/") or "/"
 
                     method = values.get("method", "").upper()
@@ -431,6 +467,7 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
                             source_start_line=start_line or None,
                             source_end_line=end_line or None,
                             extra_param_names=_extra_param_names(member),
+                            path_variable_binding_names=_path_variable_binding_names(member),
                             param_validations=_param_validations(member),
                             class_validated=class_validated,
                             request_body_validations=_request_body_param_validations(member),

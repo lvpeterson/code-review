@@ -26,6 +26,13 @@ def test_real_id_params_are_flagged():
     assert find_id_like_params(_route("/x/{id}")) == ["id"]
 
 
+def test_hyphenated_id_param_is_flagged():
+    # regression: "order-id" used to be treated as one opaque word (no
+    # split on hyphen) and never matched "id".
+    assert find_id_like_params(_route("/orders/{order-id}")) == ["order-id"]
+    assert find_id_like_params(_route("/files/{file-uuid}")) == ["file-uuid"]
+
+
 def test_uuid_and_guid_whole_words_are_flagged():
     assert find_id_like_params(_route("/files/{fileGuid}")) == ["fileGuid"]
     assert find_id_like_params(_route("/records/<uuid:record_uuid>")) == ["record_uuid"]

@@ -23,6 +23,90 @@ def test_class_level_request_mapping_is_not_a_separate_route(tmp_path):
     assert routes[0].path == "/api/users/{id}"
 
 
+def test_path_variable_binding_name_captured_even_when_it_diverges_from_url_name(tmp_path):
+    # A kebab-case URL segment requires an explicit @PathVariable("...")
+    # binding, since Java identifiers can't contain hyphens -- the report's
+    # code-view highlighting needs the Java-side name (orderId) to find
+    # where the value is actually used in the handler body, since the
+    # URL-side name (order-id) only ever appears inside the annotation's
+    # string literal.
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @GetMapping(\"/{order-id}\")\n"
+        "    public Order getOrder(@PathVariable(\"order-id\") Long orderId) { return null; }\n"
+        "}\n",
+    )
+    routes = SpringAnalyzer(tmp_path).find_routes()
+    assert routes[0].path == "/api/orders/{order-id}"
+    assert routes[0].path_variable_binding_names == ["orderId"]
+
+
+def test_path_attribute_alias_is_recognized_at_method_level(tmp_path):
+    # regression: `path = "..."` is Spring's own alias for the positional
+    # `value` attribute, commonly used instead of it once another named
+    # attribute (produces, method, ...) is also set on the same annotation.
+    # Missing this used to silently truncate the whole sub-path down to the
+    # class-level base path, not just drop one param.
+    _write(
+        tmp_path,
+        "UserController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/users\")\n"
+        "public class UserController {\n"
+        "    @GetMapping(path = \"/{id}\", produces = \"application/json\")\n"
+        "    public User getUser(@PathVariable Long id) { return null; }\n"
+        "}\n",
+    )
+    routes = SpringAnalyzer(tmp_path).find_routes()
+    assert routes[0].path == "/api/users/{id}"
+
+
+def test_path_attribute_alias_is_recognized_at_class_level(tmp_path):
+    _write(
+        tmp_path,
+        "UserController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n\n"
+        "@RestController\n"
+        "@RequestMapping(path = \"/api/users\")\n"
+        "public class UserController {\n"
+        "    @GetMapping(\"/{id}\")\n"
+        "    public User getUser(@PathVariable Long id) { return null; }\n"
+        "}\n",
+    )
+    routes = SpringAnalyzer(tmp_path).find_routes()
+    assert routes[0].path == "/api/users/{id}"
+
+
+def test_array_valued_mapping_uses_first_path_instead_of_dropping_route(tmp_path):
+    # regression: @GetMapping({"/a", "/b"}) parses to an ElementArrayValue,
+    # not a bare Literal -- unhandled, this used to silently truncate the
+    # whole sub-path (and any path params in it) down to the class-level
+    # base path instead of just picking one of the two equivalent paths.
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @GetMapping({\"/{orderId}\", \"/legacy/{orderId}\"})\n"
+        "    public Order getOrder(@PathVariable Long orderId) { return null; }\n"
+        "}\n",
+    )
+    routes = SpringAnalyzer(tmp_path).find_routes()
+    assert routes[0].path == "/api/orders/{orderId}"
+
+
 def test_preauthorize_found_regardless_of_order_above_mapping(tmp_path):
     _write(
         tmp_path,

@@ -9,15 +9,33 @@ import re
 
 # Path parameter syntax across the frameworks we support:
 #   Flask/Django   <int:user_id>  or  <user_id>   (converter prefix optional)
-#   FastAPI/Spring {item_id}
+#   FastAPI/Spring {item_id}, or {item_id:[0-9]+} / {item_id:int} with a
+#                  regex constraint or Starlette path-converter suffix
 #   Express        :orderId
 # Kept as separate alternatives (not one loose `[:{<]...[}>]?` pattern) so a
 # Flask converter prefix like `<uuid:record_uuid>` doesn't get double-counted
 # as two separate params ("uuid" and "record_uuid").
+#
+# The name itself allows internal hyphens (`[a-zA-Z0-9_-]*`, not just
+# `[a-zA-Z0-9_]*`) -- URL path segments conventionally use kebab-case
+# (`{order-id}`) even though the bound variable name in code can't contain
+# a hyphen, so the framework requires an explicit binding
+# (`@PathVariable("order-id") Long orderId`) wherever this shows up. Must
+# still start with a letter/underscore, so a bare `-` isn't misread as part
+# of a name.
+#
+# The `{name:...}` branch's suffix is `[^{}]*` rather than `.*` -- good
+# enough for the common case (a regex/converter with no braces of its own,
+# e.g. `{fileName:.+}` or `{itemId:[0-9]+}`) without misparsing across a
+# `}` that closes the placeholder. It won't correctly bound a constraint
+# that itself contains braces (e.g. Spring's `{count:\d{1,3}}`, a quantifier
+# inside the regex) -- a known gap, since matching balanced braces isn't
+# expressible in one non-recursive regex; rare enough in practice not to be
+# worth a real parser for.
 _PARAM_NAME_PATTERN = re.compile(
-    r"<(?:[a-zA-Z_][a-zA-Z0-9_]*:)?([a-zA-Z_][a-zA-Z0-9_]*)>"
-    r"|\{([a-zA-Z_][a-zA-Z0-9_]*)\}"
-    r"|:([a-zA-Z_][a-zA-Z0-9_]*)"
+    r"<(?:[a-zA-Z_][a-zA-Z0-9_]*:)?([a-zA-Z_][a-zA-Z0-9_-]*)>"
+    r"|\{([a-zA-Z_][a-zA-Z0-9_-]*)(?::[^{}]*)?\}"
+    r"|:([a-zA-Z_][a-zA-Z0-9_-]*)"
 )
 
 

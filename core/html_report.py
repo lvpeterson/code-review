@@ -139,7 +139,13 @@ def _render_code_block(target_path: Path, route: Route, language: str) -> str:
         hl_lines=hl_lines,
     )
     highlighted = pygments_highlight(code_text, _get_lexer(language, source_file), formatter)
-    highlighted = _highlight_params(highlighted, extract_path_param_names(route.path))
+    # Union the URL-side placeholder names with each param's actual code
+    # identifier -- they diverge whenever an explicit binding is used
+    # (Spring: `@PathVariable("order-id") Long orderId`), and only the code
+    # identifier ever appears as a bare token in the handler body; the
+    # URL-side name shows up only inside an annotation's string literal.
+    highlight_names = list(dict.fromkeys(extract_path_param_names(route.path) + route.path_variable_binding_names))
+    highlighted = _highlight_params(highlighted, highlight_names)
 
     return header + note + f'<div class="code-block">{highlighted}</div>'
 
