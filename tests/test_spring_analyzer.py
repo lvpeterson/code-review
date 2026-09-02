@@ -211,9 +211,13 @@ def test_direct_constraint_on_request_body_param_is_enforced_by_class_validated(
     # @NotNull directly on the @RequestBody parameter (not on a field inside
     # its type) is a *direct* constraint -- enforced by class-level
     # @Validated via the same AOP path as @PathVariable/@RequestParam.
-    # @Valid is irrelevant to it, so VALID-001 must NOT fire here even
-    # though @Valid is absent. VALID-002 (the separate, unrelated cascade-
-    # into-the-type's-own-fields concern) is still expected to fire.
+    # @Valid is irrelevant to it, so VALID-001 must NOT fire even though
+    # @Valid is absent. VALID-002 (the separate cascade-into-the-type's-own-
+    # fields concern) still fires regardless -- it fires for every
+    # @RequestBody missing @Valid with no type-based exception, since this
+    # is a triage heuristic and a human traces the actual usage either way.
+    # Both facts are simultaneously true: the direct constraint is enforced,
+    # and the cascade gap is still worth a look.
     _write(
         tmp_path,
         "OrderController.java",

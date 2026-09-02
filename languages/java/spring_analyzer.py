@@ -187,6 +187,15 @@ def _request_body_param_validations(member) -> dict[str, bool]:
     a *direct* constraint annotation on itself (that's `_param_validations`
     below, gated by class-level @Validated instead) -- a @RequestBody param
     can have one of these enforced and not the other at the same time.
+
+    Every @RequestBody param without @Valid is recorded, regardless of
+    whether its type looks like it could plausibly have fields to cascade
+    into (a `List<String>` included) -- this is a heuristic triage tool, not
+    a verdict, and a human is going to trace the actual usage regardless.
+    Silently dropping a param because its type *looks* scalar risks a
+    reviewer never even glancing at a route that turns out to matter (e.g.
+    a type alias, a generic bound, or downstream logic this tool can't see);
+    an occasional "yeah that one's fine" costs a lot less.
     """
     result: dict[str, bool] = {}
     for param in member.parameters:
