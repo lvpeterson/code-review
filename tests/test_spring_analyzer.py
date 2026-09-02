@@ -182,6 +182,100 @@ def test_spring_boot_version_detected_from_parent_pom(tmp_path):
     assert any(f.check_id == "CONFIG-003" and f.severity == "medium" for f in result.findings)
 
 
+def test_class_level_validated_does_not_suppress_request_body_check(tmp_path):
+    # @Validated on the class only governs @PathVariable/@RequestParam
+    # constraints (VALID-001) -- it has no effect on @RequestBody, which
+    # needs its own @Valid regardless. VALID-002 must still fire here.
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n"
+        "import org.springframework.validation.annotation.Validated;\n\n"
+        "@RestController\n"
+        "@Validated\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @PostMapping(\"/\")\n"
+        "    public Order create(@RequestBody OrderDto dto) { return null; }\n"
+        "}\n",
+    )
+    analyzer = SpringAnalyzer(tmp_path)
+    routes = analyzer.find_routes()
+    assert routes[0].class_validated is True
+    findings = analyzer.run_baseline_checks(routes)
+    assert any(f.check_id == "VALID-002" for f in findings)
+
+
+def test_direct_constraint_on_request_body_param_is_enforced_by_class_validated(tmp_path):
+    # @NotNull directly on the @RequestBody parameter (not on a field inside
+    # its type) is a *direct* constraint -- enforced by class-level
+    # @Validated via the same AOP path as @PathVariable/@RequestParam.
+    # @Valid is irrelevant to it, so VALID-001 must NOT fire here even
+    # though @Valid is absent. VALID-002 (the separate, unrelated cascade-
+    # into-the-type's-own-fields concern) is still expected to fire.
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import java.util.List;\n"
+        "import org.springframework.web.bind.annotation.*;\n"
+        "import org.springframework.validation.annotation.Validated;\n"
+        "import jakarta.validation.constraints.NotNull;\n\n"
+        "@RestController\n"
+        "@Validated\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @PostMapping(\"/\")\n"
+        "    public Order create(@RequestBody @NotNull List<String> someList) { return null; }\n"
+        "}\n",
+    )
+    analyzer = SpringAnalyzer(tmp_path)
+    routes = analyzer.find_routes()
+    assert routes[0].param_validations == {"someList": ["NotNull"]}
+    findings = analyzer.run_baseline_checks(routes)
+    assert not any(f.check_id == "VALID-001" for f in findings)
+    assert any(f.check_id == "VALID-002" for f in findings)
+
+
+def test_direct_constraint_on_request_body_param_without_class_validated_is_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import java.util.List;\n"
+        "import org.springframework.web.bind.annotation.*;\n"
+        "import jakarta.validation.constraints.NotNull;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @PostMapping(\"/\")\n"
+        "    public Order create(@RequestBody @NotNull List<String> someList) { return null; }\n"
+        "}\n",
+    )
+    analyzer = SpringAnalyzer(tmp_path)
+    findings = analyzer.run_baseline_checks(analyzer.find_routes())
+    assert any(f.check_id == "VALID-001" for f in findings)
+
+
+def test_unconstrained_request_body_param_not_double_counted_in_param_validations(tmp_path):
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @PostMapping(\"/\")\n"
+        "    public Order create(@RequestBody OrderDto dto) { return null; }\n"
+        "}\n",
+    )
+    routes = SpringAnalyzer(tmp_path).find_routes()
+    assert routes[0].param_validations == {}
+    assert routes[0].request_body_validations == {"dto": False}
+
+
 def test_request_body_without_valid_is_flagged(tmp_path):
     _write(
         tmp_path,

@@ -199,6 +199,16 @@ def _render_validation_note(route: Route) -> str:
     that's needed to cascade into its own field constraints. Only rendered
     when the analyzer populated `param_validations`/`request_body_validations`
     (currently just Spring); silently omitted for every other framework.
+
+    The class-wide @Validated label is shown whenever this is a Spring route
+    at all (`class_validated is not None`), even on a route with only a
+    @RequestBody param and no @PathVariable/@RequestParam -- otherwise a
+    body-only route with no @Valid shows just "dto (body): NOT @Valid" with
+    no visible connection to the class annotation sitting right above it in
+    the code, which reads as a false positive to anyone who (reasonably)
+    assumes class-level @Validated covers @RequestBody too. It doesn't --
+    the two are unrelated mechanisms -- so showing both side by side here
+    makes that explicit instead of leaving it to the finding text alone.
     """
     if not route.param_validations and not route.request_body_validations:
         return ""
@@ -206,12 +216,15 @@ def _render_validation_note(route: Route) -> str:
     parts: list[str] = []
     gap = False
 
-    if route.param_validations:
-        gap = gap or (any(anns for anns in route.param_validations.values()) and not route.class_validated)
+    if route.class_validated is not None:
         class_label = "@Validated (class-wide)" if route.class_validated else "NOT @Validated"
         parts.append(class_label)
+
+    if route.param_validations:
+        gap = gap or (any(anns for anns in route.param_validations.values()) and not route.class_validated)
         parts += [
-            f"{_esc(name)}: {' '.join('@' + _esc(a) for a in anns) if anns else 'no constraint'}"
+            f"{_esc(name)}{' (body)' if name in route.request_body_validations else ''}: "
+            f"{' '.join('@' + _esc(a) for a in anns) if anns else 'no constraint'}"
             for name, anns in sorted(route.param_validations.items())
         ]
 
@@ -221,6 +234,9 @@ def _render_validation_note(route: Route) -> str:
             f"{_esc(name)} (body): {'@Valid' if has_valid else 'NOT @Valid'}"
             for name, has_valid in sorted(route.request_body_validations.items())
         ]
+
+    if not parts:
+        return ""
 
     css_class = "validation-note validation-warn" if gap else "validation-note"
     return f'<p class="{css_class}">validation: {" &middot; ".join(parts)}</p>'

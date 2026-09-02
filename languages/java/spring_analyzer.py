@@ -181,12 +181,12 @@ def _extra_param_names(member) -> list[str]:
 
 def _request_body_param_validations(member) -> dict[str, bool]:
     """@RequestBody params, keyed by name, valued True if the parameter
-    itself carries @Valid or @Validated -- the trigger Spring needs to
-    cascade Bean Validation into the DTO's own field constraints. Without
-    it, whatever @NotBlank/@Size/etc constraints live on the DTO class are
-    silently never checked -- same failure mode as the class-level
-    @Validated gate below, but for request bodies instead of path/query
-    params.
+    itself carries @Valid or @Validated -- the trigger Bean Validation needs
+    to cascade into the *referenced type's own fields* (e.g. an OrderDto's
+    @NotBlank `name` field). This is unrelated to whether the parameter has
+    a *direct* constraint annotation on itself (that's `_param_validations`
+    below, gated by class-level @Validated instead) -- a @RequestBody param
+    can have one of these enforced and not the other at the same time.
     """
     result: dict[str, bool] = {}
     for param in member.parameters:
@@ -198,19 +198,30 @@ def _request_body_param_validations(member) -> dict[str, bool]:
 
 
 def _param_validations(member) -> dict[str, list[str]]:
-    """Bean Validation constraint annotations on each @PathVariable/
-    @RequestParam of `member`, keyed by param name -- an empty list means
-    the param was seen but carries no recognized constraint annotation.
-    Deliberately scoped to these two (rather than every parameter): they're
-    the ones Spring only validates via the class-level @Validated AOP path,
-    unlike a @Valid @RequestBody DTO, which validates independently of it.
+    """Bean Validation constraint annotations found directly on a parameter
+    (not on the fields of a type it references), keyed by param name.
+    Covers @PathVariable/@RequestParam always (empty list included, so the
+    report can say "no constraint" at a glance), and @RequestBody only when
+    it actually carries one -- e.g. `@RequestBody @NotNull List<String>
+    items`. That @NotNull is a *direct* constraint on the parameter itself
+    (checking the list reference isn't null), which class-level @Validated
+    enforces via the same AOP path as @PathVariable/@RequestParam -- @Valid
+    is irrelevant to it. @Valid only matters for a separate concern: whether
+    Bean Validation cascades into the *fields of the referenced type itself*
+    (see `_request_body_param_validations`). An unconstrained @RequestBody
+    param is deliberately left out here (rather than recorded as an empty
+    list like path/query params get) since that case is already fully
+    covered by the "(body): NOT @Valid" line from `_request_body_param_validations`
+    and would otherwise show up twice.
     """
     result: dict[str, list[str]] = {}
     for param in member.parameters:
         ann_names = {a.name for a in param.annotations}
-        if "PathVariable" not in ann_names and "RequestParam" not in ann_names:
-            continue
-        result[param.name] = sorted(ann_names & KNOWN_VALIDATION_CONSTRAINTS)
+        constraints = sorted(ann_names & KNOWN_VALIDATION_CONSTRAINTS)
+        if "PathVariable" in ann_names or "RequestParam" in ann_names:
+            result[param.name] = constraints
+        elif "RequestBody" in ann_names and constraints:
+            result[param.name] = constraints
     return result
 
 
