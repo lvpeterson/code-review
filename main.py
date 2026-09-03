@@ -4,6 +4,7 @@ Usage:
     python main.py <target_path>
     python main.py <target_path> --json out.json
     python main.py <target_path> --html report.html
+    python main.py <target_path> --sarif report.sarif
     python main.py <target_path> --language python --framework flask
     python main.py <target_path> --allow-path "/health" --allow-path "/api/public/*"
     python main.py <target_path> --fail-on medium   # exit 1 if any medium+ finding exists (CI use)
@@ -17,6 +18,7 @@ from pathlib import Path
 from core.allowlist import apply_allowlist
 from core.html_report import write_html
 from core.report import meets_or_exceeds, print_console, worst_severity, write_json
+from core.sarif_report import write_sarif
 from enumerator import enumerate_target
 
 
@@ -25,6 +27,11 @@ def main() -> int:
     parser.add_argument("target", type=Path, help="Path to the codebase to analyze")
     parser.add_argument("--json", type=Path, default=None, help="Write results as JSON to this path")
     parser.add_argument("--html", type=Path, default=None, help="Write an interactive HTML report to this path")
+    parser.add_argument(
+        "--sarif", type=Path, default=None,
+        help="Write results as a SARIF 2.1.0 report to this path -- for GitHub Code "
+        "Scanning upload, VS Code's SARIF Viewer extension, or other SARIF-aware tools",
+    )
     parser.add_argument("--language", default=None, help="Skip detection, force this language (e.g. python)")
     parser.add_argument("--framework", default=None, help="Skip detection, force this framework (e.g. flask)")
     parser.add_argument(
@@ -66,6 +73,10 @@ def main() -> int:
     if args.html:
         write_html(results, target_path, args.html)
         print(f"\nwrote HTML report to {args.html}")
+
+    if args.sarif:
+        write_sarif(results, args.sarif)
+        print(f"\nwrote SARIF report to {args.sarif}")
 
     if args.fail_on:
         worst = worst_severity(results)

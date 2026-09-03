@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import html
 import itertools
+import json
 import re
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ from pygments.util import ClassNotFound
 
 from core.models import Finding, Route, ScanResult
 from core.paths import extract_path_param_names
+from core.sarif_report import build_sarif
 
 _SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2, "info": 3}
 _SEVERITY_LABEL = {"high": "High", "medium": "Medium", "low": "Low", "info": "Info"}
@@ -283,7 +285,7 @@ def _render_route(route: Route, findings: list[Finding], target_path: Path, lang
     return f"""
       <details class="route-card sev-{worst}" data-severity="{worst}" data-methods="{_esc(methods_attr)}" data-file="{_esc(route.file)}" data-search="{_route_search_blob(route)}">
         <summary>
-          <input type="checkbox" class="review-toggle" data-route-id="{_esc(route_id)}" title="Mark reviewed" aria-label="Mark this route reviewed">
+          <input type="checkbox" class="review-toggle" data-item-id="{_esc(route_id)}" title="Mark reviewed" aria-label="Mark this route reviewed">
           <span class="methods">{method_badges}</span>
           <span class="path">{_esc(route.path)}</span>
           <span class="handler">{_esc(route.handler_name)}</span>
@@ -343,15 +345,20 @@ def _render_group(result: ScanResult, target_path: Path, route_ids: itertools.co
     </section>"""
 
 
-def _render_standalone_finding(finding: Finding, target_path: Path) -> str:
-    """A project-wide AUTH-* finding (route=None) -- these have nowhere to
-    attach in the route-card view, so unlike `_render_finding` this
-    includes its own file:line + "open in editor" link.
+def _render_standalone_finding(finding: Finding, target_path: Path, item_id: str) -> str:
+    """A project-wide finding (route=None) -- these have nowhere to attach
+    in the route-card view, so unlike `_render_finding` this includes its
+    own file:line + "open in editor" link, plus a reviewed-toggle: these
+    are exactly the checks most likely to need a human's "confirmed a
+    false positive" pass (presence-only sink checks especially), and
+    there can be many of them, so tracking progress the same way route
+    cards already do matters here too.
     """
     ide_link = _vscode_uri(target_path, finding.file, finding.line)
     return f"""
     <div class="finding sev-{_esc(finding.severity)}">
       <div class="finding-head">
+        <input type="checkbox" class="review-toggle" data-item-id="{_esc(item_id)}" title="Mark reviewed" aria-label="Mark this finding reviewed">
         <span class="finding-tag">{_esc(finding.check_id)}</span>
         <span class="finding-sev">{_esc(_SEVERITY_LABEL.get(finding.severity, finding.severity))}</span>
         <a class="ide-link finding-loc" href="{_esc(ide_link)}">{_esc(finding.file)}:{finding.line} &rarr;</a>
@@ -391,7 +398,7 @@ def _render_auth_route_row(route: Route, auth_finding: Finding | None, target_pa
       </tr>"""
 
 
-def _render_auth_tab(results: list[ScanResult], target_path: Path) -> str:
+def _render_auth_tab(results: list[ScanResult], target_path: Path, item_ids: itertools.count) -> str:
     """The Authentication tab: every AUTH-* finding gathered in one place,
     split into project-wide config findings (AUTH-002/003/004/005 -- no
     single route to attach to) and a per-route table (AUTH-001, plus routes
@@ -405,7 +412,9 @@ def _render_auth_tab(results: list[ScanResult], target_path: Path) -> str:
         (f for f in all_findings if _is_auth_finding(f) and f.route is None),
         key=lambda f: _SEVERITY_RANK.get(f.severity, 9),
     )
-    project_html = "".join(_render_standalone_finding(f, target_path) for f in project_findings)
+    project_html = "".join(
+        _render_standalone_finding(f, target_path, f"finding-{next(item_ids)}") for f in project_findings
+    )
 
     global_auth_html = ""
     for result in results:
@@ -441,7 +450,7 @@ def _render_auth_tab(results: list[ScanResult], target_path: Path) -> str:
 
     return f"""
     <section class="auth-section">
-      <h2 class="section-title">Project-wide<span class="count">{len(project_findings)} finding{"s" if len(project_findings) != 1 else ""}</span></h2>
+      <h2 class="section-title">Project-wide<span class="count">{len(project_findings)} finding{"s" if len(project_findings) != 1 else ""}</span><span class="section-reviewed">0 / {len(project_findings)} reviewed</span></h2>
       {global_auth_html}
       {project_html or '<p class="no-findings">No project-wide authentication findings.</p>'}
     </section>
@@ -451,7 +460,7 @@ def _render_auth_tab(results: list[ScanResult], target_path: Path) -> str:
     </section>"""
 
 
-def _render_findings_tab(results: list[ScanResult], target_path: Path) -> str:
+def _render_findings_tab(results: list[ScanResult], target_path: Path, item_ids: itertools.count) -> str:
     """Every other project-wide finding (route=None, not AUTH-*) gathered
     in one place -- dangerous-sink checks (SQLI/CMD/PATH/SSRF/DESER), AOP
     proxy-bypass, and general config findings (debug mode, CORS) all live
@@ -464,11 +473,13 @@ def _render_findings_tab(results: list[ScanResult], target_path: Path) -> str:
         (f for f in all_findings if f.route is None and not _is_auth_finding(f)),
         key=lambda f: _SEVERITY_RANK.get(f.severity, 9),
     )
-    findings_html = "".join(_render_standalone_finding(f, target_path) for f in findings)
+    findings_html = "".join(
+        _render_standalone_finding(f, target_path, f"finding-{next(item_ids)}") for f in findings
+    )
 
     return f"""
     <section class="auth-section">
-      <h2 class="section-title">Findings<span class="count">{len(findings)} finding{"s" if len(findings) != 1 else ""}</span></h2>
+      <h2 class="section-title">Findings<span class="count">{len(findings)} finding{"s" if len(findings) != 1 else ""}</span><span class="section-reviewed">0 / {len(findings)} reviewed</span></h2>
       {findings_html or '<p class="no-findings">No project-wide findings outside routes/authentication.</p>'}
     </section>"""
 
@@ -510,8 +521,9 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
 
     route_ids = itertools.count(1)
     groups_html = "".join(_render_group(r, target_path, route_ids) for r in results) or '<p class="no-findings">No supported language/framework detected in target.</p>'
-    auth_tab_html = _render_auth_tab(results, target_path)
-    findings_tab_html = _render_findings_tab(results, target_path)
+    item_ids = itertools.count(1)
+    auth_tab_html = _render_auth_tab(results, target_path, item_ids)
+    findings_tab_html = _render_findings_tab(results, target_path, item_ids)
 
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
     # Namespaces this report's "reviewed" checklist in localStorage so two
@@ -519,6 +531,11 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
     # one storage bucket) don't clobber each other's progress. Stable across
     # re-runs against the same target, so re-scanning doesn't wipe progress.
     report_id = hashlib.sha256(str(target_path.resolve()).encode("utf-8")).hexdigest()[:12]
+    # Embedded so "Download SARIF" works standalone from the already-open
+    # report with no server/re-run needed -- "</script" is escaped since a
+    # finding's own text (a route path, a query snippet) could otherwise
+    # prematurely close this script tag.
+    sarif_json = json.dumps(build_sarif(results)).replace("</script", "<\\/script")
 
     return f"""<!doctype html>
 <html lang="en">
@@ -552,6 +569,7 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
       <button id="collapse-all" type="button">Collapse all</button>
       <label class="hide-reviewed-toggle"><input type="checkbox" id="hide-reviewed"> Hide reviewed</label>
       <button id="reset-reviewed" type="button">Reset reviewed</button>
+      <button id="download-sarif" type="button" title="Download all findings as SARIF -- open in VS Code's SARIF Viewer extension, or upload to GitHub Code Scanning, to triage them one by one">Download SARIF</button>
     </div>
   </header>
 
@@ -616,6 +634,7 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
 
 <script>
 const REPORT_ID = "{report_id}";
+const SARIF_DATA = {sarif_json};
 {_JS}
 </script>
 </body>
@@ -956,8 +975,13 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   gap: 10px;
 }
 .section-title .count { color: var(--text); font-size: 12px; text-transform: none; letter-spacing: 0; }
+.section-title .section-reviewed { margin-left: auto; color: var(--sev-clean); font-size: 12px; text-transform: none; letter-spacing: 0; }
 .auth-section .finding { margin-bottom: 8px; }
-.finding-head { display: flex; align-items: center; gap: 4px; }
+.finding.reviewed { opacity: 0.45; }
+.finding.reviewed:hover { opacity: 0.8; }
+.finding.reviewed .finding-title { text-decoration: line-through; }
+.finding-head { display: flex; align-items: center; gap: 8px; }
+.finding-head .review-toggle { flex-shrink: 0; accent-color: var(--sev-clean); cursor: pointer; }
 .finding-loc { margin-left: auto; font-family: var(--mono); font-size: 11px; }
 
 .auth-table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12.5px; }
@@ -1149,30 +1173,53 @@ function saveReviewed() {
 }
 
 let reviewed = loadReviewed();
+// One shared pool covers both route cards and standalone project-wide
+// findings -- item ids are prefixed distinctly ("route-N" vs "finding-N")
+// so they never collide even if the numbers coincide.
 const reviewToggles = document.querySelectorAll('.review-toggle');
 
 function updateReviewedStat() {
   const stat = document.getElementById('reviewed-stat');
-  if (stat) stat.textContent = reviewed.size + ' / ' + reviewToggles.length;
+  if (stat) {
+    const routeToggles = document.querySelectorAll('.route-card .review-toggle');
+    const routeReviewed = [...routeToggles].filter(cb => cb.checked).length;
+    stat.textContent = routeReviewed + ' / ' + routeToggles.length;
+  }
+  // Each standalone-finding section (Auth tab's Project-wide, the whole
+  // Findings tab) gets its own "X / Y reviewed" count, scoped to just the
+  // toggles inside that section -- a route's own reviewed state doesn't
+  // belong in either of these counts.
+  document.querySelectorAll('.auth-section').forEach(section => {
+    const span = section.querySelector('.section-reviewed');
+    if (!span) return;
+    const toggles = section.querySelectorAll('.finding .review-toggle');
+    if (toggles.length === 0) return;
+    const done = [...toggles].filter(cb => cb.checked).length;
+    span.textContent = done + ' / ' + toggles.length + ' reviewed';
+  });
 }
 
 function applyReviewedState() {
   reviewToggles.forEach(cb => {
-    const isReviewed = reviewed.has(cb.dataset.routeId);
+    const isReviewed = reviewed.has(cb.dataset.itemId);
     cb.checked = isReviewed;
-    cb.closest('details.route-card').classList.toggle('reviewed', isReviewed);
+    const container = cb.closest('.route-card, .finding');
+    if (container) container.classList.toggle('reviewed', isReviewed);
   });
   updateReviewedStat();
 }
 
 reviewToggles.forEach(cb => {
   cb.addEventListener('click', (e) => {
-    // Without this, clicking the checkbox also toggles the parent
-    // <details> open/closed, since the click bubbles up through <summary>.
+    // Without this, clicking a route card's checkbox also toggles its
+    // parent <details> open/closed, since the click bubbles up through
+    // <summary>. Harmless no-op for a finding's checkbox (not inside a
+    // <summary>), so applied unconditionally.
     e.stopPropagation();
-    const id = cb.dataset.routeId;
+    const id = cb.dataset.itemId;
     if (cb.checked) reviewed.add(id); else reviewed.delete(id);
-    cb.closest('details.route-card').classList.toggle('reviewed', cb.checked);
+    const container = cb.closest('.route-card, .finding');
+    if (container) container.classList.toggle('reviewed', cb.checked);
     saveReviewed();
     updateReviewedStat();
     if (hideReviewed.checked) applyFilters();
@@ -1184,6 +1231,18 @@ document.getElementById('reset-reviewed').addEventListener('click', () => {
   saveReviewed();
   applyReviewedState();
   if (hideReviewed.checked) applyFilters();
+});
+
+document.getElementById('download-sarif').addEventListener('click', () => {
+  const blob = new Blob([JSON.stringify(SARIF_DATA, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'appsec-review.sarif';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 });
 
 applyReviewedState();
