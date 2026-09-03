@@ -368,6 +368,12 @@ def _render_auth_route_row(route: Route, auth_finding: Finding | None, target_pa
     if route.auth_decorators:
         status_sev = "clean"
         status_text = ", ".join(f"@{d}" for d in route.auth_decorators)
+    elif route.explicit_access == "PermitAll":
+        status_sev = "info"
+        status_text = "explicitly public (@PermitAll)"
+    elif route.explicit_access == "DenyAll":
+        status_sev = "info"
+        status_text = "explicitly denied (@DenyAll)"
     elif auth_finding is not None:
         status_sev = auth_finding.severity
         status_text = auth_finding.title

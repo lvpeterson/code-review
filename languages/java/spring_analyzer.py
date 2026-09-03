@@ -13,8 +13,11 @@ import re
 import javalang
 
 from checks import auth as auth_checks
+from checks import binding as binding_checks
 from checks import config as config_checks
+from checks import deserialization as deser_checks
 from checks import idor as idor_checks
+from checks import injection as injection_checks
 from checks import validation as validation_checks
 from checks import xml as xml_checks
 from core.base import BaseFrameworkAnalyzer
@@ -28,10 +31,25 @@ _MAPPING_ANNOTATIONS = {
     "PutMapping": "PUT",
     "DeleteMapping": "DELETE",
     "PatchMapping": "PATCH",
-    "RequestMapping": "GET",  # overridden below if a method=... value is present
+    # RequestMapping's own method(s) are resolved separately by
+    # _mapping_methods below -- it's the one mapping annotation whose HTTP
+    # verb isn't implied by its own name, and (unlike the verb-specific
+    # ones) can list zero, one, or several methods explicitly.
+    "RequestMapping": None,
 }
 
 _HTTP_METHODS = {"GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"}
+
+# @RequestMapping with no `method=` at all matches every HTTP verb in real
+# Spring (its method condition is unrestricted) -- not just GET, which is
+# what this tool used to silently assume. That mattered for more than
+# labels: AUTH-001's severity is scored off which methods a route accepts,
+# so treating an unrestricted route as GET-only under-scored anything
+# actually reachable via POST/PUT/DELETE with no auth annotation. OPTIONS/
+# HEAD are left out here since they're framework-auto-handled and
+# non-mutating -- adding them would just be method-badge noise without
+# changing what a reviewer needs to prioritize.
+_UNRESTRICTED_REQUEST_MAPPING_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH"]
 
 KNOWN_AUTH_INDICATORS = {
     "PreAuthorize",
@@ -39,6 +57,16 @@ KNOWN_AUTH_INDICATORS = {
     "RolesAllowed",
     "PostAuthorize",
 }
+
+# Explicit, deliberate access declarations (JSR-250) -- the opposite of a
+# gap: @PermitAll is a developer documenting "yes, intentionally public,"
+# and @DenyAll documents "nobody can reach this." Tracked separately from
+# KNOWN_AUTH_INDICATORS (which means "a real protective control is here")
+# so neither gets merged into auth_decorators and rendered as if it were
+# one -- @PermitAll used to cause a false AUTH-001 ("no recognized auth
+# control") despite being exactly the kind of explicit documentation that
+# finding exists to ask for.
+KNOWN_EXPLICIT_ACCESS_INDICATORS = {"PermitAll", "DenyAll"}
 
 # Bean Validation (JSR 380) constraint annotations -- javax.validation.constraints
 # and jakarta.validation.constraints alike, since javalang only exposes the bare
@@ -148,6 +176,32 @@ def _all_literal_values(element) -> list[str]:
             values.extend(_all_literal_values(v))
         return values
     return []
+
+
+def _mapping_methods(mapping_annotation) -> list[str]:
+    """Every HTTP method `mapping_annotation` actually matches.
+
+    A verb-specific annotation (@GetMapping, @PostMapping, ...) always
+    means exactly the one verb implied by its own name. @RequestMapping is
+    the special case: its `method` attribute is array-typed, so
+    `method = {RequestMethod.GET, RequestMethod.POST}` must keep every
+    entry (not just the first -- same reasoning as _xml_media_types above),
+    and when `method` is omitted entirely, real Spring matches every HTTP
+    verb -- see _UNRESTRICTED_REQUEST_MAPPING_METHODS for why that's
+    modeled as GET/POST/PUT/DELETE/PATCH rather than defaulting to GET.
+    """
+    if mapping_annotation.name != "RequestMapping":
+        return [_MAPPING_ANNOTATIONS[mapping_annotation.name]]
+
+    element = mapping_annotation.element
+    method_values: list[str] = []
+    if isinstance(element, list):
+        for pair in element:
+            if isinstance(pair, javalang.tree.ElementValuePair) and pair.name == "method":
+                method_values = [v.upper() for v in _all_literal_values(pair.value)]
+
+    resolved = [m for m in method_values if m in _HTTP_METHODS]
+    return resolved or list(_UNRESTRICTED_REQUEST_MAPPING_METHODS)
 
 
 _XML_MEDIA_TYPE_RE = re.compile(r"xml", re.IGNORECASE)
@@ -346,6 +400,199 @@ def _detect_actuator_exposure(target_path) -> list[Finding]:
     return findings
 
 
+_ACTUATOR_BASE_PATH_RE = re.compile(
+    r"management\.endpoints\.web\.base-path\s*[:=]\s*[\"']?([^\r\n\"']+)"
+    r"|base-path:\s*[\"']?([^\r\n\"']+)"
+)
+
+
+def _actuator_base_path(target_path) -> str:
+    """Actuator's base path, defaulting to "/actuator" -- but relocating it
+    (`management.endpoints.web.base-path`) is a real, common hardening
+    move specifically to obscure it, and AUTH-005's matcher-coverage check
+    needs to test the *actual* path, not always assume the default. The
+    second regex alternative (bare `base-path:`) is intentionally broader
+    than the first to catch the common nested-YAML case where `base-path`
+    sits as a sibling key under `web:` rather than adjacent to `include:` --
+    accepting a small false-match risk against an unrelated `base-path:`
+    key elsewhere, consistent with this module's other best-effort,
+    non-YAML-parsing config scans.
+    """
+    for config_file in iter_named_files(
+        target_path, ("application.properties", "application.yml", "application.yaml")
+    ):
+        text = read_text_safe(config_file)
+        match = _ACTUATOR_BASE_PATH_RE.search(text)
+        if match:
+            return (match.group(1) or match.group(2) or "/actuator").strip()
+    return "/actuator"
+
+
+def _node_line(node) -> int | None:
+    """Best-effort line number for an AST node -- javalang leaves
+    ClassCreator.position (and ClassCreator.type.position) as None, so
+    fall back to the first argument's position when the node's own is
+    missing. Returns None only when neither is available (e.g. a
+    no-argument constructor call), in which case there's nothing
+    meaningful to report a line for anyway.
+    """
+    if getattr(node, "position", None):
+        return node.position.line
+    for arg in getattr(node, "arguments", None) or []:
+        if getattr(arg, "position", None):
+            return arg.position.line
+    return None
+
+
+def _has_non_literal_argument(arguments) -> bool:
+    """True if at least one argument isn't a bare literal -- a rough proxy
+    for "this might carry attacker input," since a fixed literal can't be
+    a traversal/SSRF target no matter what. Not a real taint trace: a
+    non-literal argument might just be a hardcoded constant, not
+    attacker-controlled -- this only narrows which call sites are worth a
+    human's time, same spirit as every other presence-only check here.
+    """
+    return any(not isinstance(arg, javalang.tree.Literal) for arg in arguments)
+
+
+_JACKSON_DEFAULT_TYPING_RE = re.compile(r"\.(?:activateDefaultTyping|enableDefaultTyping)\s*\(")
+_DANGEROUS_JSON_TYPE_INFO_IDS = {"CLASS", "MINIMAL_CLASS"}
+
+
+def _detect_unsafe_deserialization(target_path) -> list[Finding]:
+    findings: list[Finding] = []
+    for java_file in iter_files(target_path, (".java",)):
+        text = read_text_safe(java_file)
+        relative_file = str(java_file.relative_to(target_path))
+
+        for match in _JACKSON_DEFAULT_TYPING_RE.finditer(text):
+            findings.append(deser_checks.default_typing_finding(relative_file, _line_of(text, match.start())))
+
+        try:
+            tree = javalang.parse.parse(text)
+        except Exception:
+            continue
+        for _, node in tree.filter(javalang.tree.Annotation):
+            if node.name != "JsonTypeInfo" or not node.position:
+                continue
+            use_value = _annotation_values(node).get("use")
+            if use_value in _DANGEROUS_JSON_TYPE_INFO_IDS:
+                findings.append(
+                    deser_checks.json_type_info_finding(relative_file, node.position.line, use_value)
+                )
+    return findings
+
+
+_COMMAND_EXEC_RE = re.compile(r"Runtime\.getRuntime\(\)\.exec\s*\(|new\s+ProcessBuilder\s*\(")
+
+
+def _detect_command_injection_sinks(target_path) -> list[Finding]:
+    findings: list[Finding] = []
+    for java_file in iter_files(target_path, (".java",)):
+        text = read_text_safe(java_file)
+        relative_file = str(java_file.relative_to(target_path))
+        for match in _COMMAND_EXEC_RE.finditer(text):
+            findings.append(
+                injection_checks.command_injection_sink_finding(relative_file, _line_of(text, match.start()))
+            )
+    return findings
+
+
+_PATH_TRAVERSAL_CLASS_CREATORS = {"File", "FileInputStream", "FileOutputStream", "FileReader", "FileWriter"}
+
+
+def _detect_path_traversal_sinks(target_path) -> list[Finding]:
+    """Flags the two moments a raw string actually becomes a filesystem
+    path: `new File(...)`/`new FileInputStream(...)`/etc, and
+    `Paths.get(...)`. Deliberately doesn't also check `Files.*` static
+    methods (readAllBytes, newInputStream, ...) -- those take an
+    already-constructed Path/File as their argument (often itself a nested
+    `Paths.get(...)` call), which would misread as "non-literal" even when
+    the underlying string is fixed; the two checks here catch the actual
+    string-to-path construction site instead.
+    """
+    findings: list[Finding] = []
+    for java_file in iter_files(target_path, (".java",)):
+        text = read_text_safe(java_file)
+        try:
+            tree = javalang.parse.parse(text)
+        except Exception:
+            continue
+        relative_file = str(java_file.relative_to(target_path))
+
+        for _, node in tree.filter(javalang.tree.ClassCreator):
+            type_name = getattr(node.type, "name", None)
+            line = _node_line(node)
+            if type_name in _PATH_TRAVERSAL_CLASS_CREATORS and line and _has_non_literal_argument(node.arguments):
+                findings.append(injection_checks.path_traversal_sink_finding(relative_file, line, f"new {type_name}(...)"))
+
+        for _, node in tree.filter(javalang.tree.MethodInvocation):
+            if node.qualifier == "Paths" and node.member == "get" and node.position and _has_non_literal_argument(node.arguments):
+                findings.append(injection_checks.path_traversal_sink_finding(relative_file, node.position.line, "Paths.get(...)"))
+    return findings
+
+
+_SSRF_METHOD_NAMES = {
+    "getForObject", "getForEntity", "postForObject", "postForEntity",
+    "postForLocation", "patchForObject", "exchange",
+}
+
+
+def _detect_ssrf_sinks(target_path) -> list[Finding]:
+    """Flags RestTemplate's own request methods and raw URL/URI
+    construction when called with a non-literal URL argument -- the URL is
+    always the first argument for the RestTemplate methods, so only that
+    argument's literalness is checked (a literal URL with a dynamic body
+    payload isn't an SSRF concern). WebClient's fluent `.uri(...)` isn't
+    covered -- that method name is too generic to detect reliably without
+    a lot of false positives from unrelated `.uri(...)` calls.
+    """
+    findings: list[Finding] = []
+    for java_file in iter_files(target_path, (".java",)):
+        text = read_text_safe(java_file)
+        try:
+            tree = javalang.parse.parse(text)
+        except Exception:
+            continue
+        relative_file = str(java_file.relative_to(target_path))
+
+        for _, node in tree.filter(javalang.tree.MethodInvocation):
+            if (
+                node.member in _SSRF_METHOD_NAMES
+                and node.position
+                and node.arguments
+                and _has_non_literal_argument(node.arguments[:1])
+            ):
+                findings.append(injection_checks.ssrf_sink_finding(relative_file, node.position.line, f"{node.member}(...)"))
+            elif node.qualifier == "URI" and node.member == "create" and node.position and _has_non_literal_argument(node.arguments):
+                findings.append(injection_checks.ssrf_sink_finding(relative_file, node.position.line, "URI.create(...)"))
+
+        for _, node in tree.filter(javalang.tree.ClassCreator):
+            type_name = getattr(node.type, "name", None)
+            line = _node_line(node)
+            if type_name == "URL" and line and _has_non_literal_argument(node.arguments):
+                findings.append(injection_checks.ssrf_sink_finding(relative_file, line, "new URL(...)"))
+    return findings
+
+
+def _entity_class_names(target_path) -> set[str]:
+    """Every class name annotated @Entity anywhere in the scan -- used by
+    the mass-assignment check to recognize when a @RequestBody parameter's
+    type IS a JPA entity rather than a dedicated DTO.
+    """
+    names: set[str] = set()
+    for java_file in iter_files(target_path, (".java",)):
+        text = read_text_safe(java_file)
+        try:
+            tree = javalang.parse.parse(text)
+        except Exception:
+            continue
+        for _, class_node in tree.filter(javalang.tree.ClassDeclaration):
+            if "Entity" in {a.name for a in class_node.annotations}:
+                names.add(class_node.name)
+    return names
+
+
 _SECURITY_RULE_RE = re.compile(
     r"\.(?:requestMatchers|antMatchers|mvcMatchers)\s*\(\s*(?P<patterns>(?:\"[^\"]*\"\s*,?\s*)+)\)"
     r"\s*\.\s*(?P<rule1>permitAll|authenticated|denyAll|hasRole|hasAnyRole|hasAuthority|hasAnyAuthority)\s*\((?P<args1>[^)]*)\)"
@@ -459,6 +706,27 @@ def _request_body_param_validations(member) -> dict[str, bool]:
             continue
         result[param.name] = bool({"Valid", "Validated"} & ann_names)
     return result
+
+
+def _request_body_param_types(member) -> dict[str, str]:
+    """Simple type name for each @RequestBody parameter, keyed by name --
+    used to cross-reference against JPA @Entity classes elsewhere in the
+    scan for the mass-assignment check. Skipped when the type can't be
+    resolved to a simple name (rare for a @RequestBody parameter).
+    """
+    result: dict[str, str] = {}
+    for param in member.parameters:
+        ann_names = {a.name for a in param.annotations}
+        if "RequestBody" not in ann_names:
+            continue
+        type_name = getattr(param.type, "name", None)
+        if type_name:
+            result[param.name] = type_name
+    return result
+
+
+def _has_pageable_or_sort_param(member) -> bool:
+    return any(getattr(p.type, "name", None) in ("Pageable", "Sort") for p in member.parameters)
 
 
 def _param_validations(member) -> dict[str, list[str]]:
@@ -649,6 +917,9 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
                 # every route in such a class a false-positive AUTH-001,
                 # the same shape of bug as the class-level @Validated gap.
                 class_auth_decorators = sorted(class_annotation_names & KNOWN_AUTH_INDICATORS)
+                class_explicit_access = next(
+                    iter(class_annotation_names & KNOWN_EXPLICIT_ACCESS_INDICATORS), None
+                )
                 base_path = ""
                 for annotation in class_node.annotations:
                     if annotation.name == "RequestMapping":
@@ -676,14 +947,19 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
                     sub_path = values.get("value") or values.get("path") or ""
                     full_path = (base_path.rstrip("/") + "/" + sub_path.lstrip("/")).rstrip("/") or "/"
 
-                    method = values.get("method", "").upper()
-                    if method not in _HTTP_METHODS:
-                        method = _MAPPING_ANNOTATIONS[mapping_annotation.name]
+                    methods = _mapping_methods(mapping_annotation)
 
                     auth_decorators = list(dict.fromkeys(
                         class_auth_decorators
                         + [a.name for a in member.annotations if a.name in KNOWN_AUTH_INDICATORS]
                     ))
+                    # Method-level wins over class-level if somehow both are
+                    # present -- more specific declaration takes precedence,
+                    # same convention as auth_decorators' own merge above.
+                    method_explicit_access = next(
+                        (a.name for a in member.annotations if a.name in KNOWN_EXPLICIT_ACCESS_INDICATORS), None
+                    )
+                    explicit_access = method_explicit_access or class_explicit_access
 
                     method_line = member.position.line if member.position else 0
                     annotation_lines = [a.position.line for a in member.annotations if a.position]
@@ -693,7 +969,7 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
                     routes.append(
                         Route(
                             path=full_path,
-                            methods=[method],
+                            methods=methods,
                             handler_name=member.name,
                             file=str(java_file.relative_to(self.target_path)),
                             line=method_line,
@@ -707,6 +983,9 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
                             class_validated=class_validated,
                             request_body_validations=_request_body_param_validations(member),
                             xml_media_types=_xml_media_types(mapping_annotation),
+                            explicit_access=explicit_access,
+                            request_body_param_types=_request_body_param_types(member),
+                            accepts_pageable_or_sort=_has_pageable_or_sort_param(member),
                         )
                     )
 
@@ -722,6 +1001,12 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
         findings += _detect_cors_wildcards(self.target_path)
         findings += _detect_csrf_disabled(self.target_path)
         findings += _detect_actuator_exposure(self.target_path)
+        findings += _detect_unsafe_deserialization(self.target_path)
+        findings += _detect_command_injection_sinks(self.target_path)
+        findings += _detect_path_traversal_sinks(self.target_path)
+        findings += _detect_ssrf_sinks(self.target_path)
+        findings += binding_checks.check_mass_assignment(routes, _entity_class_names(self.target_path))
+        findings += binding_checks.check_unallowlisted_sort(routes)
         # TODO: Spring-specific checks -- e.g. JPA repository methods
         # exposed directly (Spring Data REST) without ownership filtering.
         return findings
@@ -756,11 +1041,12 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
 
             actuator_finding = next((f for f in result.findings if f.check_id == "AUTH-004"), None)
             if actuator_finding is not None:
-                actuator_verdict = _resolve_matcher_coverage("/actuator/env", matcher_rules)
+                base_path = _actuator_base_path(self.target_path)
+                actuator_verdict = _resolve_matcher_coverage(base_path.rstrip("/") + "/env", matcher_rules)
                 if actuator_verdict and actuator_verdict.lower().startswith("permitall"):
                     result.findings.append(
                         auth_checks.actuator_not_covered_finding(
-                            actuator_finding.file, actuator_finding.line, actuator_verdict
+                            actuator_finding.file, actuator_finding.line, actuator_verdict, base_path
                         )
                     )
 

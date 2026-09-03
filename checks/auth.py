@@ -25,6 +25,11 @@ def check_missing_auth_indicator(routes: list[Route], known_auth_indicators: set
     """
     findings: list[Finding] = []
     for route in routes:
+        if route.explicit_access:
+            # @PermitAll/@DenyAll is a developer's own explicit statement
+            # about this route's access -- exactly the confirmation this
+            # check exists to ask for, not a gap to flag.
+            continue
         if any(indicator in known_auth_indicators for indicator in route.auth_decorators):
             continue
 
@@ -144,14 +149,14 @@ def actuator_exposure_finding(file: str, line: int, exposed: str) -> Finding:
     )
 
 
-def actuator_not_covered_finding(file: str, line: int, verdict: str) -> Finding:
+def actuator_not_covered_finding(file: str, line: int, verdict: str, base_path: str) -> Finding:
     return Finding(
         check_id="AUTH-005",
         severity="high",
         title=f"Actuator base path resolves to \"{verdict}\" in the security matcher chain",
         description=(
-            "The parsed SecurityFilterChain matcher rules resolve the Actuator base path "
-            "(/actuator/**) to a rule that doesn't require authentication. Combined with "
+            f"The parsed SecurityFilterChain matcher rules resolve the Actuator base path "
+            f"({base_path}/**) to a rule that doesn't require authentication. Combined with "
             "whatever's actually exposed (see AUTH-004), this means those endpoints are "
             "reachable by anyone. This resolution is regex-based and best-effort -- verify "
             "against the actual chain before treating it as certain."

@@ -895,3 +895,434 @@ def test_csrf_downgrade_scoped_to_enclosing_method_only(tmp_path):
     findings = SpringAnalyzer(tmp_path).run_baseline_checks([])
     finding = next(f for f in findings if f.check_id == "AUTH-003")
     assert finding.severity == "medium"
+
+
+def test_bare_request_mapping_matches_every_method(tmp_path):
+    # regression: a bare @RequestMapping with no `method=` matches every
+    # HTTP verb in real Spring, not just GET -- used to silently default to
+    # GET-only, under-scoring AUTH-001's severity for a route that's really
+    # also reachable via POST/PUT/DELETE.
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @RequestMapping(\"/unrestricted\")\n"
+        "    public String unrestricted() { return \"\"; }\n"
+        "}\n",
+    )
+    analyzer = SpringAnalyzer(tmp_path)
+    routes = analyzer.find_routes()
+    assert set(routes[0].methods) == {"GET", "POST", "PUT", "DELETE", "PATCH"}
+    findings = analyzer.run_baseline_checks(routes)
+    auth_finding = next(f for f in findings if f.check_id == "AUTH-001")
+    assert auth_finding.severity == "medium"
+
+
+def test_request_mapping_multi_method_array_keeps_every_entry(tmp_path):
+    # regression: method = {GET, POST} used to keep only the first entry.
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @RequestMapping(value = \"/multi\", method = {RequestMethod.GET, RequestMethod.POST})\n"
+        "    public String multi() { return \"\"; }\n"
+        "}\n",
+    )
+    routes = SpringAnalyzer(tmp_path).find_routes()
+    assert routes[0].methods == ["GET", "POST"]
+
+
+def test_verb_specific_mapping_annotation_unaffected(tmp_path):
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @PostMapping(\"/\")\n"
+        "    public String create() { return \"\"; }\n"
+        "}\n",
+    )
+    routes = SpringAnalyzer(tmp_path).find_routes()
+    assert routes[0].methods == ["POST"]
+
+
+def test_permit_all_suppresses_auth_001(tmp_path):
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n"
+        "import javax.annotation.security.PermitAll;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @PermitAll\n"
+        "    @GetMapping(\"/health\")\n"
+        "    public String health() { return \"ok\"; }\n"
+        "}\n",
+    )
+    analyzer = SpringAnalyzer(tmp_path)
+    routes = analyzer.find_routes()
+    assert routes[0].explicit_access == "PermitAll"
+    findings = analyzer.run_baseline_checks(routes)
+    assert not any(f.check_id == "AUTH-001" for f in findings)
+
+
+def test_deny_all_suppresses_auth_001(tmp_path):
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n"
+        "import javax.annotation.security.DenyAll;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @DenyAll\n"
+        "    @GetMapping(\"/disabled\")\n"
+        "    public String disabled() { return \"\"; }\n"
+        "}\n",
+    )
+    analyzer = SpringAnalyzer(tmp_path)
+    routes = analyzer.find_routes()
+    assert routes[0].explicit_access == "DenyAll"
+    findings = analyzer.run_baseline_checks(routes)
+    assert not any(f.check_id == "AUTH-001" for f in findings)
+
+
+def test_class_level_permit_all_covers_every_method(tmp_path):
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n"
+        "import javax.annotation.security.PermitAll;\n\n"
+        "@RestController\n"
+        "@PermitAll\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @GetMapping(\"/health\")\n"
+        "    public String health() { return \"ok\"; }\n"
+        "}\n",
+    )
+    analyzer = SpringAnalyzer(tmp_path)
+    routes = analyzer.find_routes()
+    assert routes[0].explicit_access == "PermitAll"
+    findings = analyzer.run_baseline_checks(routes)
+    assert not any(f.check_id == "AUTH-001" for f in findings)
+
+
+def test_actuator_custom_base_path_is_used_for_coverage_check(tmp_path):
+    # regression: AUTH-005 used to hardcode /actuator/env as the test path,
+    # missing a real permitAll misconfiguration on a relocated base path.
+    _write(
+        tmp_path,
+        "application.properties",
+        "management.endpoints.web.exposure.include=*\n"
+        "management.endpoints.web.base-path=/management\n",
+    )
+    _write(
+        tmp_path,
+        "SecurityConfig.java",
+        "package com.example;\n"
+        "public class SecurityConfig {\n"
+        "    public SecurityFilterChain filterChain(HttpSecurity http) {\n"
+        "        http.authorizeHttpRequests(auth -> auth\n"
+        "            .requestMatchers(\"/management/**\").permitAll()\n"
+        "            .anyRequest().authenticated()\n"
+        "        );\n"
+        "        return http.build();\n"
+        "    }\n"
+        "}\n",
+    )
+    result = SpringAnalyzer(tmp_path).analyze()
+    finding = next(f for f in result.findings if f.check_id == "AUTH-005")
+    assert "/management/**" in finding.description
+
+
+def test_actuator_default_base_path_not_flagged_when_only_custom_path_is_public(tmp_path):
+    # the inverse of the above: default /actuator/** should NOT resolve to
+    # permitAll here, since only /management/** (the real, relocated path)
+    # is public -- confirms the test path really changed, not just always
+    # matching.
+    _write(
+        tmp_path,
+        "application.properties",
+        "management.endpoints.web.exposure.include=*\n"
+        "management.endpoints.web.base-path=/management\n",
+    )
+    _write(
+        tmp_path,
+        "SecurityConfig.java",
+        "package com.example;\n"
+        "public class SecurityConfig {\n"
+        "    public SecurityFilterChain filterChain(HttpSecurity http) {\n"
+        "        http.authorizeHttpRequests(auth -> auth\n"
+        "            .requestMatchers(\"/actuator/**\").permitAll()\n"
+        "            .anyRequest().authenticated()\n"
+        "        );\n"
+        "        return http.build();\n"
+        "    }\n"
+        "}\n",
+    )
+    result = SpringAnalyzer(tmp_path).analyze()
+    assert not any(f.check_id == "AUTH-005" for f in result.findings)
+
+
+def test_jackson_default_typing_is_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "JacksonConfig.java",
+        "package com.example;\n"
+        "public class JacksonConfig {\n"
+        "    void configure(ObjectMapper mapper) {\n"
+        "        mapper.activateDefaultTyping(null);\n"
+        "    }\n"
+        "}\n",
+    )
+    findings = SpringAnalyzer(tmp_path).run_baseline_checks([])
+    assert any(f.check_id == "DESER-001" for f in findings)
+
+
+def test_json_type_info_class_based_typing_is_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "Payload.java",
+        "package com.example;\n"
+        "import com.fasterxml.jackson.annotation.JsonTypeInfo;\n\n"
+        "@JsonTypeInfo(use = JsonTypeInfo.Id.CLASS)\n"
+        "public class Payload {}\n",
+    )
+    findings = SpringAnalyzer(tmp_path).run_baseline_checks([])
+    assert any(f.check_id == "DESER-001" for f in findings)
+
+
+def test_json_type_info_name_based_typing_is_not_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "Payload.java",
+        "package com.example;\n"
+        "import com.fasterxml.jackson.annotation.JsonTypeInfo;\n\n"
+        "@JsonTypeInfo(use = JsonTypeInfo.Id.NAME)\n"
+        "public class Payload {}\n",
+    )
+    findings = SpringAnalyzer(tmp_path).run_baseline_checks([])
+    assert not any(f.check_id == "DESER-001" for f in findings)
+
+
+def test_command_injection_sinks_are_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "Danger.java",
+        "package com.example;\n"
+        "public class Danger {\n"
+        "    void f(String userInput) throws Exception {\n"
+        "        Runtime.getRuntime().exec(userInput);\n"
+        "        new ProcessBuilder(userInput);\n"
+        "    }\n"
+        "}\n",
+    )
+    findings = SpringAnalyzer(tmp_path).run_baseline_checks([])
+    assert sum(1 for f in findings if f.check_id == "CMD-001") == 2
+
+
+def test_path_traversal_with_dynamic_argument_is_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "Danger.java",
+        "package com.example;\n"
+        "import java.io.File;\n"
+        "import java.nio.file.Paths;\n\n"
+        "public class Danger {\n"
+        "    void f(String userInput) {\n"
+        "        File file = new File(userInput);\n"
+        "        Paths.get(userInput);\n"
+        "    }\n"
+        "}\n",
+    )
+    findings = SpringAnalyzer(tmp_path).run_baseline_checks([])
+    assert sum(1 for f in findings if f.check_id == "PATH-001") == 2
+
+
+def test_path_traversal_with_literal_argument_is_not_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "Safe.java",
+        "package com.example;\n"
+        "import java.io.File;\n"
+        "import java.nio.file.Paths;\n\n"
+        "public class Safe {\n"
+        "    void f() {\n"
+        "        File file = new File(\"config/fixed.txt\");\n"
+        "        Paths.get(\"config\", \"fixed.txt\");\n"
+        "    }\n"
+        "}\n",
+    )
+    findings = SpringAnalyzer(tmp_path).run_baseline_checks([])
+    assert not any(f.check_id == "PATH-001" for f in findings)
+
+
+def test_files_read_all_bytes_over_literal_path_get_is_not_flagged(tmp_path):
+    # regression: Files.readAllBytes(Paths.get("fixed")) must not be
+    # mistaken for a dynamic path just because its own argument is a
+    # nested MethodInvocation rather than a bare Literal -- the actual
+    # string-to-path construction site (Paths.get) is what's checked, and
+    # its argument here genuinely is a literal.
+    _write(
+        tmp_path,
+        "Safe.java",
+        "package com.example;\n"
+        "import java.nio.file.Files;\n"
+        "import java.nio.file.Paths;\n\n"
+        "public class Safe {\n"
+        "    void f() throws Exception {\n"
+        "        Files.readAllBytes(Paths.get(\"fixed\"));\n"
+        "    }\n"
+        "}\n",
+    )
+    findings = SpringAnalyzer(tmp_path).run_baseline_checks([])
+    assert not any(f.check_id == "PATH-001" for f in findings)
+
+
+def test_ssrf_sinks_with_dynamic_url_are_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "Danger.java",
+        "package com.example;\n"
+        "import java.net.URI;\n"
+        "import java.net.URL;\n"
+        "import org.springframework.web.client.RestTemplate;\n\n"
+        "public class Danger {\n"
+        "    void f(String userInput, RestTemplate restTemplate) throws Exception {\n"
+        "        new URL(userInput);\n"
+        "        URI.create(userInput);\n"
+        "        restTemplate.getForObject(userInput, String.class);\n"
+        "    }\n"
+        "}\n",
+    )
+    findings = SpringAnalyzer(tmp_path).run_baseline_checks([])
+    assert sum(1 for f in findings if f.check_id == "SSRF-001") == 3
+
+
+def test_ssrf_sink_with_literal_url_is_not_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "Safe.java",
+        "package com.example;\n"
+        "import org.springframework.web.client.RestTemplate;\n\n"
+        "public class Safe {\n"
+        "    void f(RestTemplate restTemplate) {\n"
+        "        restTemplate.getForObject(\"https://fixed.example.com\", String.class);\n"
+        "    }\n"
+        "}\n",
+    )
+    findings = SpringAnalyzer(tmp_path).run_baseline_checks([])
+    assert not any(f.check_id == "SSRF-001" for f in findings)
+
+
+def test_request_body_bound_to_jpa_entity_is_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @PostMapping(\"/\")\n"
+        "    public String create(@RequestBody OrderItem item) { return \"\"; }\n"
+        "}\n",
+    )
+    _write(
+        tmp_path,
+        "OrderItem.java",
+        "package com.example;\n"
+        "import jakarta.persistence.Entity;\n\n"
+        "@Entity\n"
+        "public class OrderItem {\n"
+        "    private boolean isAdmin;\n"
+        "}\n",
+    )
+    analyzer = SpringAnalyzer(tmp_path)
+    routes = analyzer.find_routes()
+    assert routes[0].request_body_param_types == {"item": "OrderItem"}
+    findings = analyzer.run_baseline_checks(routes)
+    assert any(f.check_id == "MASS-001" for f in findings)
+
+
+def test_request_body_bound_to_dto_is_not_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @PostMapping(\"/\")\n"
+        "    public String create(@RequestBody OrderItemDto dto) { return \"\"; }\n"
+        "}\n",
+    )
+    _write(
+        tmp_path,
+        "OrderItem.java",
+        "package com.example;\n"
+        "import jakarta.persistence.Entity;\n\n"
+        "@Entity\n"
+        "public class OrderItem {\n"
+        "    private boolean isAdmin;\n"
+        "}\n",
+    )
+    analyzer = SpringAnalyzer(tmp_path)
+    findings = analyzer.run_baseline_checks(analyzer.find_routes())
+    assert not any(f.check_id == "MASS-001" for f in findings)
+
+
+def test_pageable_param_is_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n"
+        "import org.springframework.data.domain.Pageable;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @GetMapping(\"/\")\n"
+        "    public String list(Pageable pageable) { return \"\"; }\n"
+        "}\n",
+    )
+    analyzer = SpringAnalyzer(tmp_path)
+    routes = analyzer.find_routes()
+    assert routes[0].accepts_pageable_or_sort is True
+    findings = analyzer.run_baseline_checks(routes)
+    assert any(f.check_id == "SORT-001" for f in findings)
+
+
+def test_route_without_pageable_or_sort_is_not_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @GetMapping(\"/{id}\")\n"
+        "    public String get(@PathVariable Long id) { return \"\"; }\n"
+        "}\n",
+    )
+    analyzer = SpringAnalyzer(tmp_path)
+    findings = analyzer.run_baseline_checks(analyzer.find_routes())
+    assert not any(f.check_id == "SORT-001" for f in findings)

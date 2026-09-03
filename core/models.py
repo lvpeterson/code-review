@@ -17,6 +17,19 @@ class Route:
     auth_decorators: list[str] = field(default_factory=list)
     raw_snippet: str = ""
 
+    # An explicit, deliberate access declaration (JSR-250) -- "PermitAll"
+    # (developer documented this route as intentionally public) or
+    # "DenyAll" (documented as unreachable by anyone). Deliberately
+    # separate from auth_decorators: these mean the opposite of a
+    # protective control, so merging them in would render as if the route
+    # were protected when @PermitAll is actually a developer confirming
+    # it's exactly the kind of intentionally-public route AUTH-001 asks a
+    # reviewer to check for -- flagging it anyway would be a false
+    # positive against a route that's already been explicitly documented.
+    # None when neither annotation is present, or the analyzer has no such
+    # concept.
+    explicit_access: Optional[str] = None
+
     # Best-effort names of query-string/body/form parameters the handler
     # reads (FastAPI: extra signature params; Spring: @RequestParam/
     # @RequestBody fields; Flask/Express/Django: request.args/request.json/
@@ -76,6 +89,25 @@ class Route:
     # governs @PathVariable/@RequestParam). Empty dict when the analyzer
     # doesn't populate it or the route has no @RequestBody param.
     request_body_validations: dict[str, bool] = field(default_factory=dict)
+
+    # Simple type name for each @RequestBody parameter, keyed by name --
+    # e.g. {"dto": "OrderItem"}. Used to cross-reference against classes
+    # annotated @Entity elsewhere in the scan: binding a request body
+    # directly to a persistence entity (instead of a dedicated DTO) means a
+    # client can set any field the entity has, not just the ones the API
+    # intends to accept (mass assignment / over-posting). Empty when the
+    # analyzer doesn't populate it, the route has no @RequestBody param, or
+    # the type couldn't be resolved to a simple name.
+    request_body_param_types: dict[str, str] = field(default_factory=dict)
+
+    # Whether any parameter's type is Spring Data's Pageable or Sort --
+    # both let a client control which column an ORDER BY targets directly
+    # via a query parameter. That's the client controlling query
+    # *structure*, not just a value -- worth a nudge to verify sortable
+    # fields are allowlisted before this reaches a query, the same
+    # structure-vs-data distinction that makes bound query parameters safe
+    # but doesn't extend to column/field names.
+    accepts_pageable_or_sort: bool = False
 
     # Media type strings/constant-names on this route's produces/consumes
     # that look like XML (a literal like "application/xml", or a constant
