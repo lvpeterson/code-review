@@ -184,6 +184,145 @@ def _detect_global_security_filter_chain(target_path) -> tuple[str, int, str] | 
     return None
 
 
+_METHOD_SECURITY_ENABLING_ANNOTATIONS = {"EnableMethodSecurity", "EnableGlobalMethodSecurity"}
+
+
+def _detect_method_security_enabled(target_path) -> bool:
+    """Whether @EnableMethodSecurity (Spring Security 5.6+) or the legacy
+    @EnableGlobalMethodSecurity exists anywhere in the target -- one of
+    these is required for @PreAuthorize/@PostAuthorize/@Secured/
+    @RolesAllowed to be evaluated at all; without it they're pure
+    decoration. Presence-only, codebase-wide (not tied to any one route).
+    """
+    for java_file in iter_files(target_path, (".java",)):
+        text = read_text_safe(java_file)
+        try:
+            tree = javalang.parse.parse(text)
+        except Exception:
+            continue
+        for _, class_node in tree.filter(javalang.tree.ClassDeclaration):
+            if {a.name for a in class_node.annotations} & _METHOD_SECURITY_ENABLING_ANNOTATIONS:
+                return True
+    return False
+
+
+_CSRF_DISABLED_RE = re.compile(
+    r"\.csrf\s*\([^)]*\.disable\(\)"   # .csrf(csrf -> csrf.disable())  (Spring Security 6+ lambda DSL)
+    r"|\.csrf\(\)\s*\.\s*disable\(\)"  # .csrf().disable()              (older fluent builder style)
+)
+
+
+def _detect_csrf_disabled(target_path) -> list[Finding]:
+    findings: list[Finding] = []
+    for java_file in iter_files(target_path, (".java",)):
+        text = read_text_safe(java_file)
+        relative_file = str(java_file.relative_to(target_path))
+        for match in _CSRF_DISABLED_RE.finditer(text):
+            findings.append(auth_checks.csrf_disabled_finding(relative_file, _line_of(text, match.start())))
+    return findings
+
+
+_SENSITIVE_ACTUATOR_ENDPOINTS = {
+    "env", "heapdump", "beans", "configprops", "shutdown", "mappings",
+    "threaddump", "httptrace", "loggers", "*",
+}
+_ACTUATOR_EXPOSURE_RE = re.compile(
+    r"management\.endpoints\.web\.exposure\.include\s*[:=]\s*[\"']?([^\r\n\"']+)"
+    r"|exposure:\s*\n\s*include:\s*[\"']?([^\r\n\"']+)"
+)
+
+
+def _detect_actuator_exposure(target_path) -> list[Finding]:
+    """Regex scan of application.properties/.yml/.yaml for a
+    management.endpoints.web.exposure.include naming a sensitive endpoint
+    (or "*"). Handles the flattened dotted-key form (valid in both
+    properties files and YAML) and the simple two-line nested YAML form
+    (`exposure:` immediately followed by `include:`) -- not a real YAML
+    parser, so an unusually-formatted nested block could be missed.
+    """
+    findings: list[Finding] = []
+    for config_file in iter_named_files(
+        target_path, ("application.properties", "application.yml", "application.yaml")
+    ):
+        text = read_text_safe(config_file)
+        relative_file = str(config_file.relative_to(target_path))
+        for match in _ACTUATOR_EXPOSURE_RE.finditer(text):
+            raw = (match.group(1) or match.group(2) or "").strip()
+            hit = {n.strip() for n in raw.split(",") if n.strip()} & _SENSITIVE_ACTUATOR_ENDPOINTS
+            if hit:
+                findings.append(
+                    auth_checks.actuator_exposure_finding(
+                        relative_file, _line_of(text, match.start()), ", ".join(sorted(hit))
+                    )
+                )
+    return findings
+
+
+_SECURITY_RULE_RE = re.compile(
+    r"\.(?:requestMatchers|antMatchers|mvcMatchers)\s*\(\s*(?P<patterns>(?:\"[^\"]*\"\s*,?\s*)+)\)"
+    r"\s*\.\s*(?P<rule1>permitAll|authenticated|denyAll|hasRole|hasAnyRole|hasAuthority|hasAnyAuthority)\s*\((?P<args1>[^)]*)\)"
+    r"|\.anyRequest\(\)\s*\.\s*(?P<rule2>permitAll|authenticated|denyAll|hasRole|hasAnyRole|hasAuthority|hasAnyAuthority)\s*\((?P<args2>[^)]*)\)"
+)
+_QUOTED_STRING_RE = re.compile(r'"([^"]*)"')
+
+
+def _describe_rule(rule: str, args: str) -> str:
+    values = _QUOTED_STRING_RE.findall(args)
+    return f"{rule}({', '.join(values)})" if values else f"{rule}()"
+
+
+def _extract_security_matchers(target_path) -> list[tuple[list[str], str]]:
+    """Best-effort, regex-based extraction of a SecurityFilterChain's
+    ordered (pattern(s), rule) pairs -- e.g. [(["/api/public/**"],
+    "permitAll()"), (["/api/admin/**"], "hasRole(ADMIN)"), (["**"],
+    "authenticated()")] for a chain ending `.anyRequest().authenticated()`.
+
+    Regex over raw source text, not a real parse of the fluent builder
+    chain -- javalang doesn't model method-chain order in a shape that's
+    easy to walk reliably. Works for the common, readable formatting real
+    Spring Security config is almost always written in, but won't resolve
+    a matcher pattern built from a variable/loop rather than a literal
+    string, and doesn't distinguish two independent authorizeHttpRequests
+    blocks in the same file (rare). `**` here is this function's own
+    sentinel for anyRequest()'s catch-all, not literal source text.
+    """
+    rules: list[tuple[list[str], str]] = []
+    for java_file in iter_files(target_path, (".java",)):
+        text = read_text_safe(java_file)
+        for match in _SECURITY_RULE_RE.finditer(text):
+            if match.group("patterns") is not None:
+                patterns = _QUOTED_STRING_RE.findall(match.group("patterns"))
+                rules.append((patterns, _describe_rule(match.group("rule1"), match.group("args1"))))
+            else:
+                rules.append((["**"], _describe_rule(match.group("rule2"), match.group("args2"))))
+    return rules
+
+
+def _ant_pattern_to_regex(pattern: str):
+    """Ant-style path pattern (Spring's own matcher syntax) -> compiled
+    regex. `**` matches any number of segments, `*` matches within one
+    segment, `{name}`/`{name:constraint}` matches one segment (the
+    constraint itself is ignored -- treated the same as a bare `*`).
+    """
+    escaped = re.escape(pattern)
+    escaped = escaped.replace(r"\*\*", ".*")
+    escaped = escaped.replace(r"\*", "[^/]*")
+    escaped = re.sub(r"\\\{[^}]*\\\}", "[^/]+", escaped)
+    return re.compile("^" + escaped + "$")
+
+
+def _resolve_matcher_coverage(route_path: str, rules: list[tuple[list[str], str]]) -> str | None:
+    """Walk the ordered matcher rules the same way Spring does -- first
+    matching pattern wins -- and return the rule text covering this
+    route's path, or None if nothing matched (no verdict, still open).
+    """
+    for patterns, rule in rules:
+        for pattern in patterns:
+            if pattern == "**" or _ant_pattern_to_regex(pattern).match(route_path):
+                return rule
+    return None
+
+
 def _extra_param_names(member) -> list[str]:
     """Method parameters annotated @RequestParam/@RequestBody -- Spring
     binds these from the query string / JSON body respectively, so an
@@ -417,6 +556,11 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
                     continue
 
                 class_validated = "Validated" in class_annotation_names
+                # A class-level @PreAuthorize/@Secured/etc applies to every
+                # method in the controller -- missing this used to make
+                # every route in such a class a false-positive AUTH-001,
+                # the same shape of bug as the class-level @Validated gap.
+                class_auth_decorators = sorted(class_annotation_names & KNOWN_AUTH_INDICATORS)
                 base_path = ""
                 for annotation in class_node.annotations:
                     if annotation.name == "RequestMapping":
@@ -448,7 +592,10 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
                     if method not in _HTTP_METHODS:
                         method = _MAPPING_ANNOTATIONS[mapping_annotation.name]
 
-                    auth_decorators = [a.name for a in member.annotations if a.name in KNOWN_AUTH_INDICATORS]
+                    auth_decorators = list(dict.fromkeys(
+                        class_auth_decorators
+                        + [a.name for a in member.annotations if a.name in KNOWN_AUTH_INDICATORS]
+                    ))
 
                     method_line = member.position.line if member.position else 0
                     annotation_lines = [a.position.line for a in member.annotations if a.position]
@@ -483,9 +630,10 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
         findings += validation_checks.check_validation_without_class_annotation(routes)
         findings += validation_checks.check_request_body_without_valid(routes)
         findings += _detect_cors_wildcards(self.target_path)
-        # TODO: Spring-specific checks -- e.g. missing CSRF config, JPA
-        # repository methods exposed directly (Spring Data REST) without
-        # ownership filtering.
+        findings += _detect_csrf_disabled(self.target_path)
+        findings += _detect_actuator_exposure(self.target_path)
+        # TODO: Spring-specific checks -- e.g. JPA repository methods
+        # exposed directly (Spring Data REST) without ownership filtering.
         return findings
 
     def analyze(self) -> ScanResult:
@@ -493,6 +641,38 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
         detected = _detect_global_security_filter_chain(self.target_path)
         if detected:
             auth_checks.apply_global_auth_note(result, *detected)
+
+        routes_with_auth_annotations = [r for r in result.routes if r.auth_decorators]
+        if routes_with_auth_annotations and not _detect_method_security_enabled(self.target_path):
+            first = routes_with_auth_annotations[0]
+            indicator_names = sorted({d for r in routes_with_auth_annotations for d in r.auth_decorators})
+            result.findings.append(
+                auth_checks.method_security_not_enabled_finding(first.file, first.line, indicator_names)
+            )
+
+        matcher_rules = _extract_security_matchers(self.target_path)
+        if matcher_rules:
+            for route in result.routes:
+                if route.auth_decorators:
+                    continue
+                verdict = _resolve_matcher_coverage(route.path, matcher_rules)
+                if verdict is None:
+                    continue
+                route.auth_matcher_verdict = verdict
+                for finding in result.findings:
+                    if finding.check_id == "AUTH-001" and finding.route is route:
+                        auth_checks.apply_matcher_verdict(finding, verdict)
+                        break
+
+            actuator_finding = next((f for f in result.findings if f.check_id == "AUTH-004"), None)
+            if actuator_finding is not None:
+                actuator_verdict = _resolve_matcher_coverage("/actuator/env", matcher_rules)
+                if actuator_verdict and actuator_verdict.lower().startswith("permitall"):
+                    result.findings.append(
+                        auth_checks.actuator_not_covered_finding(
+                            actuator_finding.file, actuator_finding.line, actuator_verdict
+                        )
+                    )
 
         version_info = _detect_spring_version(self.target_path)
         if version_info:

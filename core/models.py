@@ -77,6 +77,15 @@ class Route:
     # doesn't populate it or the route has no @RequestBody param.
     request_body_validations: dict[str, bool] = field(default_factory=dict)
 
+    # Best-effort resolution of which rule in a global SecurityFilterChain's
+    # authorizeHttpRequests()/authorizeRequests() matcher chain covers this
+    # route's path -- e.g. "permitAll()" or "hasRole(ADMIN)" -- resolved by
+    # walking the chain's ordered (pattern, rule) pairs the same way Spring
+    # does (first matching pattern wins). None when no matcher rule was
+    # found to cover this path (or the analyzer has no such concept), in
+    # which case the route's auth coverage is still an open question.
+    auth_matcher_verdict: Optional[str] = None
+
 
 @dataclass
 class Finding:

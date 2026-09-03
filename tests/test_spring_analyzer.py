@@ -478,3 +478,249 @@ def test_multi_module_maven_prefers_root_pom_for_version(tmp_path):
     result = SpringAnalyzer(tmp_path).analyze()
     assert result.framework_version == "3.1.4"
     assert result.framework_version_source[0] == "pom.xml"
+
+
+def test_class_level_preauthorize_covers_every_method(tmp_path):
+    # regression: a class-level @PreAuthorize applies to every method in
+    # the controller, same as class-level @Validated -- missing this used
+    # to make every route in such a class a false-positive AUTH-001.
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n"
+        "import org.springframework.security.access.prepost.PreAuthorize;\n\n"
+        "@RestController\n"
+        "@PreAuthorize(\"hasRole('ADMIN')\")\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @GetMapping(\"/{id}\")\n"
+        "    public Order get(@PathVariable Long id) { return null; }\n"
+        "}\n",
+    )
+    analyzer = SpringAnalyzer(tmp_path)
+    routes = analyzer.find_routes()
+    assert routes[0].auth_decorators == ["PreAuthorize"]
+    findings = analyzer.run_baseline_checks(routes)
+    assert not any(f.check_id == "AUTH-001" for f in findings)
+
+
+def test_method_security_not_enabled_is_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n"
+        "import org.springframework.security.access.prepost.PreAuthorize;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @PreAuthorize(\"hasRole('ADMIN')\")\n"
+        "    @GetMapping(\"/{id}\")\n"
+        "    public Order get(@PathVariable Long id) { return null; }\n"
+        "}\n",
+    )
+    result = SpringAnalyzer(tmp_path).analyze()
+    assert any(f.check_id == "AUTH-002" for f in result.findings)
+
+
+def test_method_security_enabled_suppresses_the_finding(tmp_path):
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n"
+        "import org.springframework.security.access.prepost.PreAuthorize;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @PreAuthorize(\"hasRole('ADMIN')\")\n"
+        "    @GetMapping(\"/{id}\")\n"
+        "    public Order get(@PathVariable Long id) { return null; }\n"
+        "}\n",
+    )
+    _write(
+        tmp_path,
+        "SecurityConfig.java",
+        "package com.example;\n"
+        "import org.springframework.context.annotation.Configuration;\n"
+        "import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;\n\n"
+        "@Configuration\n"
+        "@EnableMethodSecurity\n"
+        "public class SecurityConfig {}\n",
+    )
+    result = SpringAnalyzer(tmp_path).analyze()
+    assert not any(f.check_id == "AUTH-002" for f in result.findings)
+
+
+def test_csrf_disabled_lambda_style_is_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "SecurityConfig.java",
+        "package com.example;\n"
+        "public class SecurityConfig {\n"
+        "    public void configure(HttpSecurity http) {\n"
+        "        http.csrf(csrf -> csrf.disable());\n"
+        "    }\n"
+        "}\n",
+    )
+    findings = SpringAnalyzer(tmp_path).run_baseline_checks([])
+    assert any(f.check_id == "AUTH-003" for f in findings)
+
+
+def test_csrf_disabled_legacy_style_is_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "SecurityConfig.java",
+        "package com.example;\n"
+        "public class SecurityConfig {\n"
+        "    public void configure(HttpSecurity http) {\n"
+        "        http.csrf().disable();\n"
+        "    }\n"
+        "}\n",
+    )
+    findings = SpringAnalyzer(tmp_path).run_baseline_checks([])
+    assert any(f.check_id == "AUTH-003" for f in findings)
+
+
+def test_csrf_not_mentioned_is_not_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "SecurityConfig.java",
+        "package com.example;\n"
+        "public class SecurityConfig {\n"
+        "    public void configure(HttpSecurity http) {\n"
+        "        http.formLogin();\n"
+        "    }\n"
+        "}\n",
+    )
+    findings = SpringAnalyzer(tmp_path).run_baseline_checks([])
+    assert not any(f.check_id == "AUTH-003" for f in findings)
+
+
+def test_actuator_wildcard_exposure_flattened_key_is_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "application.properties",
+        "management.endpoints.web.exposure.include=*\n",
+    )
+    findings = SpringAnalyzer(tmp_path).run_baseline_checks([])
+    assert any(f.check_id == "AUTH-004" for f in findings)
+
+
+def test_actuator_sensitive_endpoint_nested_yaml_is_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "application.yml",
+        "management:\n"
+        "  endpoints:\n"
+        "    web:\n"
+        "      exposure:\n"
+        "        include: env,heapdump\n",
+    )
+    findings = SpringAnalyzer(tmp_path).run_baseline_checks([])
+    assert any(f.check_id == "AUTH-004" for f in findings)
+
+
+def test_actuator_health_only_is_not_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "application.properties",
+        "management.endpoints.web.exposure.include=health\n",
+    )
+    findings = SpringAnalyzer(tmp_path).run_baseline_checks([])
+    assert not any(f.check_id == "AUTH-004" for f in findings)
+
+
+def test_matcher_verdict_resolves_permitall_and_downgrades_severity(tmp_path):
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @GetMapping(\"/public/status\")\n"
+        "    public String status() { return \"\"; }\n"
+        "}\n",
+    )
+    _write(
+        tmp_path,
+        "SecurityConfig.java",
+        "package com.example;\n"
+        "public class SecurityConfig {\n"
+        "    public SecurityFilterChain filterChain(HttpSecurity http) {\n"
+        "        http.authorizeHttpRequests(auth -> auth\n"
+        "            .requestMatchers(\"/api/orders/public/**\").permitAll()\n"
+        "            .anyRequest().authenticated()\n"
+        "        );\n"
+        "        return http.build();\n"
+        "    }\n"
+        "}\n",
+    )
+    result = SpringAnalyzer(tmp_path).analyze()
+    route = result.routes[0]
+    assert route.auth_matcher_verdict == "permitAll()"
+    auth_finding = next(f for f in result.findings if f.check_id == "AUTH-001")
+    assert auth_finding.severity == "info"
+
+
+def test_matcher_verdict_resolves_role_requirement_more_specific_pattern_wins(tmp_path):
+    # first matching pattern wins, same as Spring's own evaluation order --
+    # the more specific /api/orders/** rule must beat the anyRequest() catch-all
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @GetMapping(\"/{id}\")\n"
+        "    public Order get(@PathVariable Long id) { return null; }\n"
+        "}\n",
+    )
+    _write(
+        tmp_path,
+        "SecurityConfig.java",
+        "package com.example;\n"
+        "public class SecurityConfig {\n"
+        "    public SecurityFilterChain filterChain(HttpSecurity http) {\n"
+        "        http.authorizeHttpRequests(auth -> auth\n"
+        "            .requestMatchers(\"/api/orders/**\").hasRole(\"ADMIN\")\n"
+        "            .anyRequest().authenticated()\n"
+        "        );\n"
+        "        return http.build();\n"
+        "    }\n"
+        "}\n",
+    )
+    result = SpringAnalyzer(tmp_path).analyze()
+    route = result.routes[0]
+    assert route.auth_matcher_verdict == "hasRole(ADMIN)"
+    auth_finding = next(f for f in result.findings if f.check_id == "AUTH-001")
+    assert auth_finding.severity == "low"
+
+
+def test_actuator_permitall_coverage_is_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "application.properties",
+        "management.endpoints.web.exposure.include=*\n",
+    )
+    _write(
+        tmp_path,
+        "SecurityConfig.java",
+        "package com.example;\n"
+        "public class SecurityConfig {\n"
+        "    public SecurityFilterChain filterChain(HttpSecurity http) {\n"
+        "        http.authorizeHttpRequests(auth -> auth\n"
+        "            .requestMatchers(\"/actuator/**\").permitAll()\n"
+        "            .anyRequest().authenticated()\n"
+        "        );\n"
+        "        return http.build();\n"
+        "    }\n"
+        "}\n",
+    )
+    result = SpringAnalyzer(tmp_path).analyze()
+    assert any(f.check_id == "AUTH-005" for f in result.findings)

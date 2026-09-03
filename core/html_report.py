@@ -58,6 +58,19 @@ def _worst_severity(findings: list[Finding]) -> str:
     return min(findings, key=lambda f: _SEVERITY_RANK.get(f.severity, 9)).severity
 
 
+def _is_auth_finding(finding: Finding) -> bool:
+    return finding.check_id.startswith("AUTH-")
+
+
+def _non_auth_findings_for_route(route: Route, findings: list[Finding]) -> list[Finding]:
+    """Findings tied to `route`, excluding the AUTH-* family -- those live
+    exclusively in the Authentication tab now (see `_render_auth_tab`), so
+    a route card's border color/sort rank/tag list should reflect only its
+    input/validation findings, matching what's actually visible on it.
+    """
+    return [f for f in findings if f.route is route and not _is_auth_finding(f)]
+
+
 def _vscode_uri(target_path: Path, file_rel: str, line: int) -> str:
     full = (target_path / file_rel).resolve()
     return f"vscode://file/{str(full).replace(chr(92), '/')}:{line}"
@@ -198,8 +211,8 @@ def _render_input_note(route: Route) -> str:
 
 def _render_validation_note(route: Route) -> str:
     """"validation: @Validated (class-wide) · orderId: @Positive · dto (body): @Valid"
-    -- a quick-glance line, parallel to the auth-note, so a reviewer can see
-    every half of Bean Validation coverage at once: is the class wired up to
+    -- a quick-glance line, parallel to `_render_input_note`, so a reviewer
+    can see every half of Bean Validation coverage at once: is the class wired up to
     enforce @PathVariable/@RequestParam constraints, does each such param
     actually carry one, and does each @RequestBody param carry the @Valid
     that's needed to cascade into its own field constraints. Only rendered
@@ -253,7 +266,7 @@ def _route_search_blob(route: Route) -> str:
 
 
 def _render_route(route: Route, findings: list[Finding], target_path: Path, language: str, route_id: str) -> str:
-    route_findings = [f for f in findings if f.route is route]
+    route_findings = _non_auth_findings_for_route(route, findings)
     worst = _worst_severity(route_findings)
 
     method_badges = "".join(f'<span class="method m-{_esc(m.lower())}">{_esc(m)}</span>' for m in route.methods)
@@ -261,7 +274,6 @@ def _render_route(route: Route, findings: list[Finding], target_path: Path, lang
     finding_tags = "".join(
         f'<span class="tag sev-{_esc(f.severity)}">{_esc(f.check_id)}</span>' for f in route_findings
     )
-    auth_note = ", ".join(route.auth_decorators) if route.auth_decorators else "none detected"
     input_html = _render_input_note(route)
     validation_html = _render_validation_note(route)
 
@@ -279,7 +291,6 @@ def _render_route(route: Route, findings: list[Finding], target_path: Path, lang
         </summary>
         <div class="route-body">
           {input_html}
-          <p class="auth-note">auth: {_esc(auth_note)}</p>
           {validation_html}
           <div class="findings">{findings_html}</div>
           {code_html}
@@ -290,11 +301,14 @@ def _render_route(route: Route, findings: list[Finding], target_path: Path, lang
 def _render_group(result: ScanResult, target_path: Path, route_ids: itertools.count) -> str:
     # Worst-first by default -- the JS "Sort by" control lets the reader
     # reorder interactively, but the first thing anyone sees on open should
-    # already be what needs attention most.
+    # already be what needs attention most. AUTH-* findings are excluded
+    # (see _non_auth_findings_for_route) since they no longer render on the
+    # card at all -- sorting by a severity the reader can't see on this tab
+    # would be confusing.
     sorted_routes = sorted(
         result.routes,
         key=lambda r: _ROUTE_SORT_RANK.get(
-            _worst_severity([f for f in result.findings if f.route is r]), 9
+            _worst_severity(_non_auth_findings_for_route(r, result.findings)), 9
         ),
     )
     routes_html = "".join(
@@ -302,16 +316,6 @@ def _render_group(result: ScanResult, target_path: Path, route_ids: itertools.co
         for r in sorted_routes
     )
     notes_html = "".join(f'<p class="group-note">{_esc(n)}</p>' for n in result.notes)
-
-    global_auth_html = ""
-    if result.global_auth_source:
-        gfile, gline, gdescription = result.global_auth_source
-        ide_link = _vscode_uri(target_path, gfile, gline)
-        global_auth_html = f"""
-      <p class="group-note global-auth-note">
-        Possible global auth coverage: <a class="ide-link" href="{_esc(ide_link)}">{_esc(gfile)}:{gline}</a>
-        &mdash; {_esc(gdescription)}. Verify affected AUTH-001 findings below before treating them as real gaps.
-      </p>"""
 
     version_html = ""
     if result.framework_version:
@@ -335,15 +339,121 @@ def _render_group(result: ScanResult, target_path: Path, route_ids: itertools.co
         <span class="count">{len(result.routes)} route{"s" if len(result.routes) != 1 else ""}</span>
       </h2>
       {notes_html}
-      {global_auth_html}
       {routes_html or '<p class="no-findings">No routes extracted.</p>'}
+    </section>"""
+
+
+def _render_standalone_finding(finding: Finding, target_path: Path) -> str:
+    """A project-wide AUTH-* finding (route=None) -- these have nowhere to
+    attach in the route-card view, so unlike `_render_finding` this
+    includes its own file:line + "open in editor" link.
+    """
+    ide_link = _vscode_uri(target_path, finding.file, finding.line)
+    return f"""
+    <div class="finding sev-{_esc(finding.severity)}">
+      <div class="finding-head">
+        <span class="finding-tag">{_esc(finding.check_id)}</span>
+        <span class="finding-sev">{_esc(_SEVERITY_LABEL.get(finding.severity, finding.severity))}</span>
+        <a class="ide-link finding-loc" href="{_esc(ide_link)}">{_esc(finding.file)}:{finding.line} &rarr;</a>
+      </div>
+      <p class="finding-title">{_esc(finding.title)}</p>
+      <p class="finding-desc">{_esc(finding.description)}</p>
+    </div>"""
+
+
+def _render_auth_route_row(route: Route, auth_finding: Finding | None, target_path: Path) -> str:
+    ide_link = _vscode_uri(target_path, route.file, route.line)
+    methods_badges = "".join(f'<span class="method m-{_esc(m.lower())}">{_esc(m)}</span>' for m in route.methods)
+
+    if route.auth_decorators:
+        status_sev = "clean"
+        status_text = ", ".join(f"@{d}" for d in route.auth_decorators)
+    elif auth_finding is not None:
+        status_sev = auth_finding.severity
+        status_text = auth_finding.title
+    else:
+        status_sev = "clean"
+        status_text = "covered"
+
+    return f"""
+      <tr class="auth-row sev-{_esc(status_sev)}" data-severity="{_esc(status_sev)}" data-search="{_route_search_blob(route)}">
+        <td>{methods_badges}</td>
+        <td class="path">{_esc(route.path)}</td>
+        <td class="handler">{_esc(route.handler_name)}</td>
+        <td class="auth-status sev-{_esc(status_sev)}">{_esc(status_text)}</td>
+        <td><a class="ide-link" href="{_esc(ide_link)}">{_esc(route.file)}:{route.line} &rarr;</a></td>
+      </tr>"""
+
+
+def _render_auth_tab(results: list[ScanResult], target_path: Path) -> str:
+    """The Authentication tab: every AUTH-* finding gathered in one place,
+    split into project-wide config findings (AUTH-002/003/004/005 -- no
+    single route to attach to) and a per-route table (AUTH-001, plus routes
+    with no finding at all because they're already covered by a
+    recognized annotation). Kept deliberately separate from the Routes tab
+    so severity/sort there reflects only input/validation coverage, not a
+    mix of two different concerns.
+    """
+    all_findings = [f for r in results for f in r.findings]
+    project_findings = sorted(
+        (f for f in all_findings if _is_auth_finding(f) and f.route is None),
+        key=lambda f: _SEVERITY_RANK.get(f.severity, 9),
+    )
+    project_html = "".join(_render_standalone_finding(f, target_path) for f in project_findings)
+
+    global_auth_html = ""
+    for result in results:
+        if not result.global_auth_source:
+            continue
+        gfile, gline, gdescription = result.global_auth_source
+        ide_link = _vscode_uri(target_path, gfile, gline)
+        global_auth_html += f"""
+      <p class="group-note global-auth-note">
+        Global auth mechanism detected: <a class="ide-link" href="{_esc(ide_link)}">{_esc(gfile)}:{gline}</a>
+        &mdash; {_esc(gdescription)}.
+      </p>"""
+
+    rows_html = ""
+    total_routes = 0
+    for result in results:
+        for route in result.routes:
+            total_routes += 1
+            auth_finding = next(
+                (f for f in result.findings if f.check_id == "AUTH-001" and f.route is route), None
+            )
+            rows_html += _render_auth_route_row(route, auth_finding, target_path)
+
+    table_html = f"""
+    <table class="auth-table">
+      <thead>
+        <tr><th>Method</th><th>Path</th><th>Handler</th><th>Status</th><th>Location</th></tr>
+      </thead>
+      <tbody>
+        {rows_html or '<tr><td colspan="5" class="no-findings">No routes extracted.</td></tr>'}
+      </tbody>
+    </table>"""
+
+    return f"""
+    <section class="auth-section">
+      <h2 class="section-title">Project-wide<span class="count">{len(project_findings)} finding{"s" if len(project_findings) != 1 else ""}</span></h2>
+      {global_auth_html}
+      {project_html or '<p class="no-findings">No project-wide authentication findings.</p>'}
+    </section>
+    <section class="auth-section">
+      <h2 class="section-title">Per-route coverage<span class="count">{total_routes} route{"s" if total_routes != 1 else ""}</span></h2>
+      {table_html}
     </section>"""
 
 
 def render_html(results: list[ScanResult], target_path: Path) -> str:
     all_findings = [f for r in results for f in r.findings]
     all_routes = [rt for r in results for rt in r.routes]
-    severity_counts = {sev: sum(1 for f in all_findings if f.severity == sev) for sev in _SEVERITY_RANK}
+    # Scoped to non-auth findings -- the sidebar's severity filter/stat
+    # block belongs to the Routes tab, which no longer shows AUTH-* at all.
+    routes_tab_findings = [f for f in all_findings if not _is_auth_finding(f)]
+    severity_counts = {sev: sum(1 for f in routes_tab_findings if f.severity == sev) for sev in _SEVERITY_RANK}
+    auth_findings = [f for f in all_findings if _is_auth_finding(f)]
+    auth_attention_count = sum(1 for f in auth_findings if f.severity in ("high", "medium"))
     languages = sorted({r.language for r in results})
     methods_present = sorted(
         {m for r in all_routes for m in r.methods},
@@ -366,6 +476,7 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
 
     route_ids = itertools.count(1)
     groups_html = "".join(_render_group(r, target_path, route_ids) for r in results) or '<p class="no-findings">No supported language/framework detected in target.</p>'
+    auth_tab_html = _render_auth_tab(results, target_path)
 
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
     # Namespaces this report's "reviewed" checklist in localStorage so two
@@ -409,35 +520,52 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
     </div>
   </header>
 
-  <div class="layout">
-    <aside class="sidebar">
-      <div class="stat-block">
-        <div class="stat"><span class="stat-value">{len(all_routes)}</span><span class="stat-label">routes</span></div>
-        <div class="stat sev-high"><span class="stat-value">{severity_counts["high"]}</span><span class="stat-label">high</span></div>
-        <div class="stat sev-medium"><span class="stat-value">{severity_counts["medium"]}</span><span class="stat-label">medium</span></div>
-        <div class="stat sev-low"><span class="stat-value">{severity_counts["low"]}</span><span class="stat-label">low</span></div>
-        <div class="stat stat-reviewed"><span class="stat-value" id="reviewed-stat">0 / {len(all_routes)}</span><span class="stat-label">reviewed</span></div>
-      </div>
+  <nav class="tabs">
+    <button class="tab-button active" id="tab-btn-routes" data-tab="routes" type="button">
+      Routes <span class="tab-count">{len(all_routes)}</span>
+    </button>
+    <button class="tab-button" id="tab-btn-auth" data-tab="auth" type="button">
+      Authentication <span class="tab-count{" tab-count-warn" if auth_attention_count else ""}">{len(auth_findings)}</span>
+    </button>
+  </nav>
 
-      <div class="filter-group">
-        <h2>Severity</h2>
-        {sev_filters}
-        <label><input type="checkbox" class="f-sev" value="clean" checked> No findings</label>
-      </div>
+  <div class="tab-panel" id="tab-panel-routes">
+    <div class="layout">
+      <aside class="sidebar">
+        <div class="stat-block">
+          <div class="stat"><span class="stat-value">{len(all_routes)}</span><span class="stat-label">routes</span></div>
+          <div class="stat sev-high"><span class="stat-value">{severity_counts["high"]}</span><span class="stat-label">high</span></div>
+          <div class="stat sev-medium"><span class="stat-value">{severity_counts["medium"]}</span><span class="stat-label">medium</span></div>
+          <div class="stat sev-low"><span class="stat-value">{severity_counts["low"]}</span><span class="stat-label">low</span></div>
+          <div class="stat stat-reviewed"><span class="stat-value" id="reviewed-stat">0 / {len(all_routes)}</span><span class="stat-label">reviewed</span></div>
+        </div>
 
-      <div class="filter-group">
-        <h2>Method</h2>
-        {method_filters}
-      </div>
+        <div class="filter-group">
+          <h2>Severity</h2>
+          {sev_filters}
+          <label><input type="checkbox" class="f-sev" value="clean" checked> No findings</label>
+        </div>
 
-      <div class="filter-group">
-        <h2>Language</h2>
-        {lang_filters}
-      </div>
-    </aside>
+        <div class="filter-group">
+          <h2>Method</h2>
+          {method_filters}
+        </div>
 
-    <main class="content">
-      {groups_html}
+        <div class="filter-group">
+          <h2>Language</h2>
+          {lang_filters}
+        </div>
+      </aside>
+
+      <main class="content">
+        {groups_html}
+      </main>
+    </div>
+  </div>
+
+  <div class="tab-panel" id="tab-panel-auth" hidden>
+    <main class="content auth-content">
+      {auth_tab_html}
     </main>
   </div>
 </div>
@@ -550,6 +678,43 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   user-select: none;
 }
 .hide-reviewed-toggle input { accent-color: var(--accent); cursor: pointer; }
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 12px 28px 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.tab-button {
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: none;
+  color: var(--text-muted);
+  padding: 10px 16px;
+  border-radius: 4px 4px 0 0;
+  font-family: var(--sans);
+  font-size: 13px;
+  cursor: pointer;
+}
+.tab-button:hover { color: var(--text); }
+.tab-button.active {
+  color: var(--text);
+  background: var(--bg);
+  border-color: var(--border);
+}
+.tab-count {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.tab-count-warn { background: var(--sev-high); color: var(--bg); }
+.tab-panel[hidden] { display: none; }
 
 .layout { display: flex; align-items: flex-start; }
 
@@ -712,7 +877,6 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 }
 
 .input-note { font-family: var(--mono); font-size: 12px; color: var(--sev-medium); margin: 0 0 4px; }
-.auth-note { font-family: var(--mono); font-size: 12px; color: var(--text-muted); margin: 0 0 4px; }
 .validation-note { font-family: var(--mono); font-size: 12px; color: var(--text-muted); margin: 0 0 12px; }
 .validation-note.validation-warn { color: var(--sev-medium); }
 .findings { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
@@ -731,6 +895,47 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .finding-title { margin: 6px 0 2px; font-weight: 600; font-size: 13px; }
 .finding-desc { margin: 0; color: var(--text-muted); font-size: 12.5px; }
 .no-findings { color: var(--text-muted); font-size: 12.5px; font-style: italic; margin: 0; }
+
+.auth-content { max-width: 1100px; }
+.auth-section { margin-bottom: 32px; }
+.section-title {
+  font-family: var(--mono);
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 8px;
+  margin: 0 0 14px;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.section-title .count { color: var(--text); font-size: 12px; text-transform: none; letter-spacing: 0; }
+.auth-section .finding { margin-bottom: 8px; }
+.finding-head { display: flex; align-items: center; gap: 4px; }
+.finding-loc { margin-left: auto; font-family: var(--mono); font-size: 11px; }
+
+.auth-table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12.5px; }
+.auth-table th {
+  text-align: left;
+  color: var(--text-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+}
+.auth-table td { padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.auth-row:hover { background: var(--surface); }
+.auth-row .path { color: var(--accent); }
+.auth-row .handler { color: var(--text-muted); }
+.auth-status { border-left: 3px solid var(--sev-clean); padding-left: 8px; }
+.auth-status.sev-high { border-left-color: var(--sev-high); color: var(--sev-high); }
+.auth-status.sev-medium { border-left-color: var(--sev-medium); color: var(--sev-medium); }
+.auth-status.sev-low { border-left-color: var(--sev-low); color: var(--sev-low); }
+.auth-status.sev-info { border-left-color: var(--sev-info); color: var(--sev-info); }
+.auth-status.sev-clean { color: var(--sev-clean); }
 
 .code-header {
   display: flex;
@@ -797,6 +1002,16 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 """
 
 _JS = """
+// --- Tabs ---
+const tabButtons = document.querySelectorAll('.tab-button');
+tabButtons.forEach(btn => {
+  btn.addEventListener('click', () => {
+    tabButtons.forEach(b => b.classList.toggle('active', b === btn));
+    document.getElementById('tab-panel-routes').hidden = btn.dataset.tab !== 'routes';
+    document.getElementById('tab-panel-auth').hidden = btn.dataset.tab !== 'auth';
+  });
+});
+
 document.getElementById('expand-all').addEventListener('click', () => {
   document.querySelectorAll('details.route-card').forEach(d => d.open = true);
 });
