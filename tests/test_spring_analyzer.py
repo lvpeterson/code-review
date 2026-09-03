@@ -810,3 +810,88 @@ def test_json_only_produces_is_not_flagged(tmp_path):
     analyzer = SpringAnalyzer(tmp_path)
     findings = analyzer.run_baseline_checks(analyzer.find_routes())
     assert not any(f.check_id == "XML-001" for f in findings)
+
+
+def test_csrf_disabled_downgraded_for_stateless_resource_server(tmp_path):
+    _write(
+        tmp_path,
+        "SecurityConfig.java",
+        "package com.example;\n"
+        "import org.springframework.security.web.SecurityFilterChain;\n\n"
+        "public class SecurityConfig {\n"
+        "    public SecurityFilterChain filterChain(HttpSecurity http) {\n"
+        "        http.sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))\n"
+        "            .oauth2ResourceServer(oauth2 -> oauth2.jwt(Customizer.withDefaults()))\n"
+        "            .csrf(csrf -> csrf.disable());\n"
+        "        return http.build();\n"
+        "    }\n"
+        "}\n",
+    )
+    findings = SpringAnalyzer(tmp_path).run_baseline_checks([])
+    finding = next(f for f in findings if f.check_id == "AUTH-003")
+    assert finding.severity == "info"
+
+
+def test_csrf_disabled_stays_medium_when_oauth2login_also_present(tmp_path):
+    # regression: oauth2Login (or formLogin) in the SAME method as csrf
+    # disable means a session cookie IS established -- must NOT downgrade,
+    # even though oauth2ResourceServer might also technically be present
+    # elsewhere, since the login flow is what actually creates the risk.
+    _write(
+        tmp_path,
+        "SecurityConfig.java",
+        "package com.example;\n"
+        "import org.springframework.security.web.SecurityFilterChain;\n\n"
+        "public class SecurityConfig {\n"
+        "    public SecurityFilterChain filterChain(HttpSecurity http) {\n"
+        "        http.oauth2Login(Customizer.withDefaults())\n"
+        "            .csrf(csrf -> csrf.disable());\n"
+        "        return http.build();\n"
+        "    }\n"
+        "}\n",
+    )
+    findings = SpringAnalyzer(tmp_path).run_baseline_checks([])
+    finding = next(f for f in findings if f.check_id == "AUTH-003")
+    assert finding.severity == "medium"
+
+
+def test_csrf_disabled_stays_medium_when_no_resource_server_signal(tmp_path):
+    _write(
+        tmp_path,
+        "SecurityConfig.java",
+        "package com.example;\n"
+        "public class SecurityConfig {\n"
+        "    public void configure(HttpSecurity http) {\n"
+        "        http.csrf(csrf -> csrf.disable());\n"
+        "    }\n"
+        "}\n",
+    )
+    findings = SpringAnalyzer(tmp_path).run_baseline_checks([])
+    finding = next(f for f in findings if f.check_id == "AUTH-003")
+    assert finding.severity == "medium"
+
+
+def test_csrf_downgrade_scoped_to_enclosing_method_only(tmp_path):
+    # regression: oauth2ResourceServer + STATELESS in an unrelated method
+    # elsewhere in the same file must NOT downgrade a csrf-disable that
+    # lives in a different method with no such corroborating signal.
+    _write(
+        tmp_path,
+        "SecurityConfig.java",
+        "package com.example;\n"
+        "import org.springframework.security.web.SecurityFilterChain;\n\n"
+        "public class SecurityConfig {\n"
+        "    public SecurityFilterChain apiChain(HttpSecurity http) {\n"
+        "        http.sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))\n"
+        "            .oauth2ResourceServer(oauth2 -> oauth2.jwt(Customizer.withDefaults()));\n"
+        "        return http.build();\n"
+        "    }\n"
+        "    public SecurityFilterChain webChain(HttpSecurity http) {\n"
+        "        http.csrf(csrf -> csrf.disable());\n"
+        "        return http.build();\n"
+        "    }\n"
+        "}\n",
+    )
+    findings = SpringAnalyzer(tmp_path).run_baseline_checks([])
+    finding = next(f for f in findings if f.check_id == "AUTH-003")
+    assert finding.severity == "medium"

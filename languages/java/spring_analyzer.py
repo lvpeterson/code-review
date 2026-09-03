@@ -257,6 +257,35 @@ _CSRF_DISABLED_RE = re.compile(
     r"\.csrf\s*\([^)]*\.disable\(\)"   # .csrf(csrf -> csrf.disable())  (Spring Security 6+ lambda DSL)
     r"|\.csrf\(\)\s*\.\s*disable\(\)"  # .csrf().disable()              (older fluent builder style)
 )
+_OAUTH2_RESOURCE_SERVER_RE = re.compile(r"\.oauth2ResourceServer\s*\(")
+_SESSION_STATELESS_RE = re.compile(r"SessionCreationPolicy\.STATELESS")
+_SESSION_BASED_AUTH_RE = re.compile(r"\.oauth2Login\s*\(|\.formLogin\s*\(")
+
+
+def _enclosing_method_body(tree, text: str, line: int) -> str | None:
+    """The full body text of whichever method declaration contains `line`,
+    or None if none does. Used to give a CSRF-disable match the actual
+    surrounding security-config context to check for corroborating
+    resource-server signals -- rather than scanning the whole file blindly,
+    which could pick up an unrelated `.oauth2Login(...)` sitting in a
+    completely different bean/method than the one that disabled CSRF.
+    Picks the innermost enclosing method if there's nesting (the one whose
+    start line is latest while still containing `line`).
+    """
+    best: tuple[int, int] | None = None
+    for _, member in tree.filter(javalang.tree.MethodDeclaration):
+        if not member.position:
+            continue
+        start = member.position.line
+        if start > line:
+            continue
+        end = _method_end_line(text, start)
+        if start <= line <= end and (best is None or start > best[0]):
+            best = (start, end)
+    if best is None:
+        return None
+    start, end = best
+    return "\n".join(text.split("\n")[start - 1:end])
 
 
 def _detect_csrf_disabled(target_path) -> list[Finding]:
@@ -264,8 +293,20 @@ def _detect_csrf_disabled(target_path) -> list[Finding]:
     for java_file in iter_files(target_path, (".java",)):
         text = read_text_safe(java_file)
         relative_file = str(java_file.relative_to(target_path))
+        try:
+            tree = javalang.parse.parse(text)
+        except Exception:
+            tree = None
+
         for match in _CSRF_DISABLED_RE.finditer(text):
-            findings.append(auth_checks.csrf_disabled_finding(relative_file, _line_of(text, match.start())))
+            line = _line_of(text, match.start())
+            context = (_enclosing_method_body(tree, text, line) if tree else None) or text
+            resource_server_only = bool(
+                _OAUTH2_RESOURCE_SERVER_RE.search(context)
+                and _SESSION_STATELESS_RE.search(context)
+                and not _SESSION_BASED_AUTH_RE.search(context)
+            )
+            findings.append(auth_checks.csrf_disabled_finding(relative_file, line, resource_server_only))
     return findings
 
 

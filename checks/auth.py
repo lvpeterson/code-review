@@ -74,7 +74,38 @@ def method_security_not_enabled_finding(file: str, line: int, indicator_names: l
     )
 
 
-def csrf_disabled_finding(file: str, line: int) -> Finding:
+def csrf_disabled_finding(file: str, line: int, resource_server_only: bool = False) -> Finding:
+    """`resource_server_only` is True when the *same* security-config method
+    that disables CSRF also configures `.oauth2ResourceServer(...)` with
+    `SessionCreationPolicy.STATELESS`, and has no `.oauth2Login(...)`/
+    `.formLogin(...)` in it -- the standard, correct combination for a pure
+    bearer-token API where CSRF genuinely doesn't apply, per Spring
+    Security's own session-cookie-based threat model. Downgrades severity
+    accordingly, but still flags it (never silently drops it) since this is
+    a same-method-only check: a session established by a *different*
+    SecurityFilterChain, or a token that ends up riding in on a cookie
+    instead of an explicit header, are both invisible to this detection.
+    """
+    if resource_server_only:
+        return Finding(
+            check_id="AUTH-003",
+            severity="info",
+            title="CSRF disabled -- looks like a stateless OAuth2 resource server",
+            description=(
+                "Found `.csrf(...).disable()` alongside `.oauth2ResourceServer(...)` and "
+                "`SessionCreationPolicy.STATELESS` in the same security config method -- "
+                "the standard, correct combination for a pure bearer-token API with no "
+                "cookie-based session, where CSRF genuinely doesn't apply. Still worth a "
+                "quick check before fully dismissing this: does any other part of the "
+                "application use `.oauth2Login(...)`, `.formLogin(...)`, or otherwise "
+                "establish a cookie-based session (a different SecurityFilterChain bean), "
+                "or does the token itself ever ride in on a cookie rather than an explicit "
+                "Authorization header? This detection only looked inside this one method."
+            ),
+            file=file,
+            line=line,
+            route=None,
+        )
     return Finding(
         check_id="AUTH-003",
         severity="medium",
