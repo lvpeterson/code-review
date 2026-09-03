@@ -524,8 +524,8 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
     <button class="tab-button active" id="tab-btn-routes" data-tab="routes" type="button">
       Routes <span class="tab-count">{len(all_routes)}</span>
     </button>
-    <button class="tab-button" id="tab-btn-auth" data-tab="auth" type="button">
-      Authentication <span class="tab-count{" tab-count-warn" if auth_attention_count else ""}">{len(auth_findings)}</span>
+    <button class="tab-button" id="tab-btn-auth" data-tab="auth" type="button" title="{auth_attention_count} needing attention (high/medium) of {len(auth_findings)} total auth finding{"s" if len(auth_findings) != 1 else ""}">
+      Authentication <span class="tab-count{" tab-count-warn" if auth_attention_count else ""}">{auth_attention_count}</span>
     </button>
   </nav>
 
