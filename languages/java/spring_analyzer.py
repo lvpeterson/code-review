@@ -16,6 +16,7 @@ from checks import auth as auth_checks
 from checks import config as config_checks
 from checks import idor as idor_checks
 from checks import validation as validation_checks
+from checks import xml as xml_checks
 from core.base import BaseFrameworkAnalyzer
 from core.fsutil import iter_files, iter_named_files, read_text_safe
 from core.models import Finding, Route, ScanResult
@@ -127,6 +128,52 @@ def _first_literal_value(element) -> str | None:
     if isinstance(element, javalang.tree.ElementArrayValue) and element.values:
         return _first_literal_value(element.values[0])
     return None
+
+
+def _all_literal_values(element) -> list[str]:
+    """Every string out of an annotation element, keeping every entry of an
+    array rather than just the first (unlike `_first_literal_value`).
+    produces/consumes are array-typed attributes where a route legitimately
+    declares multiple formats (`produces = {"application/json",
+    "application/xml"}`) -- taking only the first entry would silently drop
+    an XML format listed after a JSON one.
+    """
+    if isinstance(element, javalang.tree.Literal):
+        return [_clean_literal(element.value)]
+    if isinstance(element, javalang.tree.MemberReference):
+        return [element.member]
+    if isinstance(element, javalang.tree.ElementArrayValue):
+        values: list[str] = []
+        for v in element.values:
+            values.extend(_all_literal_values(v))
+        return values
+    return []
+
+
+_XML_MEDIA_TYPE_RE = re.compile(r"xml", re.IGNORECASE)
+
+
+def _xml_media_types(mapping_annotation) -> list[str]:
+    """produces/consumes values on `mapping_annotation` that look like XML
+    -- a literal media-type string containing "xml" (application/xml,
+    text/xml, application/soap+xml, ...) or a constant/enum-member name
+    containing "xml". Spring's own MediaType.APPLICATION_XML_VALUE,
+    MediaType.TEXT_XML_VALUE, MediaType.APPLICATION_SOAP_XML_VALUE, etc all
+    happen to embed "XML" in the constant name itself, which is what makes
+    this catch them without needing a hardcoded list of Spring's exact
+    constant names. Won't catch a value built via a method call
+    (`SomeEnum.XML.getValue()`) or a codebase's own custom media-type
+    constants class defined elsewhere -- those need real cross-file type
+    resolution, which this AST-only tool doesn't do.
+    """
+    element = mapping_annotation.element
+    if not isinstance(element, list):
+        return []
+    found: list[str] = []
+    for pair in element:
+        if isinstance(pair, javalang.tree.ElementValuePair) and pair.name in ("produces", "consumes"):
+            found += [v for v in _all_literal_values(pair.value) if _XML_MEDIA_TYPE_RE.search(v)]
+    return found
 
 
 def _annotation_values(annotation) -> dict[str, str]:
@@ -618,6 +665,7 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
                             param_validations=_param_validations(member),
                             class_validated=class_validated,
                             request_body_validations=_request_body_param_validations(member),
+                            xml_media_types=_xml_media_types(mapping_annotation),
                         )
                     )
 
@@ -629,6 +677,7 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
         findings += auth_checks.check_missing_auth_indicator(routes, KNOWN_AUTH_INDICATORS)
         findings += validation_checks.check_validation_without_class_annotation(routes)
         findings += validation_checks.check_request_body_without_valid(routes)
+        findings += xml_checks.check_xml_media_type_routes(routes)
         findings += _detect_cors_wildcards(self.target_path)
         findings += _detect_csrf_disabled(self.target_path)
         findings += _detect_actuator_exposure(self.target_path)

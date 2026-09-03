@@ -77,6 +77,16 @@ class Route:
     # doesn't populate it or the route has no @RequestBody param.
     request_body_validations: dict[str, bool] = field(default_factory=dict)
 
+    # Media type strings/constant-names on this route's produces/consumes
+    # that look like XML (a literal like "application/xml", or a constant
+    # name like Spring's own MediaType.APPLICATION_XML_VALUE) -- present so
+    # a route that speaks XML can be flagged for an XXE (XML External
+    # Entity) review, a distinct vulnerability class from anything else
+    # tracked here. Empty when the analyzer doesn't populate it or no XML
+    # type was declared. Best-effort: a codebase's own custom media-type
+    # constants class won't be resolved by this (see checks/xml.py).
+    xml_media_types: list[str] = field(default_factory=list)
+
     # Best-effort resolution of which rule in a global SecurityFilterChain's
     # authorizeHttpRequests()/authorizeRequests() matcher chain covers this
     # route's path -- e.g. "permitAll()" or "hasRole(ADMIN)" -- resolved by

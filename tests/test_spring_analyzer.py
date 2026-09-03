@@ -724,3 +724,89 @@ def test_actuator_permitall_coverage_is_flagged(tmp_path):
     )
     result = SpringAnalyzer(tmp_path).analyze()
     assert any(f.check_id == "AUTH-005" for f in result.findings)
+
+
+def test_xml_literal_produces_is_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @GetMapping(value = \"/legacy\", produces = \"application/xml\")\n"
+        "    public String legacy() { return \"\"; }\n"
+        "}\n",
+    )
+    analyzer = SpringAnalyzer(tmp_path)
+    routes = analyzer.find_routes()
+    assert routes[0].xml_media_types == ["application/xml"]
+    findings = analyzer.run_baseline_checks(routes)
+    assert any(f.check_id == "XML-001" for f in findings)
+
+
+def test_xml_spring_mediatype_constant_is_flagged(tmp_path):
+    # regression: MediaType.APPLICATION_XML_VALUE resolves (via
+    # _first_literal_value-style MemberReference handling) to the constant
+    # NAME "APPLICATION_XML_VALUE", not the literal string "application/xml"
+    # -- detection has to work off the constant name too, not just literals.
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.http.MediaType;\n"
+        "import org.springframework.web.bind.annotation.*;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @GetMapping(value = \"/legacy\", produces = MediaType.APPLICATION_XML_VALUE)\n"
+        "    public String legacy() { return \"\"; }\n"
+        "}\n",
+    )
+    analyzer = SpringAnalyzer(tmp_path)
+    routes = analyzer.find_routes()
+    assert routes[0].xml_media_types == ["APPLICATION_XML_VALUE"]
+    findings = analyzer.run_baseline_checks(routes)
+    assert any(f.check_id == "XML-001" for f in findings)
+
+
+def test_xml_as_second_entry_in_produces_array_is_still_caught(tmp_path):
+    # regression: produces is array-typed -- a naive "first value only"
+    # extraction (fine for a single-valued attribute like a mapping path)
+    # would silently drop an XML format listed after a JSON one.
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @GetMapping(value = \"/items\", produces = {\"application/json\", \"application/xml\"})\n"
+        "    public String items() { return \"\"; }\n"
+        "}\n",
+    )
+    analyzer = SpringAnalyzer(tmp_path)
+    routes = analyzer.find_routes()
+    assert routes[0].xml_media_types == ["application/xml"]
+    findings = analyzer.run_baseline_checks(routes)
+    assert any(f.check_id == "XML-001" for f in findings)
+
+
+def test_json_only_produces_is_not_flagged(tmp_path):
+    _write(
+        tmp_path,
+        "OrderController.java",
+        "package com.example;\n"
+        "import org.springframework.web.bind.annotation.*;\n\n"
+        "@RestController\n"
+        "@RequestMapping(\"/api/orders\")\n"
+        "public class OrderController {\n"
+        "    @GetMapping(value = \"/status\", produces = \"application/json\")\n"
+        "    public String status() { return \"\"; }\n"
+        "}\n",
+    )
+    analyzer = SpringAnalyzer(tmp_path)
+    findings = analyzer.run_baseline_checks(analyzer.find_routes())
+    assert not any(f.check_id == "XML-001" for f in findings)
