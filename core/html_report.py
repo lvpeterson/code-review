@@ -451,15 +451,43 @@ def _render_auth_tab(results: list[ScanResult], target_path: Path) -> str:
     </section>"""
 
 
+def _render_findings_tab(results: list[ScanResult], target_path: Path) -> str:
+    """Every other project-wide finding (route=None, not AUTH-*) gathered
+    in one place -- dangerous-sink checks (SQLI/CMD/PATH/SSRF/DESER), AOP
+    proxy-bypass, and general config findings (debug mode, CORS) all live
+    here, since none of them attach to a single route the way IDOR/VALID
+    findings do, and none of them are specifically about authentication
+    the way the Auth tab's own project-wide section is.
+    """
+    all_findings = [f for r in results for f in r.findings]
+    findings = sorted(
+        (f for f in all_findings if f.route is None and not _is_auth_finding(f)),
+        key=lambda f: _SEVERITY_RANK.get(f.severity, 9),
+    )
+    findings_html = "".join(_render_standalone_finding(f, target_path) for f in findings)
+
+    return f"""
+    <section class="auth-section">
+      <h2 class="section-title">Findings<span class="count">{len(findings)} finding{"s" if len(findings) != 1 else ""}</span></h2>
+      {findings_html or '<p class="no-findings">No project-wide findings outside routes/authentication.</p>'}
+    </section>"""
+
+
 def render_html(results: list[ScanResult], target_path: Path) -> str:
     all_findings = [f for r in results for f in r.findings]
     all_routes = [rt for r in results for rt in r.routes]
-    # Scoped to non-auth findings -- the sidebar's severity filter/stat
-    # block belongs to the Routes tab, which no longer shows AUTH-* at all.
-    routes_tab_findings = [f for f in all_findings if not _is_auth_finding(f)]
+    # Scoped to findings that actually attach to a route card -- the
+    # sidebar's severity filter/stat block belongs to the Routes tab, which
+    # no longer shows AUTH-* at all, and route=None findings (dangerous
+    # sinks, config checks) don't render as a tag on any card either, so
+    # counting them here would make the sidebar disagree with what's
+    # actually visible on the cards.
+    routes_tab_findings = [f for f in all_findings if f.route is not None and not _is_auth_finding(f)]
     severity_counts = {sev: sum(1 for f in routes_tab_findings if f.severity == sev) for sev in _SEVERITY_RANK}
     auth_findings = [f for f in all_findings if _is_auth_finding(f)]
     auth_attention_count = sum(1 for f in auth_findings if f.severity in ("high", "medium"))
+    general_findings = [f for f in all_findings if f.route is None and not _is_auth_finding(f)]
+    general_attention_count = sum(1 for f in general_findings if f.severity in ("high", "medium"))
     languages = sorted({r.language for r in results})
     methods_present = sorted(
         {m for r in all_routes for m in r.methods},
@@ -483,6 +511,7 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
     route_ids = itertools.count(1)
     groups_html = "".join(_render_group(r, target_path, route_ids) for r in results) or '<p class="no-findings">No supported language/framework detected in target.</p>'
     auth_tab_html = _render_auth_tab(results, target_path)
+    findings_tab_html = _render_findings_tab(results, target_path)
 
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
     # Namespaces this report's "reviewed" checklist in localStorage so two
@@ -533,9 +562,12 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
     <button class="tab-button" id="tab-btn-auth" data-tab="auth" type="button" title="{auth_attention_count} needing attention (high/medium) of {len(auth_findings)} total auth finding{"s" if len(auth_findings) != 1 else ""}">
       Authentication <span class="tab-count{" tab-count-warn" if auth_attention_count else ""}">{auth_attention_count}</span>
     </button>
+    <button class="tab-button" id="tab-btn-findings" data-tab="findings" type="button" title="{general_attention_count} needing attention (high/medium) of {len(general_findings)} total finding{"s" if len(general_findings) != 1 else ""}">
+      Findings <span class="tab-count{" tab-count-warn" if general_attention_count else ""}">{general_attention_count}</span>
+    </button>
   </nav>
 
-  <div class="tab-panel" id="tab-panel-routes">
+  <div class="tab-panel" id="tab-panel-routes" data-tab="routes">
     <div class="layout">
       <aside class="sidebar">
         <div class="stat-block">
@@ -569,9 +601,15 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
     </div>
   </div>
 
-  <div class="tab-panel" id="tab-panel-auth" hidden>
+  <div class="tab-panel" id="tab-panel-auth" data-tab="auth" hidden>
     <main class="content auth-content">
       {auth_tab_html}
+    </main>
+  </div>
+
+  <div class="tab-panel" id="tab-panel-findings" data-tab="findings" hidden>
+    <main class="content auth-content">
+      {findings_tab_html}
     </main>
   </div>
 </div>
@@ -1010,11 +1048,11 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 _JS = """
 // --- Tabs ---
 const tabButtons = document.querySelectorAll('.tab-button');
+const tabPanels = document.querySelectorAll('.tab-panel');
 tabButtons.forEach(btn => {
   btn.addEventListener('click', () => {
     tabButtons.forEach(b => b.classList.toggle('active', b === btn));
-    document.getElementById('tab-panel-routes').hidden = btn.dataset.tab !== 'routes';
-    document.getElementById('tab-panel-auth').hidden = btn.dataset.tab !== 'auth';
+    tabPanels.forEach(panel => { panel.hidden = panel.dataset.tab !== btn.dataset.tab; });
   });
 });
 

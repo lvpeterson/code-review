@@ -167,6 +167,27 @@ def actuator_not_covered_finding(file: str, line: int, verdict: str, base_path: 
     )
 
 
+def insecure_cookie_finding(file: str, line: int, api: str, missing: list[str]) -> Finding:
+    missing_flags = " and ".join(missing)
+    return Finding(
+        check_id="AUTH-006",
+        severity="medium",
+        title=f"{api} missing {missing_flags} ({', '.join(missing)})",
+        description=(
+            f"{api} was created, but this method's body doesn't appear to set "
+            f"{missing_flags}. Without `Secure`, the cookie can be sent over plain HTTP, "
+            "exposing it to network interception. Without `HttpOnly`, client-side "
+            "JavaScript can read it, which turns any XSS on this origin into session "
+            "theft. This is a method-body-scoped text scan, not real data-flow tracing -- "
+            "it can miss a flag set via a helper method or a shared cookie-builder "
+            "utility elsewhere; verify before treating this as certain."
+        ),
+        file=file,
+        line=line,
+        route=None,
+    )
+
+
 def apply_matcher_verdict(finding: Finding, verdict: str) -> None:
     """Fold a resolved SecurityFilterChain matcher verdict into an existing
     AUTH-001 finding for one route -- downgrading its severity/wording once

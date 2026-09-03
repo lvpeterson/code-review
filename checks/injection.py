@@ -68,3 +68,22 @@ def ssrf_sink_finding(file: str, line: int, api: str) -> Finding:
         line=line,
         route=None,
     )
+
+
+def open_redirect_sink_finding(file: str, line: int, api: str) -> Finding:
+    return Finding(
+        check_id="REDIRECT-001",
+        severity="low",
+        title=f"Redirect target built from a non-literal value ({api})",
+        description=(
+            f"{api} was called with a non-literal redirect target. If that value comes "
+            "from request input, an attacker can craft a link to this site that silently "
+            "redirects victims to an attacker-controlled destination (open redirect) -- "
+            "commonly used to make a phishing link look like it starts from a trusted "
+            "domain. Validate the target against an allowlist of known-safe paths/hosts "
+            "before redirecting, rather than passing request input straight through."
+        ),
+        file=file,
+        line=line,
+        route=None,
+    )

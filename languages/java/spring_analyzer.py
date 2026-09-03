@@ -12,12 +12,14 @@ import re
 
 import javalang
 
+from checks import aop as aop_checks
 from checks import auth as auth_checks
 from checks import binding as binding_checks
 from checks import config as config_checks
 from checks import deserialization as deser_checks
 from checks import idor as idor_checks
 from checks import injection as injection_checks
+from checks import sqli as sqli_checks
 from checks import validation as validation_checks
 from checks import xml as xml_checks
 from core.base import BaseFrameworkAnalyzer
@@ -593,6 +595,146 @@ def _entity_class_names(target_path) -> set[str]:
     return names
 
 
+_SQL_EXECUTION_METHODS = {
+    "createQuery", "createNativeQuery",  # EntityManager (JPQL/native)
+    "queryForObject", "queryForList", "queryForMap", "queryForRowSet", "batchUpdate",  # JdbcTemplate
+    "executeQuery", "executeUpdate",  # java.sql.Statement
+    "prepareStatement",  # java.sql.Connection -- concatenating here defeats its own purpose
+}
+# Deliberately excludes bare "execute"/"update"/"query" -- those collide
+# with far too many unrelated method names on arbitrary classes to check
+# without receiver-type resolution, which this AST-only tool doesn't have.
+
+
+def _detect_sql_concatenation(target_path) -> list[Finding]:
+    findings: list[Finding] = []
+    for java_file in iter_files(target_path, (".java",)):
+        text = read_text_safe(java_file)
+        try:
+            tree = javalang.parse.parse(text)
+        except Exception:
+            continue
+        relative_file = str(java_file.relative_to(target_path))
+
+        for _, node in tree.filter(javalang.tree.MethodInvocation):
+            if node.member not in _SQL_EXECUTION_METHODS or not node.position or not node.arguments:
+                continue
+            query_arg = node.arguments[0]
+            if isinstance(query_arg, javalang.tree.BinaryOperation) and query_arg.operator == "+":
+                findings.append(
+                    sqli_checks.sql_concatenation_finding(relative_file, node.position.line, f"{node.member}(...)")
+                )
+    return findings
+
+
+_PROXIED_ANNOTATIONS = KNOWN_AUTH_INDICATORS | {"Transactional"}
+
+
+def _detect_self_invocation_bypass(target_path) -> list[Finding]:
+    """Same-class calls to a @PreAuthorize/@Secured/@Transactional-etc
+    method that bypass Spring's AOP proxy -- see checks/aop.py for the
+    mechanism. `qualifier` shows up as either `""` (a bare call) or `None`
+    (a `this.`-qualified call) for a same-class invocation in javalang's
+    grammar; both are checked.
+    """
+    findings: list[Finding] = []
+    for java_file in iter_files(target_path, (".java",)):
+        text = read_text_safe(java_file)
+        try:
+            tree = javalang.parse.parse(text)
+        except Exception:
+            continue
+        relative_file = str(java_file.relative_to(target_path))
+
+        for _, class_node in tree.filter(javalang.tree.ClassDeclaration):
+            protected_methods: dict[str, list[str]] = {}
+            for member in class_node.body:
+                if not isinstance(member, javalang.tree.MethodDeclaration):
+                    continue
+                proxied = sorted({a.name for a in member.annotations} & _PROXIED_ANNOTATIONS)
+                if proxied:
+                    protected_methods[member.name] = proxied
+            if not protected_methods:
+                continue
+
+            for member in class_node.body:
+                if not isinstance(member, javalang.tree.MethodDeclaration):
+                    continue
+                for _, call in member.filter(javalang.tree.MethodInvocation):
+                    if call.member not in protected_methods or call.qualifier not in (None, "", "this") or not call.position:
+                        continue
+                    annotations = protected_methods[call.member]
+                    severity = "high" if KNOWN_AUTH_INDICATORS & set(annotations) else "medium"
+                    findings.append(
+                        aop_checks.self_invocation_bypass_finding(
+                            relative_file, call.position.line, severity, call.member, annotations
+                        )
+                    )
+    return findings
+
+
+_COOKIE_CREATION_RE = re.compile(r"new\s+Cookie\s*\(|ResponseCookie\.from\s*\(")
+_COOKIE_SECURE_RE = re.compile(r"\.setSecure\s*\(\s*true\s*\)|\.secure\s*\(\s*true\s*\)")
+_COOKIE_HTTPONLY_RE = re.compile(r"\.setHttpOnly\s*\(\s*true\s*\)|\.httpOnly\s*\(\s*true\s*\)")
+
+
+def _detect_insecure_cookies(target_path) -> list[Finding]:
+    """Flags a Cookie/ResponseCookie creation whose *enclosing method body*
+    doesn't also set the Secure/HttpOnly flags. Method-body-scoped rather
+    than a real per-variable trace (no dataflow tracking here) -- a flag
+    set via a shared helper/builder utility elsewhere would be missed.
+    """
+    findings: list[Finding] = []
+    for java_file in iter_files(target_path, (".java",)):
+        text = read_text_safe(java_file)
+        try:
+            tree = javalang.parse.parse(text)
+        except Exception:
+            tree = None
+        relative_file = str(java_file.relative_to(target_path))
+
+        for match in _COOKIE_CREATION_RE.finditer(text):
+            line = _line_of(text, match.start())
+            context = (_enclosing_method_body(tree, text, line) if tree else None) or text
+            missing = []
+            if not _COOKIE_SECURE_RE.search(context):
+                missing.append("Secure")
+            if not _COOKIE_HTTPONLY_RE.search(context):
+                missing.append("HttpOnly")
+            if missing:
+                api = "new Cookie(...)" if text[match.start():match.start() + 3] == "new" else "ResponseCookie.from(...)"
+                findings.append(auth_checks.insecure_cookie_finding(relative_file, line, api, missing))
+    return findings
+
+
+def _detect_open_redirect_sinks(target_path) -> list[Finding]:
+    findings: list[Finding] = []
+    for java_file in iter_files(target_path, (".java",)):
+        text = read_text_safe(java_file)
+        try:
+            tree = javalang.parse.parse(text)
+        except Exception:
+            continue
+        relative_file = str(java_file.relative_to(target_path))
+
+        for _, node in tree.filter(javalang.tree.MethodInvocation):
+            if not node.position:
+                continue
+            if node.member == "sendRedirect" and node.arguments and _has_non_literal_argument(node.arguments[:1]):
+                findings.append(injection_checks.open_redirect_sink_finding(relative_file, node.position.line, "sendRedirect(...)"))
+            elif node.member == "header" and len(node.arguments) >= 2:
+                first = node.arguments[0]
+                if (
+                    isinstance(first, javalang.tree.Literal)
+                    and _clean_literal(first.value).lower() == "location"
+                    and _has_non_literal_argument(node.arguments[1:2])
+                ):
+                    findings.append(
+                        injection_checks.open_redirect_sink_finding(relative_file, node.position.line, 'header("Location", ...)')
+                    )
+    return findings
+
+
 _SECURITY_RULE_RE = re.compile(
     r"\.(?:requestMatchers|antMatchers|mvcMatchers)\s*\(\s*(?P<patterns>(?:\"[^\"]*\"\s*,?\s*)+)\)"
     r"\s*\.\s*(?P<rule1>permitAll|authenticated|denyAll|hasRole|hasAnyRole|hasAuthority|hasAnyAuthority)\s*\((?P<args1>[^)]*)\)"
@@ -1007,6 +1149,10 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
         findings += _detect_ssrf_sinks(self.target_path)
         findings += binding_checks.check_mass_assignment(routes, _entity_class_names(self.target_path))
         findings += binding_checks.check_unallowlisted_sort(routes)
+        findings += _detect_sql_concatenation(self.target_path)
+        findings += _detect_self_invocation_bypass(self.target_path)
+        findings += _detect_insecure_cookies(self.target_path)
+        findings += _detect_open_redirect_sinks(self.target_path)
         # TODO: Spring-specific checks -- e.g. JPA repository methods
         # exposed directly (Spring Data REST) without ownership filtering.
         return findings
