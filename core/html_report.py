@@ -535,7 +535,10 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
     # report with no server/re-run needed -- "</script" is escaped since a
     # finding's own text (a route path, a query snippet) could otherwise
     # prematurely close this script tag.
-    sarif_json = json.dumps(build_sarif(results)).replace("</script", "<\\/script")
+    # route_none_only=True: route-tied findings already have a richer
+    # native UI here (route cards) than a flat SARIF list would give --
+    # this is specifically for the findings that don't have one.
+    sarif_json = json.dumps(build_sarif(results, route_none_only=True)).replace("</script", "<\\/script")
 
     return f"""<!doctype html>
 <html lang="en">
@@ -569,7 +572,7 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
       <button id="collapse-all" type="button">Collapse all</button>
       <label class="hide-reviewed-toggle"><input type="checkbox" id="hide-reviewed"> Hide reviewed</label>
       <button id="reset-reviewed" type="button">Reset reviewed</button>
-      <button id="download-sarif" type="button" title="Download all findings as SARIF -- open in VS Code's SARIF Viewer extension, or upload to GitHub Code Scanning, to triage them one by one">Download SARIF</button>
+      <button id="download-sarif" type="button" title="Download the Authentication/Findings tab items as SARIF (route-tied findings already have a fuller view on their route card) -- open in VS Code's SARIF Viewer extension, or upload to GitHub Code Scanning, to triage them one by one">Download SARIF</button>
     </div>
   </header>
 
@@ -1233,8 +1236,30 @@ document.getElementById('reset-reviewed').addEventListener('click', () => {
   if (hideReviewed.checked) applyFilters();
 });
 
-document.getElementById('download-sarif').addEventListener('click', () => {
-  const blob = new Blob([JSON.stringify(SARIF_DATA, null, 2)], { type: 'application/json' });
+document.getElementById('download-sarif').addEventListener('click', async () => {
+  const text = JSON.stringify(SARIF_DATA, null, 2);
+
+  // showSaveFilePicker gives a real native "choose folder + filename"
+  // dialog -- Chrome/Edge only as of writing, not Firefox/Safari, which
+  // fall through to the classic <a download> below (goes straight to the
+  // browser's configured downloads folder, no picker).
+  if (window.showSaveFilePicker) {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: 'appsec-review.sarif',
+        types: [{ description: 'SARIF file', accept: { 'application/json': ['.sarif'] } }],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(text);
+      await writable.close();
+      return;
+    } catch (e) {
+      if (e.name === 'AbortError') return; // user cancelled the picker
+      // any other failure (e.g. a policy blocking the API) -- fall through
+    }
+  }
+
+  const blob = new Blob([text], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;

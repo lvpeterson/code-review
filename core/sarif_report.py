@@ -11,10 +11,18 @@ through a flat list and mark each one off, so rather than reinventing that
 workflow, findings are exported in a shape those tools already know how to
 present that way.
 
-Every finding across the whole scan is included -- route-tied ones (IDOR,
-VALID, MASS, SORT, XML) map onto SARIF just as naturally as the
+By default every finding across the whole scan is included -- route-tied
+ones (IDOR, VALID, MASS, SORT, XML) map onto SARIF just as naturally as the
 project-wide ones, since SARIF's location model is just file+line either
-way and has no separate concept of "route."
+way and has no separate concept of "route." That's the right default for
+`write_sarif`'s CLI/CI use (e.g. a GitHub Code Scanning upload wants every
+finding surfaced as a PR annotation, not a subset). `build_sarif(...,
+route_none_only=True)` narrows to just the findings with no route --
+that's what the HTML report's own "Download SARIF" button uses, since
+route-tied findings already have a much richer native UI there (route
+cards: code snippets, highlighting, IDE links, reviewed checkboxes) --
+including them in a side-by-side SARIF viewer would just be re-triaging
+the same finding twice in two different views.
 
 Findings are grouped by check_id into SARIF "rules" (tool.driver.rules) --
 every SARIF-aware viewer groups/filters by rule automatically, which is
@@ -64,8 +72,10 @@ def _result(finding: Finding) -> dict:
     }
 
 
-def build_sarif(results: list[ScanResult]) -> dict:
+def build_sarif(results: list[ScanResult], route_none_only: bool = False) -> dict:
     all_findings = [f for r in results for f in r.findings]
+    if route_none_only:
+        all_findings = [f for f in all_findings if f.route is None]
 
     rules: dict[str, dict] = {}
     for finding in all_findings:
