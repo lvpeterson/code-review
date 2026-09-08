@@ -16,13 +16,16 @@ ones (IDOR, VALID, MASS, SORT, XML) map onto SARIF just as naturally as the
 project-wide ones, since SARIF's location model is just file+line either
 way and has no separate concept of "route." That's the right default for
 `write_sarif`'s CLI/CI use (e.g. a GitHub Code Scanning upload wants every
-finding surfaced as a PR annotation, not a subset). `build_sarif(...,
-route_none_only=True)` narrows to just the findings with no route --
-that's what the HTML report's own "Download SARIF" button uses, since
-route-tied findings already have a much richer native UI there (route
-cards: code snippets, highlighting, IDE links, reviewed checkboxes) --
-including them in a side-by-side SARIF viewer would just be re-triaging
-the same finding twice in two different views.
+finding surfaced as a PR annotation, not a subset).
+
+`build_sarif(..., route_none_only=True, exclude_auth=True)` is what the
+HTML report's own "Download SARIF" button uses instead, narrowed to
+*exactly* the Findings tab's own contents: route-tied findings already have
+a much richer native UI (route cards: code snippets, highlighting, IDE
+links, reviewed checkboxes), and AUTH-* project-wide findings already have
+their own reviewed checkboxes in the Auth tab's own "Project-wide" section
+-- including either in a side-by-side SARIF viewer would just be
+re-triaging the same finding twice in two different views.
 
 Findings are grouped by check_id into SARIF "rules" (tool.driver.rules) --
 every SARIF-aware viewer groups/filters by rule automatically, which is
@@ -72,10 +75,16 @@ def _result(finding: Finding) -> dict:
     }
 
 
-def build_sarif(results: list[ScanResult], route_none_only: bool = False) -> dict:
+def build_sarif(results: list[ScanResult], route_none_only: bool = False, exclude_auth: bool = False) -> dict:
     all_findings = [f for r in results for f in r.findings]
     if route_none_only:
         all_findings = [f for f in all_findings if f.route is None]
+    if exclude_auth:
+        # AUTH-* project-wide findings live in the Auth tab's own
+        # "Project-wide" section, which already has its own reviewed
+        # checkboxes -- excluded here so the HTML report's download button
+        # matches exactly what's in the Findings tab, not that plus Auth.
+        all_findings = [f for f in all_findings if not f.check_id.startswith("AUTH-")]
 
     rules: dict[str, dict] = {}
     for finding in all_findings:

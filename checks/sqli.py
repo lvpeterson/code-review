@@ -18,6 +18,21 @@ from __future__ import annotations
 
 from core.models import Finding
 
+# The natural way to dismiss this is "I traced every route and none of them
+# reach this" -- true as far as it goes, but a route-only trace misses two
+# real paths in: a non-route entry point (a @Scheduled job, a
+# @KafkaListener/@RabbitListener/@JmsListener, a WebSocket @MessageMapping)
+# that never appears in any route trace at all, and indirect reachability
+# through persisted data (a route writes a value that this code reads back
+# out later, with no direct call chain for a route trace to follow). Neither
+# is something this tool can verify -- both need a human to actually check.
+_TRACE_REMINDER = (
+    " When tracing this by hand, a route-only trace can under-clear it: also check "
+    "whether it's reachable from a non-route entry point (a @Scheduled job, a message "
+    "listener, a WebSocket handler) or indirectly, via data a route wrote earlier "
+    "(a DB field, a cache) that this code reads back out."
+)
+
 
 def sql_concatenation_finding(file: str, line: int, api: str) -> Finding:
     return Finding(
@@ -33,7 +48,7 @@ def sql_concatenation_finding(file: str, line: int, api: str) -> Finding:
             "positional bind parameter and pass the value separately. Note: this only "
             "catches concatenation happening directly in the call's argument -- "
             "concatenation done in an earlier statement and passed in via a variable "
-            "isn't traced."
+            "isn't traced." + _TRACE_REMINDER
         ),
         file=file,
         line=line,

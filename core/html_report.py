@@ -535,10 +535,13 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
     # report with no server/re-run needed -- "</script" is escaped since a
     # finding's own text (a route path, a query snippet) could otherwise
     # prematurely close this script tag.
-    # route_none_only=True: route-tied findings already have a richer
-    # native UI here (route cards) than a flat SARIF list would give --
-    # this is specifically for the findings that don't have one.
-    sarif_json = json.dumps(build_sarif(results, route_none_only=True)).replace("</script", "<\\/script")
+    # route_none_only + exclude_auth: matches exactly the Findings tab's
+    # own contents. Route-tied findings already have a richer native UI
+    # (route cards) and AUTH-* project-wide findings already have their own
+    # reviewed checkboxes in the Auth tab -- neither belongs in this export.
+    sarif_json = json.dumps(
+        build_sarif(results, route_none_only=True, exclude_auth=True)
+    ).replace("</script", "<\\/script")
 
     return f"""<!doctype html>
 <html lang="en">
@@ -572,7 +575,7 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
       <button id="collapse-all" type="button">Collapse all</button>
       <label class="hide-reviewed-toggle"><input type="checkbox" id="hide-reviewed"> Hide reviewed</label>
       <button id="reset-reviewed" type="button">Reset reviewed</button>
-      <button id="download-sarif" type="button" title="Download the Authentication/Findings tab items as SARIF (route-tied findings already have a fuller view on their route card) -- open in VS Code's SARIF Viewer extension, or upload to GitHub Code Scanning, to triage them one by one">Download SARIF</button>
+      <button id="download-sarif" type="button" title="Download the Findings tab items as SARIF (route-tied findings already have a fuller view on their route card, and Authentication tab items already have their own reviewed checkboxes) -- open in VS Code's SARIF Viewer extension, or upload to GitHub Code Scanning, to triage them one by one">Download SARIF</button>
     </div>
   </header>
 

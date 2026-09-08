@@ -12,6 +12,22 @@ from __future__ import annotations
 
 from core.models import Finding
 
+# Appended to every finding below: the natural way to dismiss one of these
+# is "I traced every route and none of them reach this" -- true as far as
+# it goes, but a route-only trace misses two real paths in: a non-route
+# entry point (a @Scheduled job, a @KafkaListener/@RabbitListener/
+# @JmsListener, a WebSocket @MessageMapping) that never appears in any
+# route trace at all, and indirect reachability through persisted data (a
+# route writes a value that *this* code reads back out later, with no
+# direct call chain between them for a route trace to follow). Neither is
+# something this tool can verify -- both need a human to actually check.
+_TRACE_REMINDER = (
+    " When tracing this by hand, a route-only trace can under-clear it: also check "
+    "whether it's reachable from a non-route entry point (a @Scheduled job, a message "
+    "listener, a WebSocket handler) or indirectly, via data a route wrote earlier "
+    "(a DB field, a cache) that this code reads back out."
+)
+
 
 def command_injection_sink_finding(file: str, line: int) -> Finding:
     return Finding(
@@ -23,7 +39,7 @@ def command_injection_sink_finding(file: str, line: int) -> Finding:
             "command (or its arguments) is built from request input, this is command "
             "injection -- trace where the command string/argument list actually comes "
             "from. Presence-only: this doesn't verify user input reaches it, or that "
-            "it's exploitable if it does."
+            "it's exploitable if it does." + _TRACE_REMINDER
         ),
         file=file,
         line=line,
@@ -42,7 +58,7 @@ def path_traversal_sink_finding(file: str, line: int, api: str) -> Finding:
             "traversal or normalizing/allowlisting the resulting path, this can read or "
             "write files outside the intended directory. A non-literal argument might "
             "just be a hardcoded constant, not attacker-controlled -- trace it before "
-            "treating this as a real gap."
+            "treating this as a real gap." + _TRACE_REMINDER
         ),
         file=file,
         line=line,
@@ -62,7 +78,7 @@ def ssrf_sink_finding(file: str, line: int, api: str) -> Finding:
             "arbitrary external hosts (SSRF). Only RestTemplate's own methods and raw "
             "URL/URI construction are detected here -- WebClient's fluent `.uri(...)` "
             "isn't, since that method name is too generic to detect without a lot of "
-            "false positives."
+            "false positives." + _TRACE_REMINDER
         ),
         file=file,
         line=line,
@@ -81,7 +97,7 @@ def open_redirect_sink_finding(file: str, line: int, api: str) -> Finding:
             "redirects victims to an attacker-controlled destination (open redirect) -- "
             "commonly used to make a phishing link look like it starts from a trusted "
             "domain. Validate the target against an allowlist of known-safe paths/hosts "
-            "before redirecting, rather than passing request input straight through."
+            "before redirecting, rather than passing request input straight through." + _TRACE_REMINDER
         ),
         file=file,
         line=line,
