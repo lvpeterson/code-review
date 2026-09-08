@@ -27,6 +27,15 @@ def print_console(results: list[ScanResult]) -> None:
             auth = ",".join(route.auth_decorators) if route.auth_decorators else "-"
             print(f"  [{methods}] {route.path} -> {route.handler_name}  ({route.file}:{route.line})  auth={auth}")
 
+        if result.entry_points:
+            print(f"\nentry points found: {len(result.entry_points)}")
+            for entry_point in result.entry_points:
+                detail = f" ({entry_point.detail})" if entry_point.detail else ""
+                print(
+                    f"  [{entry_point.kind}] {entry_point.handler_name}{detail}"
+                    f"  ({entry_point.file}:{entry_point.line})"
+                )
+
         if result.findings:
             print(f"\nbaseline findings: {len(result.findings)}")
             for finding in sorted(result.findings, key=lambda f: _SEVERITY_ORDER.get(f.severity, 9)):
@@ -65,6 +74,7 @@ def _scan_result_to_dict(result: ScanResult) -> dict:
         "language": result.language,
         "framework": result.framework,
         "routes": [asdict(route) for route in result.routes],
+        "entry_points": [asdict(ep) for ep in result.entry_points],
         "findings": [_finding_to_dict(f) for f in result.findings],
         "notes": result.notes,
         "global_auth_source": list(result.global_auth_source) if result.global_auth_source else None,
