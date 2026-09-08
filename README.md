@@ -67,7 +67,7 @@ Security-tab alerts, or open it in VS Code's SARIF Viewer extension.
 ### `--html`: the interactive report
 
 Writes a single self-contained HTML file (no external assets, so it opens
-fine offline), split into three tabs:
+fine offline), split into four tabs:
 
 - **Routes** -- one collapsible card per route, syntax-highlighted.
   Expanding a card shows the full handler source with line numbers, an
@@ -82,6 +82,15 @@ fine offline), split into three tabs:
   `core/html_report.py:_highlight_params()`), not a traced dataflow to any
   sink. Routes are sorted worst-severity-first by default; the sidebar has
   severity/method/language filters plus a text search box.
+- **Entry Points** -- non-HTTP ways external/untrusted data can enter the
+  application: `@Scheduled` jobs, `@KafkaListener`/`@RabbitListener`/
+  `@JmsListener` message handlers, `@EventListener`s, `@MessageMapping`
+  WebSocket destinations. None of these appear in any route, so a
+  route-by-route trace structurally can't reach them -- "I walked every
+  route and none of them call this" says nothing about whether the entry
+  point itself does. Each card is correlated with any dangerous-sink
+  finding (CMD-001/PATH-001/SSRF-001/etc) that falls inside its own method
+  body, the same collapsible-card/reviewed-checkbox UI as Routes.
 - **Authentication** -- every auth-related finding gathered in one place:
   project-wide auth-infrastructure findings (is the enforcement mechanism
   even wired up at all -- see "Auth coverage vs. auth infrastructure"
@@ -91,12 +100,13 @@ fine offline), split into three tabs:
 - **Findings** -- every other project-wide finding that doesn't attach to
   a single route and isn't specifically about authentication (dangerous-
   sink checks, deserialization, AOP bypass, general config findings).
-- **Download SARIF** button (topbar) -- exports just the Authentication +
-  Findings tab items (route-tied findings already have a richer view on
-  their own card, so including them here would just be re-triaging the
-  same thing twice). Uses a native "Save As" picker where the browser
-  supports it (`showSaveFilePicker` -- Chrome/Edge; Firefox/Safari fall
-  back to a normal browser download).
+- **Download SARIF** button (topbar) -- exports just the Findings tab's own
+  contents (route-tied findings already have a richer view on their own
+  card, and `AUTH-*` project-wide findings already have their own reviewed
+  checkboxes in the Authentication tab, so including either here would just
+  be re-triaging the same finding twice in two views). Uses a native
+  "Save As" picker where the browser supports it (`showSaveFilePicker` --
+  Chrome/Edge; Firefox/Safari fall back to a normal browser download).
 
 Every route card and every standalone finding has a checkbox to mark it
 reviewed as you triage -- reviewed items dim and get a strikethrough, "Hide
@@ -112,12 +122,12 @@ somewhere else, or a different browser). "Reset reviewed" clears it.
 main.py                  CLI entry point
 enumerator.py             detects language(s)/framework(s), dispatches to analyzers
 core/
-  models.py                Route / Finding / ScanResult dataclasses
+  models.py                Route / EntryPoint / Finding / ScanResult dataclasses
   base.py                   BaseFrameworkAnalyzer -- every analyzer subclasses this
   registry.py                @register("language", "framework") decorator + lookup
   fsutil.py                   file-walking helpers shared by detectors/analyzers
   report.py                    console + JSON output, --fail-on severity comparison
-  html_report.py                self-contained interactive HTML report (3 tabs)
+  html_report.py                self-contained interactive HTML report (4 tabs)
   sarif_report.py                SARIF 2.1.0 export, shared by --sarif and the HTML report's download button
   paths.py                     path-param extraction + mount-prefix resolution (shared)
   bodyscan.py                  regex scan for request.X/req.X field reads (shared)

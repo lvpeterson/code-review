@@ -24,7 +24,7 @@ from checks import validation as validation_checks
 from checks import xml as xml_checks
 from core.base import BaseFrameworkAnalyzer
 from core.fsutil import iter_files, iter_named_files, read_text_safe
-from core.models import Finding, Route, ScanResult
+from core.models import EntryPoint, Finding, Route, ScanResult
 from core.registry import register
 
 _MAPPING_ANNOTATIONS = {
@@ -595,6 +595,74 @@ def _entity_class_names(target_path) -> set[str]:
     return names
 
 
+# Annotation name -> attribute names to try (in order) for a human-readable
+# "detail" string -- a cron expression, a topic/queue/destination name, etc.
+# First attribute found wins; falls back to the bare positional `value`.
+_ENTRY_POINT_ANNOTATIONS = {
+    "Scheduled": ("cron", "fixedRate", "fixedDelay", "value"),
+    "KafkaListener": ("topics", "topicPattern", "value"),
+    "RabbitListener": ("queues", "value"),
+    "JmsListener": ("destination", "value"),
+    "EventListener": ("value",),
+    "MessageMapping": ("value",),
+}
+
+
+def _entry_point_detail(annotation, member) -> str:
+    values = _annotation_values(annotation)
+    for key in _ENTRY_POINT_ANNOTATIONS.get(annotation.name, ()):
+        if key in values:
+            return f"{key}={values[key]}"
+    if annotation.name == "EventListener" and len(member.parameters) == 1:
+        # @EventListener with no explicit event class listens on whatever
+        # type its single parameter declares -- that's the actual "topic"
+        # for this one, same idea as a Kafka topic name being the detail.
+        type_name = getattr(member.parameters[0].type, "name", None)
+        if type_name:
+            return f"event={type_name}"
+    return ""
+
+
+def _find_entry_points(target_path) -> list[EntryPoint]:
+    """Every method carrying a non-route "something external can trigger
+    this" annotation -- a @Scheduled job, a message-queue listener, an
+    @EventListener, a WebSocket @MessageMapping. None of these are routes
+    (no HTTP path/method), but they're every bit as much an entry point for
+    data to arrive through as a route is, and a route-by-route trace can't
+    reach any of them.
+    """
+    entry_points: list[EntryPoint] = []
+    for java_file in iter_files(target_path, (".java",)):
+        text = read_text_safe(java_file)
+        try:
+            tree = javalang.parse.parse(text)
+        except Exception:
+            continue
+        relative_file = str(java_file.relative_to(target_path))
+
+        for _, member in tree.filter(javalang.tree.MethodDeclaration):
+            matched = next(
+                (a for a in member.annotations if a.name in _ENTRY_POINT_ANNOTATIONS), None
+            )
+            if matched is None or not member.position:
+                continue
+
+            line = member.position.line
+            end_line = _method_end_line(text, line)
+            entry_points.append(
+                EntryPoint(
+                    kind=matched.name,
+                    detail=_entry_point_detail(matched, member),
+                    handler_name=member.name,
+                    file=relative_file,
+                    line=line,
+                    source_start_line=line,
+                    source_end_line=end_line,
+                )
+            )
+    return entry_points
+
+
 _SQL_EXECUTION_METHODS = {
     "createQuery", "createNativeQuery",  # EntityManager (JPQL/native)
     "queryForObject", "queryForList", "queryForMap", "queryForRowSet", "batchUpdate",  # JdbcTemplate
@@ -1159,6 +1227,7 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
 
     def analyze(self) -> ScanResult:
         result = super().analyze()
+        result.entry_points = _find_entry_points(self.target_path)
         detected = _detect_global_security_filter_chain(self.target_path)
         if detected:
             auth_checks.apply_global_auth_note(result, *detected)

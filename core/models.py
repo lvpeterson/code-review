@@ -130,6 +130,31 @@ class Route:
 
 
 @dataclass
+class EntryPoint:
+    """A non-HTTP way external/untrusted data can enter the application --
+    a scheduled job, a message-queue listener, an internal event handler, a
+    WebSocket destination. None of these appear in any route, and a
+    route-by-route trace structurally can't reach them: "I walked every
+    route and none of them call this" says nothing about whether this
+    entry point itself calls it. Kept as its own top-level list (not a
+    kind of Route) since it has no HTTP path/method at all.
+    """
+
+    kind: str  # "Scheduled" | "KafkaListener" | "RabbitListener" | "JmsListener" | "EventListener" | "MessageMapping"
+    detail: str  # e.g. a cron expression, a topic/queue/destination name, an event type -- "" if not resolvable
+    handler_name: str
+    file: str
+    line: int
+
+    # Full source range of the handler, for the HTML report's expandable
+    # code view and for correlating a dangerous-sink finding that falls
+    # textually inside this method (see html_report.py's Entry Points tab).
+    # None when the analyzer couldn't resolve it.
+    source_start_line: Optional[int] = None
+    source_end_line: Optional[int] = None
+
+
+@dataclass
 class Finding:
     """A baseline observation surfaced for manual auditor triage.
 
@@ -156,6 +181,7 @@ class ScanResult:
     routes: list[Route] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    entry_points: list[EntryPoint] = field(default_factory=list)
 
     # Where a detected global auth mechanism (Flask before_request, a Spring
     # SecurityFilterChain bean, etc) actually lives, so the HTML report can

@@ -196,6 +196,49 @@ side for exactly this reason.
   tail of support, `medium`; current-looking = `info` nudge to verify the
   exact minor/patch line and check for known CVEs yourself).
 
+## Entry points (non-route)
+
+Every check above assumes the way to reach a piece of code is through a
+route -- but Spring apps have several other ways external or untrusted
+data gets in that never appear in any route, so a route-by-route trace
+structurally can't reach them: "I walked every route and none of them call
+this" says nothing about whether one of these does. `_find_entry_points()`
+in `spring_analyzer.py` scans every method carrying one of:
+
+- `@Scheduled` -- a cron/fixed-rate/fixed-delay job. The trigger isn't
+  request input at all, but the job often reads from a DB/queue/file that
+  *was* written by request input earlier, with no direct call chain a
+  route-only trace would ever find.
+- `@KafkaListener` / `@RabbitListener` / `@JmsListener` -- a message off a
+  topic/queue, whose payload is exactly as untrusted as an HTTP request
+  body.
+- `@EventListener` -- an in-process application event, which can itself
+  ultimately be triggered by request input published earlier in the same
+  request.
+- `@MessageMapping` -- a WebSocket/STOMP destination, the WebSocket
+  equivalent of a route.
+
+Each detected entry point is resolved to its detail (the cron expression,
+topic/queue/destination name, or event type, best-effort from the
+annotation's own attributes) and its full method source range (via the
+same brace-counting `_method_end_line()` used for route handlers). The
+HTML report's **Entry Points** tab renders one card per entry point,
+correlated with any dangerous-sink finding (`CMD-001`/`PATH-001`/
+`SSRF-001`/etc) whose line falls inside that entry point's own method body
+(`_findings_within_entry_point()` in `core/html_report.py`) -- a same-file,
+line-range check, not a call-graph trace, so a sink reached only via a
+helper method defined elsewhere won't be correlated even though it's still
+genuinely inside that entry point's reach.
+
+This is presence-only, same as everything else here: it finds the
+annotation, not whether the handler is reachable with attacker-controlled
+data, or whether a sink inside it is actually fed by that data. It's also
+not exhaustive of every non-route entry mechanism Spring supports (e.g. a
+custom `TaskExecutor`-submitted `Runnable`, a raw JMS `MessageListener`
+class rather than the `@JmsListener` annotation) -- it covers the
+annotation-based mechanisms, which cover the large majority of real
+codebases.
+
 ## What's not covered at all
 
 Real gaps, not built this session, worth knowing about explicitly rather
@@ -254,3 +297,4 @@ than assuming silence means "clean":
 | `PROXY-001` | Same-class call-site detection | None really -- this one's close to a hard fact once found, just confirm the call site |
 | `CONFIG-002` (CORS) | Wildcard presence | Whether it's actually intended |
 | `CONFIG-003` (version) | Version detection + coarse EOL bucketing | Cross-checking against real CVE databases -- explicitly not what this does |
+| Entry points | Annotation detection + same-file/line-range correlation with sink findings | Reachability with real attacker-controlled data; sinks reached only via a helper method elsewhere (correlation is line-range, not call-graph); mechanisms not covered (custom `TaskExecutor`/raw `MessageListener`) |

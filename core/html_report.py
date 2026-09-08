@@ -20,7 +20,7 @@ from pygments.formatters import HtmlFormatter
 from pygments.lexers import get_lexer_by_name, get_lexer_for_filename
 from pygments.util import ClassNotFound
 
-from core.models import Finding, Route, ScanResult
+from core.models import EntryPoint, Finding, Route, ScanResult
 from core.paths import extract_path_param_names
 from core.sarif_report import build_sarif
 
@@ -161,6 +161,44 @@ def _render_code_block(target_path: Path, route: Route, language: str) -> str:
     # URL-side name shows up only inside an annotation's string literal.
     highlight_names = list(dict.fromkeys(extract_path_param_names(route.path) + route.path_variable_binding_names))
     highlighted = _highlight_params(highlighted, highlight_names)
+
+    return header + note + f'<div class="code-block">{highlighted}</div>'
+
+
+def _render_entry_point_code_block(target_path: Path, entry_point: EntryPoint, language: str) -> str:
+    """Same shape as `_render_code_block`, minus the path-param highlighting
+    -- an entry point has no URL/path params to underline.
+    """
+    source_file = entry_point.file
+    start = entry_point.source_start_line
+    end = entry_point.source_end_line
+    unresolved = start is None or end is None
+
+    if unresolved:
+        start = end = entry_point.line
+
+    numbered_lines, error = _read_lines(target_path, source_file, start, end)
+    ide_link = _vscode_uri(target_path, source_file, entry_point.line)
+
+    header = f"""
+    <div class="code-header">
+      <span class="code-path">{_esc(source_file)}:{entry_point.line}</span>
+      <a class="ide-link" href="{_esc(ide_link)}">open in editor &rarr;</a>
+    </div>"""
+
+    if error:
+        return header + f'<p class="code-error">{_esc(error)}</p>'
+    note = '<p class="code-note">handler body not automatically resolved -- showing the registration line only.</p>' if unresolved else ""
+
+    code_text = "\n".join(text for _, text in numbered_lines)
+    hl_lines = [entry_point.line - start + 1] if start <= entry_point.line <= end else []
+    formatter = HtmlFormatter(
+        style=_PYGMENTS_STYLE,
+        linenos="inline",
+        linenostart=start,
+        hl_lines=hl_lines,
+    )
+    highlighted = pygments_highlight(code_text, _get_lexer(language, source_file), formatter)
 
     return header + note + f'<div class="code-block">{highlighted}</div>'
 
@@ -484,6 +522,108 @@ def _render_findings_tab(results: list[ScanResult], target_path: Path, item_ids:
     </section>"""
 
 
+_ENTRY_POINT_LABELS = {
+    "Scheduled": "SCHEDULED",
+    "KafkaListener": "KAFKA",
+    "RabbitListener": "RABBIT",
+    "JmsListener": "JMS",
+    "EventListener": "EVENT",
+    "MessageMapping": "WEBSOCKET",
+}
+_ENTRY_POINT_TRIGGER_DESCRIPTIONS = {
+    "Scheduled": "Spring's task scheduler on a timer, not an HTTP client",
+    "KafkaListener": "a Kafka message arriving on this topic",
+    "RabbitListener": "a RabbitMQ message arriving on this queue",
+    "JmsListener": "a JMS message arriving on this destination",
+    "EventListener": "an internal application event -- not external input directly, but check what publishes it",
+    "MessageMapping": "a WebSocket/STOMP message from a connected client",
+}
+
+
+def _findings_within_entry_point(entry_point: EntryPoint, findings: list[Finding]) -> list[Finding]:
+    """Project-wide findings (CMD-001/PATH-001/SSRF-001/SQLI-001/etc, all
+    route=None) whose file:line falls inside this entry point's own method
+    body -- the one level of correlation this tool actually does between
+    "here's a dangerous sink" and "here's a place a route trace can't
+    reach." Doesn't follow a call one level further into a helper method;
+    that's real call-graph tracing, out of scope here same as everywhere
+    else in this tool.
+    """
+    if entry_point.source_start_line is None or entry_point.source_end_line is None:
+        return []
+    return [
+        f for f in findings
+        if f.route is None
+        and f.file == entry_point.file
+        and entry_point.source_start_line <= f.line <= entry_point.source_end_line
+    ]
+
+
+def _render_entry_point(
+    entry_point: EntryPoint, findings: list[Finding], target_path: Path, language: str, item_id: str
+) -> str:
+    contained = _findings_within_entry_point(entry_point, findings)
+    worst = _worst_severity(contained)
+    kind_label = _ENTRY_POINT_LABELS.get(entry_point.kind, entry_point.kind.upper())
+    trigger = _ENTRY_POINT_TRIGGER_DESCRIPTIONS.get(entry_point.kind, "something other than an HTTP request")
+
+    finding_tags = "".join(
+        f'<span class="tag sev-{_esc(f.severity)}">{_esc(f.check_id)}</span>' for f in contained
+    )
+    findings_html = (
+        "".join(_render_finding(f) for f in contained)
+        or '<p class="no-findings">No dangerous-sink finding directly inside this method (a sink reached through a helper method it calls wouldn\'t show up here -- see the note below).</p>'
+    )
+    code_html = _render_entry_point_code_block(target_path, entry_point, language)
+    search_blob = _esc(f"{entry_point.kind} {entry_point.detail} {entry_point.handler_name} {entry_point.file}".lower())
+
+    return f"""
+      <details class="entry-point-card sev-{worst}" data-severity="{worst}" data-search="{search_blob}">
+        <summary>
+          <input type="checkbox" class="review-toggle" data-item-id="{_esc(item_id)}" title="Mark reviewed" aria-label="Mark this entry point reviewed">
+          <span class="method m-entrypoint">{_esc(kind_label)}</span>
+          <span class="path">{_esc(entry_point.detail) or _esc(entry_point.handler_name)}</span>
+          <span class="handler">{_esc(entry_point.handler_name)}</span>
+          <span class="tags">{finding_tags}</span>
+        </summary>
+        <div class="route-body">
+          <p class="input-note">not reachable from any route trace -- triggered by {_esc(trigger)}</p>
+          <div class="findings">{findings_html}</div>
+          {code_html}
+        </div>
+      </details>"""
+
+
+def _render_entry_points_tab(results: list[ScanResult], target_path: Path, item_ids: itertools.count) -> str:
+    """The Entry Points tab: every non-route way external data can get into
+    the application (@Scheduled/@KafkaListener/@RabbitListener/@JmsListener/
+    @EventListener/@MessageMapping methods), each correlated with any
+    dangerous-sink finding that falls directly inside its own body. Exists
+    specifically because "I traced every route" is a claim about routes,
+    not about these -- kept as its own tab, right after Routes, so it reads
+    as the other half of "everything with an entry point to trace," not
+    just another flavor of project-wide finding.
+    """
+    all_entry_points = [(r.language, ep) for r in results for ep in r.entry_points]
+    all_findings = [f for r in results for f in r.findings]
+
+    sorted_entry_points = sorted(
+        all_entry_points,
+        key=lambda pair: _ROUTE_SORT_RANK.get(_worst_severity(_findings_within_entry_point(pair[1], all_findings)), 9),
+    )
+    cards_html = "".join(
+        _render_entry_point(ep, all_findings, target_path, language, f"entrypoint-{next(item_ids)}")
+        for language, ep in sorted_entry_points
+    )
+
+    return f"""
+    <section class="auth-section">
+      <h2 class="section-title">Entry points<span class="count">{len(all_entry_points)} found</span><span class="section-reviewed">0 / {len(all_entry_points)} reviewed</span></h2>
+      <p class="group-note">Scheduled jobs, message-queue listeners, event listeners, and WebSocket handlers -- none of these have an HTTP route, so a route-by-route trace can't reach them. Each is correlated below with any dangerous-sink finding that falls directly inside its own method body.</p>
+      {cards_html or '<p class="no-findings">No non-route entry points found.</p>'}
+    </section>"""
+
+
 def render_html(results: list[ScanResult], target_path: Path) -> str:
     all_findings = [f for r in results for f in r.findings]
     all_routes = [rt for r in results for rt in r.routes]
@@ -499,6 +639,11 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
     auth_attention_count = sum(1 for f in auth_findings if f.severity in ("high", "medium"))
     general_findings = [f for f in all_findings if f.route is None and not _is_auth_finding(f)]
     general_attention_count = sum(1 for f in general_findings if f.severity in ("high", "medium"))
+    all_entry_points = [ep for r in results for ep in r.entry_points]
+    entry_point_attention_count = sum(
+        1 for ep in all_entry_points
+        if any(f.severity in ("high", "medium") for f in _findings_within_entry_point(ep, all_findings))
+    )
     languages = sorted({r.language for r in results})
     methods_present = sorted(
         {m for r in all_routes for m in r.methods},
@@ -522,6 +667,7 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
     route_ids = itertools.count(1)
     groups_html = "".join(_render_group(r, target_path, route_ids) for r in results) or '<p class="no-findings">No supported language/framework detected in target.</p>'
     item_ids = itertools.count(1)
+    entry_points_tab_html = _render_entry_points_tab(results, target_path, item_ids)
     auth_tab_html = _render_auth_tab(results, target_path, item_ids)
     findings_tab_html = _render_findings_tab(results, target_path, item_ids)
 
@@ -583,6 +729,9 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
     <button class="tab-button active" id="tab-btn-routes" data-tab="routes" type="button">
       Routes <span class="tab-count">{len(all_routes)}</span>
     </button>
+    <button class="tab-button" id="tab-btn-entrypoints" data-tab="entrypoints" type="button" title="{entry_point_attention_count} needing attention (high/medium) of {len(all_entry_points)} entry point{"s" if len(all_entry_points) != 1 else ""}">
+      Entry Points <span class="tab-count{" tab-count-warn" if entry_point_attention_count else ""}">{entry_point_attention_count}</span>
+    </button>
     <button class="tab-button" id="tab-btn-auth" data-tab="auth" type="button" title="{auth_attention_count} needing attention (high/medium) of {len(auth_findings)} total auth finding{"s" if len(auth_findings) != 1 else ""}">
       Authentication <span class="tab-count{" tab-count-warn" if auth_attention_count else ""}">{auth_attention_count}</span>
     </button>
@@ -623,6 +772,12 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
         {groups_html}
       </main>
     </div>
+  </div>
+
+  <div class="tab-panel" id="tab-panel-entrypoints" data-tab="entrypoints" hidden>
+    <main class="content auth-content">
+      {entry_points_tab_html}
+    </main>
   </div>
 
   <div class="tab-panel" id="tab-panel-auth" data-tab="auth" hidden>
@@ -871,7 +1026,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 }
 .global-auth-note .ide-link { font-family: var(--mono); }
 
-.route-card {
+.route-card, .entry-point-card {
   background: var(--surface);
   border: 1px solid var(--border);
   border-left: 3px solid var(--sev-clean);
@@ -879,16 +1034,17 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   margin-bottom: 8px;
   overflow: hidden;
 }
-.route-card.sev-high { border-left-color: var(--sev-high); }
-.route-card.sev-medium { border-left-color: var(--sev-medium); }
-.route-card.sev-low { border-left-color: var(--sev-low); }
-.route-card.sev-info { border-left-color: var(--sev-info); }
+.route-card.sev-high, .entry-point-card.sev-high { border-left-color: var(--sev-high); }
+.route-card.sev-medium, .entry-point-card.sev-medium { border-left-color: var(--sev-medium); }
+.route-card.sev-low, .entry-point-card.sev-low { border-left-color: var(--sev-low); }
+.route-card.sev-info, .entry-point-card.sev-info { border-left-color: var(--sev-info); }
 
-.route-card.reviewed { opacity: 0.45; }
-.route-card.reviewed:hover { opacity: 0.8; }
-.route-card.reviewed .path, .route-card.reviewed .handler { text-decoration: line-through; }
+.route-card.reviewed, .entry-point-card.reviewed { opacity: 0.45; }
+.route-card.reviewed:hover, .entry-point-card.reviewed:hover { opacity: 0.8; }
+.route-card.reviewed .path, .route-card.reviewed .handler,
+.entry-point-card.reviewed .path, .entry-point-card.reviewed .handler { text-decoration: line-through; }
 
-.route-card summary {
+.route-card summary, .entry-point-card summary {
   display: flex;
   align-items: center;
   gap: 12px;
@@ -898,9 +1054,11 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   font-family: var(--mono);
   font-size: 12.5px;
 }
-.route-card summary::-webkit-details-marker { display: none; }
-.route-card summary:hover { background: var(--surface-raised); }
-.route-card summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.route-card summary::-webkit-details-marker, .entry-point-card summary::-webkit-details-marker { display: none; }
+.route-card summary:hover, .entry-point-card summary:hover { background: var(--surface-raised); }
+.route-card summary:focus-visible, .entry-point-card summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.method.m-entrypoint { color: var(--accent); border-color: var(--accent); }
 
 .review-toggle {
   width: 15px;
@@ -1067,7 +1225,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 @media (max-width: 860px) {
   .layout { flex-direction: column; }
   .sidebar { width: 100%; position: static; border-right: none; border-bottom: 1px solid var(--border); }
-  .route-card summary { flex-wrap: wrap; }
+  .route-card summary, .entry-point-card summary { flex-wrap: wrap; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1192,13 +1350,13 @@ function updateReviewedStat() {
     stat.textContent = routeReviewed + ' / ' + routeToggles.length;
   }
   // Each standalone-finding section (Auth tab's Project-wide, the whole
-  // Findings tab) gets its own "X / Y reviewed" count, scoped to just the
-  // toggles inside that section -- a route's own reviewed state doesn't
-  // belong in either of these counts.
+  // Findings tab, the Entry Points tab) gets its own "X / Y reviewed"
+  // count, scoped to just the toggles inside that section -- a route's own
+  // reviewed state doesn't belong in any of these counts.
   document.querySelectorAll('.auth-section').forEach(section => {
     const span = section.querySelector('.section-reviewed');
     if (!span) return;
-    const toggles = section.querySelectorAll('.finding .review-toggle');
+    const toggles = section.querySelectorAll('.finding .review-toggle, .entry-point-card .review-toggle');
     if (toggles.length === 0) return;
     const done = [...toggles].filter(cb => cb.checked).length;
     span.textContent = done + ' / ' + toggles.length + ' reviewed';
@@ -1209,7 +1367,7 @@ function applyReviewedState() {
   reviewToggles.forEach(cb => {
     const isReviewed = reviewed.has(cb.dataset.itemId);
     cb.checked = isReviewed;
-    const container = cb.closest('.route-card, .finding');
+    const container = cb.closest('.route-card, .entry-point-card, .finding');
     if (container) container.classList.toggle('reviewed', isReviewed);
   });
   updateReviewedStat();
@@ -1224,7 +1382,7 @@ reviewToggles.forEach(cb => {
     e.stopPropagation();
     const id = cb.dataset.itemId;
     if (cb.checked) reviewed.add(id); else reviewed.delete(id);
-    const container = cb.closest('.route-card, .finding');
+    const container = cb.closest('.route-card, .entry-point-card, .finding');
     if (container) container.classList.toggle('reviewed', cb.checked);
     saveReviewed();
     updateReviewedStat();
