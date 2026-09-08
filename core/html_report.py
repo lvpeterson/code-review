@@ -529,6 +529,15 @@ _ENTRY_POINT_LABELS = {
     "JmsListener": "JMS",
     "EventListener": "EVENT",
     "MessageMapping": "WEBSOCKET",
+    "QueryMapping": "GRAPHQL",
+    "MutationMapping": "GRAPHQL",
+    "SubscriptionMapping": "GRAPHQL",
+    "SchemaMapping": "GRAPHQL",
+    "ServiceActivator": "INTEGRATION",
+    "InboundChannelAdapter": "INTEGRATION",
+    "ReadOperation": "ACTUATOR",
+    "WriteOperation": "ACTUATOR",
+    "DeleteOperation": "ACTUATOR",
 }
 _ENTRY_POINT_TRIGGER_DESCRIPTIONS = {
     "Scheduled": "Spring's task scheduler on a timer, not an HTTP client",
@@ -537,6 +546,15 @@ _ENTRY_POINT_TRIGGER_DESCRIPTIONS = {
     "JmsListener": "a JMS message arriving on this destination",
     "EventListener": "an internal application event -- not external input directly, but check what publishes it",
     "MessageMapping": "a WebSocket/STOMP message from a connected client",
+    "QueryMapping": "a GraphQL query naming this field",
+    "MutationMapping": "a GraphQL mutation naming this field",
+    "SubscriptionMapping": "a GraphQL subscription naming this field",
+    "SchemaMapping": "a GraphQL query/mutation resolving this type's field",
+    "ServiceActivator": "a message arriving on this Spring Integration channel",
+    "InboundChannelAdapter": "Spring Integration polling/pushing a message onto this channel",
+    "ReadOperation": "a request to this custom Actuator endpoint",
+    "WriteOperation": "a request to this custom Actuator endpoint",
+    "DeleteOperation": "a request to this custom Actuator endpoint",
 }
 
 

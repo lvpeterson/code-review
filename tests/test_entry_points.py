@@ -53,6 +53,82 @@ def test_kafka_listener_is_detected_with_topic_detail(tmp_path):
     assert entry_point.detail == "topics=orders"
 
 
+def test_graphql_query_mapping_is_detected_with_name_detail(tmp_path):
+    _write(
+        tmp_path,
+        "OrderResolver.java",
+        "package com.example;\n"
+        "import org.springframework.graphql.data.method.annotation.QueryMapping;\n\n"
+        "public class OrderResolver {\n"
+        "    @QueryMapping(name = \"order\")\n"
+        "    public Order order(String id) {\n"
+        "        return lookup(id);\n"
+        "    }\n"
+        "}\n",
+    )
+    result = SpringAnalyzer(tmp_path).analyze()
+    entry_point = next(ep for ep in result.entry_points if ep.kind == "QueryMapping")
+    assert entry_point.handler_name == "order"
+    assert entry_point.detail == "name=order"
+
+
+def test_graphql_schema_mapping_is_detected_with_field_detail(tmp_path):
+    _write(
+        tmp_path,
+        "OrderResolver.java",
+        "package com.example;\n"
+        "import org.springframework.graphql.data.method.annotation.SchemaMapping;\n\n"
+        "public class OrderResolver {\n"
+        "    @SchemaMapping(field = \"items\")\n"
+        "    public java.util.List<Item> items(Order order) {\n"
+        "        return lookupItems(order);\n"
+        "    }\n"
+        "}\n",
+    )
+    result = SpringAnalyzer(tmp_path).analyze()
+    entry_point = next(ep for ep in result.entry_points if ep.kind == "SchemaMapping")
+    assert entry_point.detail == "field=items"
+
+
+def test_spring_integration_service_activator_is_detected_with_channel_detail(tmp_path):
+    _write(
+        tmp_path,
+        "OrderActivator.java",
+        "package com.example;\n"
+        "import org.springframework.integration.annotation.ServiceActivator;\n\n"
+        "public class OrderActivator {\n"
+        "    @ServiceActivator(inputChannel = \"orderChannel\")\n"
+        "    public void handle(String payload) {\n"
+        "        process(payload);\n"
+        "    }\n"
+        "}\n",
+    )
+    result = SpringAnalyzer(tmp_path).analyze()
+    entry_point = next(ep for ep in result.entry_points if ep.kind == "ServiceActivator")
+    assert entry_point.detail == "inputChannel=orderChannel"
+
+
+def test_custom_actuator_read_operation_is_detected_with_no_detail(tmp_path):
+    _write(
+        tmp_path,
+        "CustomEndpoint.java",
+        "package com.example;\n"
+        "import org.springframework.boot.actuate.endpoint.annotation.Endpoint;\n"
+        "import org.springframework.boot.actuate.endpoint.annotation.ReadOperation;\n\n"
+        "@Endpoint(id = \"custom\")\n"
+        "public class CustomEndpoint {\n"
+        "    @ReadOperation\n"
+        "    public String data() {\n"
+        "        return loadData();\n"
+        "    }\n"
+        "}\n",
+    )
+    result = SpringAnalyzer(tmp_path).analyze()
+    entry_point = next(ep for ep in result.entry_points if ep.kind == "ReadOperation")
+    assert entry_point.handler_name == "data"
+    assert entry_point.detail == ""
+
+
 def test_plain_method_is_not_an_entry_point(tmp_path):
     _write(
         tmp_path,

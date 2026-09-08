@@ -605,6 +605,23 @@ _ENTRY_POINT_ANNOTATIONS = {
     "JmsListener": ("destination", "value"),
     "EventListener": ("value",),
     "MessageMapping": ("value",),
+    # Spring for GraphQL: a resolver method is exactly as much an entry
+    # point as a controller method -- it's just addressed by a GraphQL
+    # field name instead of an HTTP path.
+    "QueryMapping": ("name", "value"),
+    "MutationMapping": ("name", "value"),
+    "SubscriptionMapping": ("name", "value"),
+    "SchemaMapping": ("field", "typeName", "value"),
+    # Spring Integration: a message-driven entry point, same shape as
+    # @KafkaListener/@RabbitListener but for an integration channel.
+    "ServiceActivator": ("inputChannel", "value"),
+    "InboundChannelAdapter": ("value", "channel"),
+    # A custom Actuator @Endpoint's own operation methods -- distinct from
+    # AUTH-004/005, which only check whether *built-in* actuator endpoints
+    # are exposed; these are hand-written code that runs on a request.
+    "ReadOperation": (),
+    "WriteOperation": (),
+    "DeleteOperation": (),
 }
 
 
@@ -626,10 +643,14 @@ def _entry_point_detail(annotation, member) -> str:
 def _find_entry_points(target_path) -> list[EntryPoint]:
     """Every method carrying a non-route "something external can trigger
     this" annotation -- a @Scheduled job, a message-queue listener, an
-    @EventListener, a WebSocket @MessageMapping. None of these are routes
-    (no HTTP path/method), but they're every bit as much an entry point for
-    data to arrive through as a route is, and a route-by-route trace can't
-    reach any of them.
+    @EventListener, a WebSocket @MessageMapping, a GraphQL resolver
+    (@QueryMapping/@MutationMapping/@SubscriptionMapping/@SchemaMapping), a
+    Spring Integration endpoint (@ServiceActivator/@InboundChannelAdapter),
+    or a custom Actuator endpoint's own operation
+    (@ReadOperation/@WriteOperation/@DeleteOperation). None of these are
+    routes (no HTTP path/method), but they're every bit as much an entry
+    point for data to arrive through as a route is, and a route-by-route
+    trace can't reach any of them.
     """
     entry_points: list[EntryPoint] = []
     for java_file in iter_files(target_path, (".java",)):

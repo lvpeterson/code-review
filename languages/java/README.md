@@ -217,14 +217,28 @@ in `spring_analyzer.py` scans every method carrying one of:
   request.
 - `@MessageMapping` -- a WebSocket/STOMP destination, the WebSocket
   equivalent of a route.
+- `@QueryMapping` / `@MutationMapping` / `@SubscriptionMapping` /
+  `@SchemaMapping` (Spring for GraphQL) -- a resolver method is exactly as
+  much an entry point as a controller method, just addressed by a GraphQL
+  field name instead of an HTTP path.
+- `@ServiceActivator` / `@InboundChannelAdapter` (Spring Integration) -- a
+  message-driven entry point off an integration channel, same shape as
+  `@KafkaListener`/`@RabbitListener` but for Spring Integration pipelines.
+- `@ReadOperation` / `@WriteOperation` / `@DeleteOperation` on a custom
+  `@Endpoint` -- a hand-written Actuator operation, distinct from
+  `AUTH-004`/`AUTH-005` below (those only check whether *built-in*
+  actuator endpoints are exposed; this is real code that runs on a
+  request).
 
 Each detected entry point is resolved to its detail (the cron expression,
-topic/queue/destination name, or event type, best-effort from the
-annotation's own attributes) and its full method source range (via the
-same brace-counting `_method_end_line()` used for route handlers). The
-HTML report's **Entry Points** tab renders one card per entry point,
-correlated with any dangerous-sink finding (`CMD-001`/`PATH-001`/
-`SSRF-001`/etc) whose line falls inside that entry point's own method body
+topic/queue/destination/GraphQL-field/channel name, best-effort from the
+annotation's own attributes -- empty for the bare `@Read/Write/
+DeleteOperation` annotations, which carry no attributes of their own) and
+its full method source range (via the same brace-counting
+`_method_end_line()` used for route handlers). The HTML report's **Entry
+Points** tab renders one card per entry point, correlated with any
+dangerous-sink finding (`CMD-001`/`PATH-001`/`SSRF-001`/etc) whose line
+falls inside that entry point's own method body
 (`_findings_within_entry_point()` in `core/html_report.py`) -- a same-file,
 line-range check, not a call-graph trace, so a sink reached only via a
 helper method defined elsewhere won't be correlated even though it's still
@@ -233,11 +247,32 @@ genuinely inside that entry point's reach.
 This is presence-only, same as everything else here: it finds the
 annotation, not whether the handler is reachable with attacker-controlled
 data, or whether a sink inside it is actually fed by that data. It's also
-not exhaustive of every non-route entry mechanism Spring supports (e.g. a
-custom `TaskExecutor`-submitted `Runnable`, a raw JMS `MessageListener`
-class rather than the `@JmsListener` annotation) -- it covers the
-annotation-based mechanisms, which cover the large majority of real
-codebases.
+not exhaustive of every non-route entry mechanism Spring supports --
+everything above is annotation-based (a method-level `@grep`, essentially),
+which is cheap to detect and covers the large majority of real codebases,
+but deliberately excludes mechanisms that would need a different kind of
+detection (class-level `implements`/`extends` scanning, or correlating
+against a `application.yml`/`.properties` config file this tool doesn't
+read anywhere). Worth checking by hand:
+
+- **Servlet `Filter`s / `HandlerInterceptor`s** -- run on *every* request
+  before any controller, and often read headers/params directly (custom
+  auth filters, logging filters). Worth a pass regardless of a route's own
+  auth annotations, since a filter runs even for routes with airtight
+  `@PreAuthorize` coverage.
+- **Spring Cloud Stream functional bindings** -- a `Function<Message<T>,
+  ...>`/`Consumer<...>` `@Bean` bound to a broker via config rather than an
+  annotation on the method; the modern alternative to `@KafkaListener` in a
+  lot of shops, and structurally invisible to an annotation-based scan
+  since there's no annotation on the method at all.
+- **Quartz jobs** (`implements org.quartz.Job`) -- the non-`@Scheduled` way
+  to run cron-like jobs.
+- **Raw `WebSocketHandler`** implementations registered via
+  `WebSocketConfigurer` -- the STOMP/`@MessageMapping` path above is
+  covered, a raw handler isn't.
+- Lower-frequency but worth a `grep`: JMX (`@ManagedOperation`), Redis
+  pub/sub (`RedisMessageListenerContainer`), `CommandLineRunner`/
+  `ApplicationRunner` beans, a custom `TaskExecutor`-submitted `Runnable`.
 
 ## What's not covered at all
 
@@ -297,4 +332,4 @@ than assuming silence means "clean":
 | `PROXY-001` | Same-class call-site detection | None really -- this one's close to a hard fact once found, just confirm the call site |
 | `CONFIG-002` (CORS) | Wildcard presence | Whether it's actually intended |
 | `CONFIG-003` (version) | Version detection + coarse EOL bucketing | Cross-checking against real CVE databases -- explicitly not what this does |
-| Entry points | Annotation detection + same-file/line-range correlation with sink findings | Reachability with real attacker-controlled data; sinks reached only via a helper method elsewhere (correlation is line-range, not call-graph); mechanisms not covered (custom `TaskExecutor`/raw `MessageListener`) |
+| Entry points | Annotation detection (Scheduled/Kafka/Rabbit/Jms/Event/MessageMapping/GraphQL/Integration/Actuator) + same-file/line-range correlation with sink findings | Reachability with real attacker-controlled data; sinks reached only via a helper method elsewhere (correlation is line-range, not call-graph); non-annotation mechanisms not covered (Filters/Interceptors, Cloud Stream functional bindings, Quartz `Job`, raw `WebSocketHandler`) |

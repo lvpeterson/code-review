@@ -85,7 +85,8 @@ fine offline), split into four tabs:
 - **Entry Points** -- non-HTTP ways external/untrusted data can enter the
   application: `@Scheduled` jobs, `@KafkaListener`/`@RabbitListener`/
   `@JmsListener` message handlers, `@EventListener`s, `@MessageMapping`
-  WebSocket destinations. None of these appear in any route, so a
+  WebSocket destinations, GraphQL resolvers, Spring Integration endpoints,
+  and custom Actuator operations. None of these appear in any route, so a
   route-by-route trace structurally can't reach them -- "I walked every
   route and none of them call this" says nothing about whether the entry
   point itself does. Each card is correlated with any dangerous-sink

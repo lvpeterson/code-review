@@ -140,7 +140,9 @@ class EntryPoint:
     kind of Route) since it has no HTTP path/method at all.
     """
 
-    kind: str  # "Scheduled" | "KafkaListener" | "RabbitListener" | "JmsListener" | "EventListener" | "MessageMapping"
+    kind: str  # "Scheduled" | "KafkaListener" | "RabbitListener" | "JmsListener" | "EventListener" |
+    # "MessageMapping" | "QueryMapping" | "MutationMapping" | "SubscriptionMapping" | "SchemaMapping" |
+    # "ServiceActivator" | "InboundChannelAdapter" | "ReadOperation" | "WriteOperation" | "DeleteOperation"
     detail: str  # e.g. a cron expression, a topic/queue/destination name, an event type -- "" if not resolvable
     handler_name: str
     file: str
