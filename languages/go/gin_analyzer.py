@@ -19,7 +19,8 @@ from core.bodyscan import extract_request_field_names
 from core.fsutil import iter_files, read_text_safe
 from core.models import Finding, Route
 from core.registry import register
-from languages.go._ts_utils import iter_nodes, node_text, parser, string_value
+from languages.go._ts_utils import bare_name, iter_nodes, node_text, parser, string_value
+from languages.go.dangerous_sinks import detect_dangerous_sinks
 
 _METHOD_NAMES = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
 
@@ -70,7 +71,11 @@ def _build_gin_router_names(target_path: Path) -> set[str]:
 
 
 def _build_function_index(target_path: Path) -> dict[str, tuple[str, int, int, str]]:
-    """function name -> (file, start_line, end_line, body_text)."""
+    """function name -> (file, start_line, end_line, body_text). Indexes
+    both plain `function_declaration`s and receiver `method_declaration`s
+    (`func (s *Server) getOrder(...)`) -- keyed by bare method name,
+    matching `bare_name()`'s handling of a `s.getOrder` call-site reference.
+    """
     index: dict[str, tuple[str, int, int, str]] = {}
     for go_file in iter_files(target_path, (".go",)):
         src = read_text_safe(go_file).encode("utf-8")
@@ -79,7 +84,7 @@ def _build_function_index(target_path: Path) -> dict[str, tuple[str, int, int, s
         tree = parser().parse(src)
         relative_file = str(go_file.relative_to(target_path))
         for node in iter_nodes(tree.root_node):
-            if node.type != "function_declaration":
+            if node.type not in ("function_declaration", "method_declaration"):
                 continue
             name_node = node.child_by_field_name("name")
             if name_node is None:
@@ -96,7 +101,7 @@ def _build_function_index(target_path: Path) -> dict[str, tuple[str, int, int, s
 def _describe_arg(node, src: bytes) -> str:
     if node.type in _INLINE_HANDLER_TYPES:
         return "<inline handler>"
-    return node_text(node, src)
+    return bare_name(node, src)
 
 
 def _extract_gin_call(node, src: bytes, gin_names: set[str]):
@@ -181,6 +186,7 @@ class GinAnalyzer(BaseFrameworkAnalyzer):
         findings: list[Finding] = []
         findings += idor_checks.check_id_param_routes(routes)
         findings += auth_checks.check_missing_auth_indicator(routes, KNOWN_AUTH_INDICATORS)
+        findings += detect_dangerous_sinks(self.target_path)
         # TODO: Gin-specific checks -- e.g. router.Use(cors.Default()) with
         # no origin restriction, .Group() prefix composition (not yet
         # resolved -- routes on a sub-router report their bare sub-path).

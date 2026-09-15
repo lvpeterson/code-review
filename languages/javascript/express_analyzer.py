@@ -30,6 +30,7 @@ from core.fsutil import iter_files, read_text_safe
 from core.models import Finding, Route, ScanResult
 from core.paths import join_path_segments, resolve_mount_prefix
 from core.registry import register
+from languages.javascript.dangerous_sinks import detect_dangerous_sinks
 
 _JS_LANGUAGE = Language(tsjs.language())
 _TS_LANGUAGE = Language(tsts.language_typescript())
@@ -420,6 +421,7 @@ class ExpressAnalyzer(BaseFrameworkAnalyzer):
         findings += idor_checks.check_id_param_routes(routes)
         findings += auth_checks.check_missing_auth_indicator(routes, KNOWN_AUTH_INDICATORS)
         findings += _detect_cors_wildcards(self.target_path)
+        findings += detect_dangerous_sinks(self.target_path)
         # TODO: Express-specific checks -- e.g. missing helmet(),
         # body-parser without size limits.
         return findings

@@ -56,6 +56,43 @@ def test_inline_middleware_arg_captured_as_auth_decorator(tmp_path):
     assert "authMiddleware" in routes[0].auth_decorators
 
 
+def test_receiver_method_handler_is_resolved_to_its_body(tmp_path):
+    _write(
+        tmp_path,
+        "main.go",
+        "package main\n\n"
+        'import "github.com/gin-gonic/gin"\n\n'
+        "type Server struct{}\n\n"
+        "func (s *Server) setup() {\n"
+        "\trouter := gin.Default()\n"
+        '\trouter.GET("/orders/:orderId", s.getOrder)\n'
+        "}\n\n"
+        "func (s *Server) getOrder(c *gin.Context) {\n"
+        '\tid := c.Query("includeArchived")\n'
+        "}\n",
+    )
+    routes = GinAnalyzer(tmp_path).find_routes()
+    assert routes[0].extra_param_names == ["includeArchived"]
+    assert routes[0].source_start_line is not None
+
+
+def test_receiver_qualified_middleware_arg_is_recognized_as_auth(tmp_path):
+    _write(
+        tmp_path,
+        "main.go",
+        "package main\n\n"
+        'import "github.com/gin-gonic/gin"\n\n'
+        "type Server struct{}\n\n"
+        "func (s *Server) setup() {\n"
+        "\trouter := gin.Default()\n"
+        '\trouter.POST("/orders", s.authMiddleware, s.createOrder)\n'
+        "}\n\n"
+        "func (s *Server) createOrder(c *gin.Context) {}\n",
+    )
+    routes = GinAnalyzer(tmp_path).find_routes()
+    assert "authMiddleware" in routes[0].auth_decorators
+
+
 def test_query_param_captured_from_handler_body(tmp_path):
     _write(
         tmp_path,

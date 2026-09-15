@@ -20,6 +20,7 @@ from core.fsutil import iter_files, read_text_safe
 from core.models import Finding, Route
 from core.registry import register
 from languages.go._ts_utils import iter_nodes, node_text, parser, string_value
+from languages.go.dangerous_sinks import detect_dangerous_sinks
 
 _METHOD_NAMES = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
 _METHOD_PATH_PREFIX = re.compile(r"^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(.+)$")
@@ -33,11 +34,21 @@ KNOWN_AUTH_INDICATORS = {
     "requireAuth",
     "AuthRequired",
     "JWTAuth",
+    "requireToken",
+    "RequireToken",
 }
 
 
 def _build_function_index(target_path: Path) -> dict[str, tuple[str, int, int, str]]:
-    """function name -> (file, start_line, end_line, body_text)."""
+    """function name -> (file, start_line, end_line, body_text). Indexes
+    both plain `function_declaration`s and receiver `method_declaration`s
+    (`func (n *Notifier) handleCreateDB(...)`) -- tree-sitter-go gives
+    those two shapes distinct node types, and a method is exactly as
+    common a handler shape in real Go code as a bare function. Keyed by
+    the bare method name only, ignoring the receiver -- the call site
+    (`n.handleCreateDB`) never references the receiver variable's name
+    either, just the method name.
+    """
     index: dict[str, tuple[str, int, int, str]] = {}
     for go_file in iter_files(target_path, (".go",)):
         src = read_text_safe(go_file).encode("utf-8")
@@ -46,7 +57,7 @@ def _build_function_index(target_path: Path) -> dict[str, tuple[str, int, int, s
         tree = parser().parse(src)
         relative_file = str(go_file.relative_to(target_path))
         for node in iter_nodes(tree.root_node):
-            if node.type != "function_declaration":
+            if node.type not in ("function_declaration", "method_declaration"):
                 continue
             name_node = node.child_by_field_name("name")
             if name_node is None:
@@ -60,9 +71,48 @@ def _build_function_index(target_path: Path) -> dict[str, tuple[str, int, int, s
     return index
 
 
-def _extract_handlefunc_call(node, src: bytes) -> tuple[str, str] | None:
-    """Return (raw_path, handler_name) for `X.HandleFunc(path, handler)` or
-    the package-level `http.HandleFunc(path, handler)`.
+def _bare_name(node, src: bytes) -> str:
+    """`handleCreateDB` -> "handleCreateDB"; `n.handleCreateDB` (a
+    selector_expression referencing a receiver method) -> "handleCreateDB",
+    matching how _build_function_index keys receiver methods.
+    """
+    if node.type == "selector_expression":
+        field = node.child_by_field_name("field")
+        if field is not None:
+            return node_text(field, src)
+    return node_text(node, src)
+
+
+def _unwrap_handler_arg(node, src: bytes) -> tuple[str, list[str]]:
+    """See through `wrapper(actualHandler)`-style handler wrapping --
+    `mux.HandleFunc(path, n.requireToken(n.handleCreateDB))` is exactly as
+    common a way to apply auth in net/http as gin's inline middleware-chain
+    args, just shaped as a wrapping call instead of extra call arguments.
+    Recurses so stacked wrapping (`log(requireToken(handler))`) unwraps
+    fully. Returns (real_handler_name, [wrapper_name, ...] outermost-first).
+    """
+    if node.type != "call_expression":
+        return _bare_name(node, src), []
+
+    func = node.child_by_field_name("function")
+    wrapper_name = _bare_name(func, src) if func is not None else "?"
+
+    args_node = node.child_by_field_name("arguments")
+    args = list(args_node.named_children) if args_node else []
+    if not args:
+        return wrapper_name, []
+
+    # The wrapped handler is conventionally the last argument (mirrors why
+    # Express/gin/Hono all treat the last call arg as "the handler" too).
+    inner_name, inner_wrappers = _unwrap_handler_arg(args[-1], src)
+    return inner_name, [wrapper_name] + inner_wrappers
+
+
+def _extract_handlefunc_call(node, src: bytes) -> tuple[str, str, list[str]] | None:
+    """Return (raw_path, handler_name, wrapper_names) for
+    `X.HandleFunc(path, handler)` or the package-level
+    `http.HandleFunc(path, handler)`. `wrapper_names` is empty unless the
+    handler argument is itself a wrapping call (see _unwrap_handler_arg).
     """
     if node.type != "call_expression":
         return None
@@ -82,7 +132,8 @@ def _extract_handlefunc_call(node, src: bytes) -> tuple[str, str] | None:
     raw_path = string_value(args[0], src)
     if raw_path is None:
         return None
-    return raw_path, node_text(args[1], src)
+    handler_name, wrapper_names = _unwrap_handler_arg(args[1], src)
+    return raw_path, handler_name, wrapper_names
 
 
 @register("go", "net_http")
@@ -102,7 +153,7 @@ class NetHTTPAnalyzer(BaseFrameworkAnalyzer):
                 extracted = _extract_handlefunc_call(node, src)
                 if extracted is None:
                     continue
-                raw_path, handler_name = extracted
+                raw_path, handler_name, wrapper_names = extracted
 
                 prefix_match = _METHOD_PATH_PREFIX.match(raw_path)
                 path = prefix_match.group(2) if prefix_match else raw_path
@@ -133,7 +184,7 @@ class NetHTTPAnalyzer(BaseFrameworkAnalyzer):
                         handler_name=handler_name,
                         file=relative_file,
                         line=node.start_point[0] + 1,
-                        auth_decorators=auth_from_body,
+                        auth_decorators=wrapper_names + auth_from_body,
                         raw_snippet=node_text(node, src)[:120],
                         source_file=source_file,
                         source_start_line=source_start,
@@ -148,6 +199,7 @@ class NetHTTPAnalyzer(BaseFrameworkAnalyzer):
         findings: list[Finding] = []
         findings += idor_checks.check_id_param_routes(routes)
         findings += auth_checks.check_missing_auth_indicator(routes, KNOWN_AUTH_INDICATORS)
+        findings += detect_dangerous_sinks(self.target_path)
         # TODO: net/http-specific checks -- e.g. middleware chains built via
         # manual `http.Handler` wrapping aren't traced back to the route the
         # way gin's inline chain args are.

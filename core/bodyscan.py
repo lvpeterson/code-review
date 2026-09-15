@@ -21,6 +21,12 @@ import re
 #          same req.query/req.body shape as Express, already covered above.
 # Go:      net/http `r.URL.Query().Get("x")`; gin `c.Query("x")` (query
 #          string), `c.PostForm("x")` (form body).
+# Hono:    c.req.query('x') (single query value) / c.req.queries('x')
+#          (multi-value query) -- c.req.json()/c.req.parseBody() take no
+#          field-name argument, so an id-like field read off the parsed
+#          body isn't caught here (same class of gap as Express missing
+#          `const body = req.body; body.x`, a destructure this tool
+#          doesn't trace across statements either).
 _ACCESSOR_PATTERN = re.compile(
     r"request\.(?:args|form|json|GET|POST|data)\.get\(\s*['\"](\w+)['\"]"
     r"|request\.(?:args|form|json|GET|POST|data)\[['\"](\w+)['\"]\]"
@@ -29,6 +35,7 @@ _ACCESSOR_PATTERN = re.compile(
     r"|searchParams\.get\(\s*['\"](\w+)['\"]"
     r"|\.URL\.Query\(\)\.Get\(\s*['\"](\w+)['\"]"
     r"|\.(?:Query|PostForm)\(\s*['\"](\w+)['\"]"
+    r"|c\.req\.(?:query|queries)\(\s*['\"](\w+)['\"]"
 )
 
 

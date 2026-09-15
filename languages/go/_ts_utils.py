@@ -30,3 +30,18 @@ def iter_nodes(node: Node):
     yield node
     for child in node.children:
         yield from iter_nodes(child)
+
+
+def bare_name(node: Node, src: bytes) -> str:
+    """`getOrder` -> "getOrder"; `s.getOrder` (a selector_expression
+    referencing a receiver method through its receiver variable, e.g.
+    `s.getOrder` where `getOrder` is `func (s *Server) getOrder(...)`) ->
+    "getOrder" -- the receiver variable name is a per-call-site alias, not
+    part of the method's identity, so it's dropped to match how a
+    project-wide function/method index is keyed (by bare name only).
+    """
+    if node.type == "selector_expression":
+        field = node.child_by_field_name("field")
+        if field is not None:
+            return node_text(field, src)
+    return node_text(node, src)

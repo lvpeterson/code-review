@@ -140,7 +140,7 @@ checks/                    heuristics that build Finding objects from Route data
   validation.py               VALID-001/002 -- Bean Validation wiring (Spring only)
   xml.py                       XML-001 -- XXE-adjacent produces/consumes detection (Spring only)
   deserialization.py            DESER-001 -- unsafe Jackson polymorphic typing (Spring only)
-  injection.py                   CMD-001/PATH-001/SSRF-001/REDIRECT-001 -- dangerous-sink checks (Spring only)
+  injection.py                   CMD-001/PATH-001/SSRF-001/REDIRECT-001 -- dangerous-sink checks (Java, JS/TS, Go)
   binding.py                      MASS-001/SORT-001 -- request-binding shape checks (Spring only)
   sqli.py                          SQLI-001 -- SQL/JPQL built via string concatenation (Spring only)
   aop.py                            PROXY-001 -- AOP proxy self-invocation bypass (Spring only)
@@ -155,7 +155,7 @@ tests/                     pytest suite -- pure-logic unit tests + one integrati
 Currently implemented (route extraction + baseline checks):
 - **python**: flask, fastapi, django
 - **java**: spring
-- **javascript**: express, nextjs
+- **javascript**: express, nextjs, hono
 - **go**: gin, net_http
 - **dotnet**: aspnet
 - **ruby**: rails, sinatra
@@ -265,9 +265,10 @@ you to verify by hand.
   object identifiers, so a naive substring check would drown real findings
   in noise. Also splits on hyphens (`order-id`) and camelCase boundaries,
   not just underscores.
-- Every dangerous-sink-style check across this tool (SQL/command/path/SSRF
-  injection, open redirect -- Spring-only today, see
-  `languages/java/README.md`) is **presence-only**: it flags that a
+- Every dangerous-sink-style check across this tool (command/path/SSRF/
+  open-redirect for Java, JS/TS, and Go -- see `languages/java/README.md`,
+  `languages/javascript/README.md`, `languages/go/README.md`; SQL
+  injection is Spring-only) is **presence-only**: it flags that a
   dangerous API was called with a non-literal (or, for SQL specifically,
   concatenated) argument, not that user input actually reaches it. That
   trace is always manual.
