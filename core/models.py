@@ -172,6 +172,11 @@ class Finding:
     file: str
     line: int
     route: Optional[Route] = None
+    # "REVIEW" when the check itself knows it can't decide on its own and a
+    # human has to verify (e.g. PL/SQL AUTHID DEFINER, a variable EXECUTE
+    # IMMEDIATE argument); None for checks that don't make that distinction.
+    # Rendered as a badge in the HTML report, carried into JSON/SARIF.
+    confidence: Optional[str] = None
 
 
 @dataclass

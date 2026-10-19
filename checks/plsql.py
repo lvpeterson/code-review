@@ -1,35 +1,19 @@
-#!/usr/bin/env python3
-"""
-PL/SQL Secure Code Review Scanner
-Usage: python plsql.py [project_root] [--csv report.csv]
-       Defaults to current directory if no path given.
-       --csv writes findings to a CSV file in addition to terminal output.
-"""
+"""PL/SQL rule engine -- regex rules with comment/string masking, enclosing
+program-unit extraction (BEGIN/END depth counting that skips nested local
+subprograms), and literal-only || chain suppression.
 
-import argparse
-import csv
-import datetime
-import json
+Run by `languages/sql/plsql_analyzer.py`, which converts each PlsqlHit
+into a core.models.Finding. Oracle-specific: the injection rules know EXECUTE
+IMMEDIATE / DBMS_SQL / OPEN ... FOR, not T-SQL's sp_executesql or
+PL/pgSQL's EXECUTE.
+"""
+from __future__ import annotations
+
 import re
-import sys
-import os
-from pathlib import Path
-from dataclasses import dataclass
 from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
 
-for _stream in (sys.stdout, sys.stderr):
-    if hasattr(_stream, "reconfigure"):
-        _stream.reconfigure(encoding="utf-8", errors="replace")
-
-# ── ANSI colors ──────────────────────────────────────────────────────────────
-RED    = "\033[91m"
-YELLOW = "\033[93m"
-CYAN   = "\033[96m"
-BOLD   = "\033[1m"
-DIM    = "\033[2m"
-RESET  = "\033[0m"
-
-# ── Rule definitions ─────────────────────────────────────────────────────────
 @dataclass
 class Rule:
     id: str
@@ -60,20 +44,25 @@ class Rule:
     # text regardless of this flag.
     match_in_strings: bool = False
     # When True: if the ||-joined operand chain (spanning wrapped lines) is built
-    # entirely from string/numeric literals the finding is suppressed — literal-only
+    # entirely from string/numeric literals the finding is suppressed -- literal-only
     # concatenation inside EXECUTE IMMEDIATE is not injectable.
     literal_concat_suppress: bool = False
     # For literal_concat_suppress rules: sub-pattern that locates the point inside
     # the match where the || operand chain actually starts. When None the chain
     # starts at the first single-quote in the match span.
     chain_anchor_pattern: str | None = None
+    # What block_suppress / block_require are checked against:
+    #   "unit"    → the whole enclosing PROCEDURE/FUNCTION/TRIGGER/PACKAGE BODY
+    #   "handler" → only the exception handler starting at the matched line,
+    #               up to the next sibling WHEN ... THEN or the closing END
+    block_scope: str = "unit"
 
 
 # ── User-configurable "this counts as error logging" identifiers ────────────
 # Add any project-specific error-logging procedure/package names here so EXC-2
 # (WHEN OTHERS THEN without RAISE or logging) stops flagging handlers that
 # call an in-house logger it doesn't already recognise. Matched case-
-# insensitively as a whole word/qualified call — a raw name like "msg_log"
+# insensitively as a whole word/qualified call -- a raw name like "msg_log"
 # matches any MSG_LOG.<anything> call; a qualified entry like "etl_log.fail"
 # only matches that specific call. Regex-special characters must be escaped.
 CUSTOM_LOG_CALLS: list[str] = [
@@ -127,13 +116,13 @@ RULES: list[Rule] = [
          + "DBMS_ASSERT.SQL_OBJECT_NAME() or DBMS_ASSERT.ENQUOTE_NAME() to prevent "
          + "identifier injection.",
          block_suppress=r'(?i)\bDBMS_ASSERT\b',
-         block_note="No DBMS_ASSERT call found near this EXECUTE IMMEDIATE — "
+         block_note="No DBMS_ASSERT call found near this EXECUTE IMMEDIATE -- "
                     + "dynamic identifiers appear unvalidated.",
          confidence="REVIEW"),
 
     # ── Exception Handling ─────────────────────────────────────────────────
     Rule("EXC-1", "Exception Handling", "HIGH",
-         "WHEN OTHERS THEN NULL — silently swallows all exceptions",
+         "WHEN OTHERS THEN NULL -- silently swallows all exceptions",
          r'(?i)\bWHEN\s+OTHERS\s+THEN\s+NULL\s*;',
          "Silently discarding all exceptions hides bugs and security events; "
          + "at minimum log the error via DBMS_OUTPUT, an audit table, or "
@@ -150,9 +139,10 @@ RULES: list[Rule] = [
              r'|DBMS_OUTPUT\.PUT_LINE\b'
              rf'|{_EXC2_LOG_CALLS})\b'
          ),
-         block_note="No RAISE or error-logging call found in the handler block — "
+         block_note="No RAISE or error-logging call found in the handler block -- "
                     + "exception may be silently swallowed.",
-         confidence="REVIEW"),
+         confidence="REVIEW",
+         block_scope="handler"),
 
     Rule("EXC-3", "Exception Handling", "MEDIUM",
          "Stored program unit without an EXCEPTION block",
@@ -161,13 +151,13 @@ RULES: list[Rule] = [
          + "an EXCEPTION block so failures are caught, logged, and surfaced rather "
          + "than propagating as raw ORA- errors.",
          block_suppress=r'(?i)\bEXCEPTION\b',
-         block_note="No EXCEPTION block found in this CREATE PROCEDURE/FUNCTION — "
+         block_note="No EXCEPTION block found in this CREATE PROCEDURE/FUNCTION -- "
                     + "unhandled errors will surface as uncontrolled ORA- exceptions.",
          confidence="REVIEW"),
 
     # ── Invoker / Definer Rights ───────────────────────────────────────────
     Rule("AUTHZ-1", "Invoker & Definer Rights", "MEDIUM",
-         "AUTHID DEFINER — unit runs with schema-owner privileges",
+         "AUTHID DEFINER -- unit runs with schema-owner privileges",
          r'(?i)\bAUTHID\s+DEFINER\b',
          "DEFINER rights means the unit executes as the owning schema; if "
          + "user-controlled input influences the code path the caller effectively "
@@ -182,12 +172,12 @@ RULES: list[Rule] = [
          + "(schema-owner) rights by default; document and review whether this "
          + "privilege elevation is intentional for each program unit.",
          block_suppress=r'(?i)\bAUTHID\b',
-         block_note="No AUTHID clause found in the body — "
+         block_note="No AUTHID clause found in the body -- "
                     + "unit defaults to DEFINER (owner) rights.",
          confidence="REVIEW"),
 
     Rule("AUTHZ-3", "Invoker & Definer Rights", "HIGH",
-         "GRANT TO PUBLIC — privilege exposed to every database user",
+         "GRANT TO PUBLIC -- privilege exposed to every database user",
          r'(?i)\bGRANT\b[^;]+\bTO\s+PUBLIC\b',
          "Granting any privilege to PUBLIC exposes it to every current and future "
          + "schema including untrusted application accounts; grant only to specific "
@@ -213,7 +203,7 @@ RULES: list[Rule] = [
          match_in_strings=True),
 
     Rule("CRED-2", "Hardcoded Credentials", "HIGH",
-         "IDENTIFIED BY in DDL — hardcoded password for user/DB link creation",
+         "IDENTIFIED BY in DDL -- hardcoded password for user/DB link creation",
          r'(?i)\bIDENTIFIED\s+BY\s+\S',
          "IDENTIFIED BY stores the password in the DDL statement itself; passwords "
          + "set this way appear in audit trails and can be extracted from SYS.LINK$ "
@@ -232,13 +222,13 @@ RULES: list[Rule] = [
 
     # ── File & Network Access ──────────────────────────────────────────────
     Rule("NET-1", "File & Network Access", "MEDIUM",
-         "UTL_HTTP outbound call — verify ACL restriction and URL source",
+         "UTL_HTTP outbound call -- verify ACL restriction and URL source",
          r'(?i)\bUTL_HTTP\s*\.\s*(?:BEGIN_REQUEST|REQUEST|GET)\s*\(',
          "Outbound HTTP from the database bypasses application-tier controls; "
          + "confirm the target URL comes from a trusted config source (not user "
          + "input) and that an ACL restricts reachable hosts.",
          block_suppress=r'(?i)\bACL\b|DBMS_NETWORK_ACL',
-         block_note="No ACL / DBMS_NETWORK_ACL reference nearby — "
+         block_note="No ACL / DBMS_NETWORK_ACL reference nearby -- "
                     + "confirm the outbound target is allowlisted.",
          confidence="REVIEW"),
 
@@ -251,7 +241,7 @@ RULES: list[Rule] = [
          confidence="REVIEW"),
 
     Rule("NET-3", "File & Network Access", "HIGH",
-         "DBMS_SCHEDULER EXTERNAL job — OS command execution",
+         "DBMS_SCHEDULER EXTERNAL job -- OS command execution",
          r'(?i)\bDBMS_SCHEDULER\s*\.\s*(?:CREATE_JOB|CREATE_PROGRAM)\b[^;]+\bEXTERNAL',
          "DBMS_SCHEDULER EXTERNAL jobs run OS commands as the Oracle OS user; "
          + "confirm the command path and all arguments are static constants, "
@@ -275,7 +265,7 @@ RULES: list[Rule] = [
          + "generated IV stored separately from the ciphertext."),
 
     Rule("CRYPTO-2", "Cryptography", "HIGH",
-         "DBMS_OBFUSCATION_TOOLKIT usage (deprecated — weak DES/MD5)",
+         "DBMS_OBFUSCATION_TOOLKIT usage (deprecated -- weak DES/MD5)",
          r'(?i)\bDBMS_OBFUSCATION_TOOLKIT\b',
          "DBMS_OBFUSCATION_TOOLKIT is deprecated and implements weak DES encryption "
          + "and MD5 hashing; replace with DBMS_CRYPTO using AES-256."),
@@ -297,7 +287,7 @@ RULES: list[Rule] = [
 
     # ── Transaction Control ────────────────────────────────────────────────
     Rule("PRAGMA-1", "Transaction Control", "MEDIUM",
-         "PRAGMA AUTONOMOUS_TRANSACTION — bypasses calling transaction",
+         "PRAGMA AUTONOMOUS_TRANSACTION -- bypasses calling transaction",
          r'(?i)\bPRAGMA\s+AUTONOMOUS_TRANSACTION\b',
          "Autonomous transactions commit independently of the caller's transaction, "
          + "which can cause data inconsistency (partial writes survive rollback) and "
@@ -321,7 +311,7 @@ RULES: list[Rule] = [
          + "user-controlled input."),
 
     Rule("PRIV-3", "Privilege Escalation", "MEDIUM",
-         "DBMS_SESSION.SET_CONTEXT — application context manipulation",
+         "DBMS_SESSION.SET_CONTEXT -- application context manipulation",
          r'(?i)\bDBMS_SESSION\s*\.\s*SET_CONTEXT\s*\(',
          "Application contexts used for row-level security can be abused if the "
          + "context-setter is callable with insufficient privilege; verify the "
@@ -330,7 +320,7 @@ RULES: list[Rule] = [
 
     # ── Public Synonyms ────────────────────────────────────────────────────
     Rule("SYN-1", "Object Exposure", "MEDIUM",
-         "CREATE PUBLIC SYNONYM — object resolvable by every database user",
+         "CREATE PUBLIC SYNONYM -- object resolvable by every database user",
          r'(?i)\bCREATE\s+(?:OR\s+REPLACE\s+)?PUBLIC\s+SYNONYM\b',
          "Public synonyms make the target object resolvable from any schema including "
          + "untrusted application accounts; prefer private synonyms or schema-qualified "
@@ -339,7 +329,7 @@ RULES: list[Rule] = [
 
     # ── Data Exposure ──────────────────────────────────────────────────────
     Rule("DATA-1", "Data Exposure", "LOW",
-         "SELECT * — wildcard column fetch may expose sensitive or future columns",
+         "SELECT * -- wildcard column fetch may expose sensitive or future columns",
          r'(?i)\bSELECT\s+\*\s+FROM\b',
          "SELECT * fetches every column including ones added by future schema changes; "
          + "enumerate only the columns the code actually needs to minimise accidental "
@@ -357,25 +347,34 @@ RULES: list[Rule] = [
          confidence="REVIEW"),
 ]
 
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 IGNORE_DIRS = {
     ".git", ".svn", ".idea", "__pycache__",
     "node_modules", "target", "build", "out", "bin",
 }
 
-SEV_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
-SEV_COLOR = {"HIGH": RED, "MEDIUM": YELLOW, "LOW": CYAN}
+PLSQL_EXTENSIONS = {ext for r in RULES for ext in r.file_exts}
 
-# ── Data model ────────────────────────────────────────────────────────────────
+SEV_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+
 @dataclass
-class Finding:
+class PlsqlHit:
     rule:       Rule
     file:       str
     line_no:    int
     line:       str
-    context:    list[str]
     confidence: str = "CONFIRM"
     block_note: str | None = None
+    # Other rule IDs that fired on this same line and were folded into this
+    # hit by dedup(). Lives on the hit, never on the shared Rule object.
+    also_matched: list[str] = field(default_factory=list)
+
+    @property
+    def title(self) -> str:
+        if not self.also_matched:
+            return self.rule.description
+        return f"{self.rule.description}  [also matched: {', '.join(self.also_matched)}]"
 
 # ── Comment / string masking ──────────────────────────────────────────────────
 def _mask_plsql(lines: list[str], mask_strings: bool) -> list[str]:
@@ -417,7 +416,7 @@ def _mask_plsql(lines: list[str], mask_strings: bool) -> list[str]:
                 if ch == "'":
                     if i + 1 < n and line[i + 1] == "'":
                         result.append('  ' if mask_strings else "''")
-                        i += 2          # '' = escaped quote — stay in string
+                        i += 2          # '' = escaped quote -- stay in string
                     else:
                         result.append(' ' if mask_strings else ch)
                         i += 1
@@ -480,7 +479,7 @@ def _find_matching_end(masked_lines: list[str], start_i: int, limit: int) -> int
 
     A unit's declare section may contain local nested subprograms (e.g. a
     helper logging procedure) each with their own self-contained BEGIN...END.
-    Those are skipped as opaque units — via recursion — so their BEGIN/END
+    Those are skipped as opaque units -- via recursion -- so their BEGIN/END
     aren't mistaken for the enclosing unit's own body boundaries. Without
     this, a nested subprogram's END would prematurely look like the outer
     unit's closing END, truncating the extracted block before it ever
@@ -521,8 +520,8 @@ def _find_matching_end(masked_lines: list[str], start_i: int, limit: int) -> int
 
 
 def extract_plsql_block(
-    masked_lines:  list[str],   # comment+string masked — for depth counting
-    text_lines:    list[str],   # comment-only masked — for suppression patterns
+    masked_lines:  list[str],   # comment+string masked -- for depth counting
+    text_lines:    list[str],   # comment-only masked -- for suppression patterns
     match_line_idx: int,
 ) -> str:
     """
@@ -540,7 +539,7 @@ def extract_plsql_block(
     # Walk backward over candidate headers looking for the one whose own body
     # (per _find_matching_end, which skips nested subprograms as opaque units)
     # actually spans match_line_idx. The nearest preceding header is not
-    # necessarily the right one — it may belong to an earlier sibling helper
+    # necessarily the right one -- it may belong to an earlier sibling helper
     # subprogram declared in the same declare section whose body closes
     # before match_line_idx is ever reached; in that case keep walking
     # backward for the real enclosing unit.
@@ -556,12 +555,60 @@ def extract_plsql_block(
             break
 
     if block_start is None:
-        # No enclosing header found — return a fixed ±60 line window
+        # No enclosing header found -- return a fixed ±60 line window
         return "\n".join(
             text_lines[max(0, match_line_idx - 60):min(total, match_line_idx + 60)]
         )
 
     return "\n".join(text_lines[block_start:block_end + 1])
+
+
+# END LOOP / END CASE / END IF are matched as one token so their trailing
+# keyword isn't also counted as an opener.
+_HANDLER_TOKEN_RE = re.compile(r'(?i)\b(?:END(?:\s+(IF|LOOP|CASE))?|BEGIN|CASE|LOOP|WHEN)\b')
+_HANDLER_START_RE = re.compile(r'(?i)\bWHEN\s+OTHERS\s+THEN\b')
+
+
+def extract_handler_block(
+    masked_lines:   list[str],   # comment+string masked -- for token scanning
+    text_lines:     list[str],   # comment-only masked -- returned text
+    match_line_idx: int,
+    max_lines:      int = 200,
+) -> str:
+    """
+    Text of the single exception handler that starts on match_line_idx:
+    everything after its WHEN ... THEN up to the next sibling WHEN or the
+    END that closes the EXCEPTION section. Nested BEGIN/CASE/LOOP blocks
+    inside the handler are depth-tracked so a CASE's WHEN, an EXIT WHEN, or
+    a nested block's END doesn't end the handler early.
+
+    Scoping EXC-2 to this (instead of the whole enclosing unit) is what stops
+    a RAISE somewhere else in the procedure from hiding a handler that
+    genuinely swallows the exception.
+    """
+    end_idx = min(len(masked_lines), match_line_idx + max_lines)
+    joined_masked = "\n".join(masked_lines[match_line_idx:end_idx])
+    joined_text   = "\n".join(text_lines[match_line_idx:end_idx])
+
+    start = _HANDLER_START_RE.search(joined_masked)
+    pos = start.end() if start else 0
+
+    depth = 0
+    for tok in _HANDLER_TOKEN_RE.finditer(joined_masked, pos):
+        word = tok.group().split()[0].upper()
+        suffix = (tok.group(1) or "").upper()
+        if word in ("BEGIN", "CASE", "LOOP"):
+            depth += 1
+        elif word == "END":
+            if suffix == "IF":
+                continue
+            if depth == 0:
+                return joined_text[pos:tok.start()]
+            depth -= 1
+        elif word == "WHEN" and depth == 0:
+            return joined_text[pos:tok.start()]
+
+    return joined_text[pos:]
 
 
 # ── Block check ───────────────────────────────────────────────────────────────
@@ -578,7 +625,10 @@ def apply_block_check(
     if rule.block_suppress is None and rule.block_require is None:
         return True, None
 
-    block = extract_plsql_block(masked_lines, text_lines, match_line_idx)
+    if rule.block_scope == "handler":
+        block = extract_handler_block(masked_lines, text_lines, match_line_idx)
+    else:
+        block = extract_plsql_block(masked_lines, text_lines, match_line_idx)
 
     if rule.block_require and not re.search(rule.block_require, block):
         return False, None   # required pattern absent → suppress
@@ -595,10 +645,10 @@ def plsql_chain_contains_variable(text: str, start_idx: int, max_scan: int = 400
     Walk a PL/SQL ||-joined operand chain starting at start_idx.
 
     Returns True  the moment a non-literal operand is found (variable,
-                  function call, etc.) — the chain is potentially injectable.
+                  function call, etc.) -- the chain is potentially injectable.
     Returns True  on anything inconclusive (unterminated literal, hit max_scan).
     Returns False only when the chain cleanly ends having seen nothing but
-                  string and/or numeric literals — literal-only concat is safe.
+                  string and/or numeric literals -- literal-only concat is safe.
 
     PL/SQL strings use single quotes; '' is the in-string escaped quote.
     """
@@ -619,13 +669,13 @@ def plsql_chain_contains_variable(text: str, start_idx: int, max_scan: int = 400
                 if text[i] == "'":
                     i += 1
                     if i < n and text[i] == "'":
-                        i += 1   # '' escape — stay in string
+                        i += 1   # '' escape -- stay in string
                         continue
                     closed = True
                     break
                 i += 1
             if not closed:
-                return True   # ran off end of text mid-literal — inconclusive
+                return True   # ran off end of text mid-literal -- inconclusive
 
         elif ch.isdigit():
             # Numeric literal (integer or simple float)
@@ -633,7 +683,7 @@ def plsql_chain_contains_variable(text: str, start_idx: int, max_scan: int = 400
                 i += 1
 
         else:
-            return True   # non-literal operand — variable or expression
+            return True   # non-literal operand -- variable or expression
 
         # Skip whitespace after operand
         while i < n and text[i] in ' \t\r\n':
@@ -648,7 +698,7 @@ def plsql_chain_contains_variable(text: str, start_idx: int, max_scan: int = 400
 
         return False   # chain ended cleanly with literal(s) only
 
-    return True   # hit max_scan — inconclusive
+    return True   # hit max_scan -- inconclusive
 
 
 def find_chain_start_col(rule: Rule, match: re.Match) -> int:
@@ -669,12 +719,15 @@ def find_chain_start_col(rule: Rule, match: re.Match) -> int:
 
 
 # ── Deduplication ─────────────────────────────────────────────────────────────
-def dedup(findings: list[Finding]) -> list[Finding]:
+def dedup(findings: list[PlsqlHit]) -> list[PlsqlHit]:
     """
     When multiple rules fire on the exact same (file, line), keep only the
-    highest-severity one and fold the extra rule IDs into its description.
+    highest-severity one and record the extra rule IDs on that hit's
+    also_matched (shown via PlsqlHit.title). Never mutates the shared Rule --
+    appending to rule.description here used to leak "[also matched: ...]"
+    into every later hit of that rule and into the SARIF rule descriptors.
     """
-    grouped: dict[tuple, list[Finding]] = defaultdict(list)
+    grouped: dict[tuple, list[PlsqlHit]] = defaultdict(list)
     for f in findings:
         grouped[(f.file, f.line_no)].append(f)
 
@@ -682,19 +735,14 @@ def dedup(findings: list[Finding]) -> list[Finding]:
     for _, group in grouped.items():
         group.sort(key=lambda f: SEV_ORDER[f.rule.severity])
         primary = group[0]
-        if len(group) > 1:
-            extra_ids = ", ".join(g.rule.id for g in group[1:])
-            primary.rule.description += f"  [also matched: {extra_ids}]"
+        primary.also_matched = [g.rule.id for g in group[1:]]
         result.append(primary)
     return result
 
 
 # ── Scanner ───────────────────────────────────────────────────────────────────
-CONTEXT_LINES = 2
-
-
-def scan_file(path: Path, rules: list[Rule]) -> list[Finding]:
-    findings: list[Finding] = []
+def scan_file(path: Path, rules: list[Rule]) -> list[PlsqlHit]:
+    findings: list[PlsqlHit] = []
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except Exception:
@@ -725,11 +773,11 @@ def scan_file(path: Path, rules: list[Rule]) -> list[Finding]:
 
         for i, raw_line in enumerate(lines, 1):
             # Which masked view to trigger against:
-            #   comment_masked (strings visible) — when the rule needs to see
+            #   comment_masked (strings visible) -- when the rule needs to see
             #     string literal content (CRED-1 etc.) OR when it has
             #     literal_concat_suppress (chain anchor must land on the first
             #     quote, not on blanked-out space where the string was).
-            #   fully_masked (strings blanked) — for all other rules, so that
+            #   fully_masked (strings blanked) -- for all other rules, so that
             #     keywords that happen to appear inside a string literal (e.g.
             #     'EXECUTE IMMEDIATE...' in a log message) can't false-positive.
             use_cm = rule.match_in_strings or rule.literal_concat_suppress
@@ -758,18 +806,11 @@ def scan_file(path: Path, rules: list[Rule]) -> list[Finding]:
             if not keep:
                 continue
 
-            start = max(0, i - 1 - CONTEXT_LINES)
-            end   = min(len(lines), i - 1 + CONTEXT_LINES + 1)
-            ctx   = [
-                f"{'>' if idx == i - 1 else ' '} {idx + 1:4d} │ {lines[idx].rstrip()}"
-                for idx in range(start, end)
-            ]
-            findings.append(Finding(
+            findings.append(PlsqlHit(
                 rule=rule,
                 file=str(path),
                 line_no=i,
                 line=raw_line.rstrip(),
-                context=ctx,
                 confidence=rule.confidence,
                 block_note=block_note,
             ))
@@ -777,324 +818,21 @@ def scan_file(path: Path, rules: list[Rule]) -> list[Finding]:
     return findings
 
 
-def scan_project(root: Path) -> list[Finding]:
-    all_findings: list[Finding] = []
-    extensions = {ext for r in RULES for ext in r.file_exts}
-
+def iter_plsql_files(root: Path):
+    """Yield PL/SQL source files under root. Extension match is case-
+    insensitive (.SQL/.PKB are common on Oracle shops), and IGNORE_DIRS is
+    checked against the path *relative to root* so a target that itself
+    lives under e.g. a "build" folder isn't skipped wholesale."""
     for path in root.rglob("*"):
-        if any(part in IGNORE_DIRS for part in path.parts):
+        if any(part in IGNORE_DIRS for part in path.relative_to(root).parts):
             continue
-        if path.suffix.lower() in extensions and path.is_file():
-            all_findings.extend(scan_file(path, RULES))
+        if path.suffix.lower() in PLSQL_EXTENSIONS and path.is_file():
+            yield path
 
+
+def scan_project(root: Path) -> list[PlsqlHit]:
+    all_findings: list[PlsqlHit] = []
+    for path in iter_plsql_files(root):
+        all_findings.extend(scan_file(path, RULES))
     return dedup(all_findings)
 
-
-# ── Reporting ─────────────────────────────────────────────────────────────────
-def print_report(findings: list[Finding], root: Path):
-    findings.sort(key=lambda f: (
-        SEV_ORDER[f.rule.severity], f.rule.category, f.file, f.line_no
-    ))
-
-    by_category: dict[str, list[Finding]] = defaultdict(list)
-    for f in findings:
-        by_category[f.rule.category].append(f)
-
-    total  = len(findings)
-    counts = {s: sum(1 for f in findings if f.rule.severity == s)
-              for s in ("HIGH", "MEDIUM", "LOW")}
-
-    print(f"\n{BOLD}{'═'*70}{RESET}")
-    print(f"{BOLD}  PL/SQL Security Audit — {root}{RESET}")
-    print(f"{BOLD}{'═'*70}{RESET}")
-    print(f"  {RED}HIGH: {counts['HIGH']}{RESET}  "
-          f"{YELLOW}MEDIUM: {counts['MEDIUM']}{RESET}  "
-          f"{CYAN}LOW: {counts['LOW']}{RESET}  "
-          f"│  Total findings: {total}")
-    print()
-
-    if total == 0:
-        print(f"  {BOLD}✓ No findings.{RESET}\n")
-    else:
-        for category, cat_findings in by_category.items():
-            print(f"{BOLD}── {category} {'─'*(60-len(category))}{RESET}")
-            for f in cat_findings:
-                col   = SEV_COLOR[f.rule.severity]
-                rel   = os.path.relpath(f.file, root)
-                badge = f" {DIM}[REVIEW]{RESET}" if f.confidence == "REVIEW" else ""
-                print(f"\n  {col}{BOLD}[{f.rule.severity}] {f.rule.id}{RESET}{badge}"
-                      f"  {f.rule.description}")
-                print(f"  {DIM}{rel}:{f.line_no}{RESET}")
-                for ctx_line in f.context:
-                    print(f"  {DIM}{ctx_line}{RESET}")
-                if f.block_note:
-                    print(f"  {YELLOW}⚠  {f.block_note}{RESET}")
-                elif f.rule.note:
-                    print(f"  {CYAN}ℹ  {f.rule.note}{RESET}")
-            print()
-
-    if findings:
-        file_counts: dict[str, dict] = defaultdict(
-            lambda: {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
-        )
-        for f in findings:
-            rel = os.path.relpath(f.file, root)
-            file_counts[rel][f.rule.severity] += 1
-
-        ranked = sorted(file_counts.items(), key=lambda x: (
-            -x[1]["HIGH"], -x[1]["MEDIUM"], -x[1]["LOW"]
-        ))[:10]
-
-        print(f"{BOLD}── Top files by finding count {'─'*39}{RESET}")
-        for rel, cnts in ranked:
-            h = f"{RED}{cnts['HIGH']}H{RESET}"     if cnts["HIGH"]   else f"{DIM}0H{RESET}"
-            m = f"{YELLOW}{cnts['MEDIUM']}M{RESET}" if cnts["MEDIUM"] else f"{DIM}0M{RESET}"
-            l = f"{CYAN}{cnts['LOW']}L{RESET}"     if cnts["LOW"]    else f"{DIM}0L{RESET}"
-            print(f"  {h}  {m}  {l}  {DIM}{rel}{RESET}")
-        print()
-
-    print(f"{BOLD}{'═'*70}{RESET}\n")
-
-
-def write_csv(findings: list[Finding], root: Path, output_path: Path):
-    findings.sort(key=lambda f: (
-        SEV_ORDER[f.rule.severity], f.rule.category, f.file, f.line_no
-    ))
-    with open(output_path, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.writer(fh)
-        writer.writerow([
-            "Severity", "Rule ID", "Category", "Description",
-            "File", "Line", "Code", "Guidance", "Confidence", "Block Note",
-        ])
-        for f in findings:
-            writer.writerow([
-                f.rule.severity,
-                f.rule.id,
-                f.rule.category,
-                f.rule.description,
-                os.path.relpath(f.file, root),
-                f.line_no,
-                f.line.strip()[:200],
-                f.rule.note,
-                f.confidence,
-                f.block_note or "",
-            ])
-    print(f"  CSV written → {output_path}  ({len(findings)} rows)\n")
-
-
-def write_md(findings: list[Finding], root: Path, output_path: Path):
-    findings = sorted(findings, key=lambda f: (
-        SEV_ORDER[f.rule.severity], f.rule.category, f.file, f.line_no
-    ))
-    by_category: dict[str, list[Finding]] = defaultdict(list)
-    for f in findings:
-        by_category[f.rule.category].append(f)
-
-    counts = {s: sum(1 for f in findings if f.rule.severity == s)
-              for s in ("HIGH", "MEDIUM", "LOW")}
-    total = len(findings)
-
-    out: list[str] = []
-
-    out.append("# PL/SQL Security Audit\n")
-    out.append(f"**Root:** `{root}`  ")
-    out.append(f"**Date:** {datetime.date.today().isoformat()}  ")
-    out.append(
-        f"**Findings:** "
-        f"HIGH: {counts['HIGH']}  |  "
-        f"MEDIUM: {counts['MEDIUM']}  |  "
-        f"LOW: {counts['LOW']}  |  "
-        f"**Total: {total}**\n"
-    )
-    out.append("---\n")
-
-    if total == 0:
-        out.append("No findings.\n")
-    else:
-        for category, cat_findings in by_category.items():
-            out.append(f"## {category}\n")
-            for f in cat_findings:
-                rel   = os.path.relpath(f.file, root)
-                badge = " `[REVIEW]`" if f.confidence == "REVIEW" else ""
-                out.append(
-                    f"### [{f.rule.severity}] {f.rule.id}{badge}"
-                    f" - {f.rule.description}\n"
-                )
-                out.append(f"**File:** `{rel}:{f.line_no}`\n")
-                out.append("```sql")
-                for ctx_line in f.context:
-                    out.append(ctx_line.replace("│", "|"))
-                out.append("```\n")
-                msg = f.block_note if f.block_note else f.rule.note
-                if msg:
-                    out.append(f"> {msg}\n")
-                out.append("---\n")
-
-    # Top files table
-    if findings:
-        file_counts: dict[str, dict] = defaultdict(
-            lambda: {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
-        )
-        for f in findings:
-            rel = os.path.relpath(f.file, root)
-            file_counts[rel][f.rule.severity] += 1
-        ranked = sorted(
-            file_counts.items(),
-            key=lambda x: (-x[1]["HIGH"], -x[1]["MEDIUM"], -x[1]["LOW"])
-        )[:10]
-        out.append("## Top Files by Finding Count\n")
-        out.append("| File | HIGH | MEDIUM | LOW |")
-        out.append("|------|-----:|-------:|----:|")
-        for rel, cnts in ranked:
-            out.append(
-                f"| `{rel}` | {cnts['HIGH']} | {cnts['MEDIUM']} | {cnts['LOW']} |"
-            )
-        out.append("")
-
-    output_path.write_text("\n".join(out), encoding="utf-8")
-    print(f"  Markdown written → {output_path}  ({total} findings)\n")
-
-
-# ── SARIF level map (HIGH→error, MEDIUM→warning, LOW→note) ───────────────────
-_SARIF_LEVEL = {"HIGH": "error", "MEDIUM": "warning", "LOW": "note"}
-
-
-def write_sarif(findings: list[Finding], root: Path, output_path: Path):
-    # Build rule descriptors from the global RULES list (deduplicated by id).
-    rule_index: dict[str, int] = {}
-    sarif_rules: list[dict] = []
-    for rule in RULES:
-        if rule.id in rule_index:
-            continue
-        rule_index[rule.id] = len(sarif_rules)
-        sarif_rules.append({
-            "id": rule.id,
-            "name": re.sub(r"[^A-Za-z0-9]", "", rule.description[:64]),
-            "shortDescription": {"text": rule.description},
-            "fullDescription":  {"text": rule.note or rule.description},
-            "defaultConfiguration": {"level": _SARIF_LEVEL[rule.severity]},
-            "properties": {
-                "tags": [
-                    "security",
-                    rule.category.lower().replace(" ", "-").replace("&", "and"),
-                    rule.severity.lower(),
-                ],
-                "category": rule.category,
-            },
-        })
-
-    # Artifact list (unique files)
-    seen_uris: set[str] = set()
-    artifacts: list[dict] = []
-    for f in findings:
-        uri = os.path.relpath(f.file, root).replace("\\", "/")
-        if uri not in seen_uris:
-            seen_uris.add(uri)
-            artifacts.append({
-                "location": {"uri": uri, "uriBaseId": "%SRCROOT%"},
-                "roles": ["analysisTarget"],
-            })
-
-    # Result list
-    results: list[dict] = []
-    for f in findings:
-        uri = os.path.relpath(f.file, root).replace("\\", "/")
-        # Compose a human-readable message: description + guidance or block note.
-        guidance = f.block_note or f.rule.note
-        msg = f.rule.description + (f"  {guidance}" if guidance else "")
-
-        results.append({
-            "ruleId":    f.rule.id,
-            "ruleIndex": rule_index.get(f.rule.id, 0),
-            "level":     _SARIF_LEVEL[f.rule.severity],
-            "message":   {"text": msg},
-            "locations": [{
-                "physicalLocation": {
-                    "artifactLocation": {
-                        "uri":       uri,
-                        "uriBaseId": "%SRCROOT%",
-                    },
-                    "region": {"startLine": f.line_no},
-                }
-            }],
-            "properties": {
-                "confidence": f.confidence,
-                "category":   f.rule.category,
-            },
-        })
-
-    sarif_doc = {
-        "$schema": (
-            "https://schemastore.azurewebsites.net"
-            "/schemas/json/sarif-2.1.0-rtm.5.json"
-        ),
-        "version": "2.1.0",
-        "runs": [{
-            "tool": {
-                "driver": {
-                    "name":    "plsql-security-scanner",
-                    "version": "1.0.0",
-                    "rules":   sarif_rules,
-                }
-            },
-            "invocations": [{
-                "executionSuccessful": True,
-                "commandLine": " ".join(sys.argv),
-            }],
-            "results":   results,
-            "artifacts": artifacts,
-        }],
-    }
-
-    output_path.write_text(json.dumps(sarif_doc, indent=2), encoding="utf-8")
-    print(f"  SARIF written   → {output_path}  ({len(findings)} results)\n")
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="PL/SQL static security scanner.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Examples:\n"
-            "  python plsql.py ./db/src\n"
-            "  python plsql.py ./db/src --csv report.csv\n"
-            "  python plsql.py ./db/src --md report.md\n"
-            "  python plsql.py ./db/src --sarif report.sarif\n"
-            "  python plsql.py ./db/src --csv r.csv --md r.md --sarif r.sarif\n"
-        ),
-    )
-    parser.add_argument(
-        "root", nargs="?", default=".",
-        help="Project root to scan (default: current directory)",
-    )
-    parser.add_argument(
-        "--csv", metavar="FILE",
-        help="Write findings to a CSV file",
-    )
-    parser.add_argument(
-        "--md", metavar="FILE",
-        help="Write findings to a Markdown report",
-    )
-    parser.add_argument(
-        "--sarif", metavar="FILE",
-        help="Write findings in SARIF 2.1.0 format (JSON)",
-    )
-    args = parser.parse_args()
-
-    root = Path(args.root)
-    if not root.is_dir():
-        print(f"Error: '{root}' is not a directory.", file=sys.stderr)
-        sys.exit(1)
-
-    findings = scan_project(root)
-    print_report(findings, root)
-
-    if args.csv:
-        write_csv(findings, root, Path(args.csv))
-    if args.md:
-        write_md(findings, root, Path(args.md))
-    if args.sarif:
-        write_sarif(findings, root, Path(args.sarif))
-
-    sys.exit(1 if any(f.rule.severity == "HIGH" for f in findings) else 0)

@@ -15,3 +15,4 @@ from . import javascript  # noqa: F401
 from . import go  # noqa: F401
 from . import ruby  # noqa: F401
 from . import dotnet  # noqa: F401
+from . import sql  # noqa: F401

@@ -60,7 +60,7 @@ def _rule(check_id: str, sample: Finding) -> dict:
 
 
 def _result(finding: Finding) -> dict:
-    return {
+    result = {
         "ruleId": finding.check_id,
         "level": _SEVERITY_TO_SARIF_LEVEL.get(finding.severity, "warning"),
         "message": {"text": f"{finding.title}\n\n{finding.description}"},
@@ -73,6 +73,9 @@ def _result(finding: Finding) -> dict:
             }
         ],
     }
+    if finding.confidence:
+        result["properties"] = {"confidence": finding.confidence}
+    return result
 
 
 def build_sarif(results: list[ScanResult], route_none_only: bool = False, exclude_auth: bool = False) -> dict:

@@ -100,7 +100,10 @@ fine offline), split into four tabs:
   reflects only input/validation coverage, not a mix of two concerns.
 - **Findings** -- every other project-wide finding that doesn't attach to
   a single route and isn't specifically about authentication (dangerous-
-  sink checks, deserialization, AOP bypass, general config findings).
+  sink checks, deserialization, AOP bypass, general config findings, every
+  PL/SQL finding). Each card shows the flagged line with 2 lines of
+  context either side, plus a "review" badge when the check itself marks
+  the finding as needing manual verification (`Finding.confidence`).
 - **Download SARIF** button (topbar) -- exports just the Findings tab's own
   contents (route-tied findings already have a richer view on their own
   card, and `AUTH-*` project-wide findings already have their own reviewed
@@ -144,7 +147,7 @@ checks/                    heuristics that build Finding objects from Route data
   binding.py                      MASS-001/SORT-001 -- request-binding shape checks (Spring only)
   sqli.py                          SQLI-001 -- SQL/JPQL built via string concatenation (Spring only)
   aop.py                            PROXY-001 -- AOP proxy self-invocation bypass (Spring only)
-languages/<lang>/
+  plsql.py                           Oracle PL/SQL rule engine (INJ/EXC/AUTHZ/CRED/NET/CRYPTO/PRIV/... -- see languages/sql/README.md)languages/<lang>/
   README.md                 what this language's analyzer(s) check, and what's still manual -- READ THIS FIRST when reviewing a codebase in this language
   detector.py               detect_language() / detect_frameworks() for that language
   <framework>_analyzer.py    route extraction + baseline checks for one framework
@@ -159,6 +162,9 @@ Currently implemented (route extraction + baseline checks):
 - **go**: gin, net_http
 - **dotnet**: aspnet
 - **ruby**: rails, sinatra
+- **sql**: plsql (Oracle). No routes: every finding is project-wide and
+  goes in the Findings tab. T-SQL/PL/pgSQL files are detected but have no
+  analyzer yet.
 
 **Every `languages/<lang>/README.md` is the fast reference for that
 language** -- exactly which checks run, exactly what triggers each one, and

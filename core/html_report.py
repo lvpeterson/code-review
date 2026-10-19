@@ -33,7 +33,7 @@ _METHOD_ORDER = {"GET": 0, "POST": 1, "PUT": 2, "PATCH": 3, "DELETE": 4, "OPTION
 # as this report's palette, so its token colors blend in once we force the
 # background transparent below and let our own --surface show through.
 _PYGMENTS_STYLE = "night-owl"
-_LEXER_NAME_BY_LANGUAGE = {"python": "python", "java": "java", "javascript": "javascript"}
+_LEXER_NAME_BY_LANGUAGE = {"python": "python", "java": "java", "javascript": "javascript", "sql": "sql"}
 
 
 def _get_lexer(language: str, filename: str):
@@ -383,7 +383,32 @@ def _render_group(result: ScanResult, target_path: Path, route_ids: itertools.co
     </section>"""
 
 
-def _render_standalone_finding(finding: Finding, target_path: Path, item_id: str) -> str:
+_SNIPPET_CONTEXT_LINES = 2
+
+
+def _render_finding_snippet(finding: Finding, target_path: Path, language: str) -> str:
+    """A few lines either side of a project-wide finding's own line, with
+    that line highlighted -- these have no route card to show the handler
+    body in, so without this the only way to see the flagged code at all
+    is the open-in-editor link. Silently omitted if the file can't be read
+    (the file:line link above it still works)."""
+    start = finding.line - _SNIPPET_CONTEXT_LINES
+    numbered_lines, error = _read_lines(target_path, finding.file, start, finding.line + _SNIPPET_CONTEXT_LINES)
+    if error or not numbered_lines:
+        return ""
+    first = numbered_lines[0][0]
+    code_text = "\n".join(text for _, text in numbered_lines)
+    formatter = HtmlFormatter(
+        style=_PYGMENTS_STYLE,
+        linenos="inline",
+        linenostart=first,
+        hl_lines=[finding.line - first + 1],
+    )
+    highlighted = pygments_highlight(code_text, _get_lexer(language, finding.file), formatter)
+    return f'<div class="code-block finding-snippet">{highlighted}</div>'
+
+
+def _render_standalone_finding(finding: Finding, target_path: Path, item_id: str, language: str = "") -> str:
     """A project-wide finding (route=None) -- these have nowhere to attach
     in the route-card view, so unlike `_render_finding` this includes its
     own file:line + "open in editor" link, plus a reviewed-toggle: these
@@ -393,16 +418,22 @@ def _render_standalone_finding(finding: Finding, target_path: Path, item_id: str
     cards already do matters here too.
     """
     ide_link = _vscode_uri(target_path, finding.file, finding.line)
+    review_badge = (
+        '<span class="finding-confidence" title="The check itself can\'t decide this one -- needs manual verification">review</span>'
+        if finding.confidence == "REVIEW" else ""
+    )
     return f"""
     <div class="finding sev-{_esc(finding.severity)}">
       <div class="finding-head">
         <input type="checkbox" class="review-toggle" data-item-id="{_esc(item_id)}" title="Mark reviewed" aria-label="Mark this finding reviewed">
         <span class="finding-tag">{_esc(finding.check_id)}</span>
         <span class="finding-sev">{_esc(_SEVERITY_LABEL.get(finding.severity, finding.severity))}</span>
+        {review_badge}
         <a class="ide-link finding-loc" href="{_esc(ide_link)}">{_esc(finding.file)}:{finding.line} &rarr;</a>
       </div>
       <p class="finding-title">{_esc(finding.title)}</p>
       <p class="finding-desc">{_esc(finding.description)}</p>
+      {_render_finding_snippet(finding, target_path, language)}
     </div>"""
 
 
@@ -506,13 +537,15 @@ def _render_findings_tab(results: list[ScanResult], target_path: Path, item_ids:
     findings do, and none of them are specifically about authentication
     the way the Auth tab's own project-wide section is.
     """
-    all_findings = [f for r in results for f in r.findings]
-    findings = sorted(
-        (f for f in all_findings if f.route is None and not _is_auth_finding(f)),
-        key=lambda f: _SEVERITY_RANK.get(f.severity, 9),
+    # (finding, language) pairs so each snippet gets its own language's lexer
+    # fallback -- .pkb/.pks have no Pygments filename mapping of their own.
+    pairs = sorted(
+        ((f, r.language) for r in results for f in r.findings if f.route is None and not _is_auth_finding(f)),
+        key=lambda pair: _SEVERITY_RANK.get(pair[0].severity, 9),
     )
+    findings = [f for f, _ in pairs]
     findings_html = "".join(
-        _render_standalone_finding(f, target_path, f"finding-{next(item_ids)}") for f in findings
+        _render_standalone_finding(f, target_path, f"finding-{next(item_ids)}", language) for f, language in pairs
     )
 
     return f"""
@@ -1138,6 +1171,12 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .finding-tag { font-family: var(--mono); font-size: 11px; color: var(--text-muted); }
 .finding-sev { font-family: var(--mono); font-size: 11px; margin-left: 8px; text-transform: uppercase; letter-spacing: 0.04em; }
 .finding-title { margin: 6px 0 2px; font-weight: 600; font-size: 13px; }
+.finding-confidence {
+  font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--text-muted); border: 1px solid var(--border); border-radius: 3px; padding: 0 5px;
+}
+.finding-snippet { margin-top: 8px; }
+.finding.reviewed .finding-snippet { display: none; }
 .finding-desc { margin: 0; color: var(--text-muted); font-size: 12.5px; }
 .no-findings { color: var(--text-muted); font-size: 12.5px; font-style: italic; margin: 0; }
 

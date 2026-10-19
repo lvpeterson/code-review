@@ -39,7 +39,8 @@ def print_console(results: list[ScanResult]) -> None:
         if result.findings:
             print(f"\nbaseline findings: {len(result.findings)}")
             for finding in sorted(result.findings, key=lambda f: _SEVERITY_ORDER.get(f.severity, 9)):
-                print(f"  [{finding.severity.upper():6}] {finding.check_id}  {finding.title}")
+                badge = f" [{finding.confidence}]" if finding.confidence == "REVIEW" else ""
+                print(f"  [{finding.severity.upper():6}] {finding.check_id}{badge}  {finding.title}")
                 print(f"           {finding.description}")
                 print(f"           {finding.file}:{finding.line}")
         else:
@@ -66,6 +67,7 @@ def _finding_to_dict(finding: Finding) -> dict:
         "description": finding.description,
         "file": finding.file,
         "line": finding.line,
+        "confidence": finding.confidence,
     }
 
 
