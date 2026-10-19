@@ -13,7 +13,16 @@ PL/SQL in a mixed repo, use `--language sql`.
 ## Detection
 
 `detector.py`: the language is "sql" if any `.sql .pls .pkb .pks .pck .fnc
-.prc .trg .typ` file exists (case-insensitive). The framework (really the
+.prc .trg .typ` file exists (case-insensitive), or a `.txt` file whose
+contents look like SQL. Code often arrives as `.txt` (pasted from a ticket,
+emailed, exported from a DB client), but a `.txt` is only scanned if a line
+*starts* with a real statement shape: `CREATE [OR REPLACE] PROCEDURE|
+FUNCTION|PACKAGE|TRIGGER|TYPE <name>` followed by `(`/`IS`/`AS`/`AUTHID`/
+`RETURN`/trigger timing, a line that's only `BEGIN` or `DECLARE`,
+`EXECUTE IMMEDIATE`, or `GRANT ... TO ...;`. So `requirements.txt`,
+licenses and prose READMEs are skipped
+(`checks/plsql.py:looks_like_sql()`). Snippets from `.txt` files are still
+highlighted as SQL in the HTML report. The framework (really the
 dialect) is `plsql` if any of those files has an Oracle-only extension
 (anything but `.sql`), or a `.sql` file contains an Oracle-only construct
 (`EXECUTE IMMEDIATE`, `AUTHID`, `CREATE PACKAGE`, `DBMS_*.`, `UTL_*.`,
@@ -26,9 +35,15 @@ running them anyway would look like a clean bill of health.
 ## How matching works
 
 - **Masking**: comments are always blanked before matching. String
-  contents are blanked too, except for rules that have to see inside a
-  literal (`CRED-1`, `CRED-3`, `CRYPTO-4`) and the `||`-chain rules. So
-  `'EXECUTE IMMEDIATE ...'` inside a log message can't fire `INJ-*`.
+  contents are blanked too (the quotes themselves are kept, so `'abc'`
+  becomes `'   '`), except for rules that have to see inside a literal
+  (`CRED-1`, `CRED-3`, `CRYPTO-4`, `AUTHZ-5`) and the `||`-chain rules. So
+  `'EXECUTE IMMEDIATE ...'` inside a log message can't fire `INJ-*`, but
+  rules can still tell a literal was there.
+- **Post checks** (`Rule.post_check`): for rules a one-line regex can't
+  decide, a function sees the whole file. `top_level_operands()` splits an
+  expression into its depth-0 `||` operands, parens and literals aware.
+  INJ-6, XSS-1/2, AUTHZ-2 and AUTHZ-5 use this.
 - **Literal-only `||` chains are suppressed** (`INJ-1/2/3`): a chain built
   only from string or number literals isn't injectable. The chain walker
   follows `||` across wrapped lines.
@@ -59,13 +74,17 @@ running them anyway would look like a clean bill of health.
 | INJ-3 | high | `OPEN c FOR` with `\|\|` concatenation |
 | INJ-4 | medium (review) | `EXECUTE IMMEDIATE <variable>`: trace the variable |
 | INJ-5 | high (review) | dynamic identifier (`FROM`/`INTO`/`TABLE` + `\|\|`) with no `DBMS_ASSERT` in the unit |
+| INJ-6 | high | `EXECUTE IMMEDIATE v` / `OPEN c FOR v` / `DBMS_SQL.PARSE(c, v)` where `v` is assigned in the same unit from a `\|\|` chain with an operand that isn't a literal, `v` itself, or `DBMS_ASSERT.*(...)` |
 | EXC-1 | high | `WHEN OTHERS THEN NULL;` |
 | EXC-2 | high (review) | `WHEN OTHERS` handler with no RAISE or logging call in that handler |
 | EXC-3 | medium (review) | `CREATE PROCEDURE/FUNCTION` with no `EXCEPTION` section |
 | AUTHZ-1 | medium (review) | `AUTHID DEFINER` |
-| AUTHZ-2 | medium (review) | no `AUTHID` clause (so it defaults to definer rights) |
+| AUTHZ-2 | medium (review) | no `AUTHID` clause in the unit header (so it defaults to definer rights). Specs and standalone units only; a `PACKAGE BODY` can't carry AUTHID |
 | AUTHZ-3 | high | `GRANT ... TO PUBLIC` |
 | AUTHZ-4 | high | DBA / SYSDBA / RESOURCE / CONNECT / `* ANY` grants |
+| AUTHZ-5 | high (review) | `SYS_CONTEXT('USERENV', 'CLIENT_IDENTIFIER'\|'CLIENT_INFO'\|'MODULE'\|'ACTION'\|'OS_USER'\|'HOST'\|'TERMINAL')` in a condition on the same line (after IF/ELSIF/WHEN/WHERE/AND/OR/CASE, or directly compared). These values are client-controlled |
+| XSS-1 | high | `HTP.P/PRINT/PRN(...)` with a `\|\|` chain containing an operand not wrapped in `HTF.ESCAPE_SC`/`ESCAPE_URL`, `APEX_ESCAPE.*` or `UTL_URL.ESCAPE` |
+| XSS-2 | medium (review) | `HTP.P/PRINT/PRN(v)` with a single unescaped non-literal value |
 | CRED-1 | high | `password := 'literal'` / `=> 'literal'` |
 | CRED-2 | high | `IDENTIFIED BY` in DDL |
 | CRED-3 | medium | `UTL_HTTP`/`DBMS_LDAP`/`UTL_SMTP` call with two or more string literals |
@@ -91,9 +110,16 @@ running them anyway would look like a clean bill of health.
   says a non-literal was concatenated in, not that the value came from a
   caller. Trace the procedure's parameters back to whoever calls it,
   including app-side code that SQLI-001 may or may not have flagged.
-- **Concatenation in an earlier statement**: `v_sql := '...' || p_x;`
-  followed later by `EXECUTE IMMEDIATE v_sql` only shows up as INJ-4
-  (review). Nothing traces `v_sql` back to its assignment.
+- **Concatenation in an earlier statement**: INJ-6 follows `v_sql` back to
+  its `:=` assignments in the same unit, but no further: a package-level
+  variable, a value built in another procedure and passed in, or one
+  filled via `SELECT ... INTO` still only shows as INJ-4 (review).
+- **USERENV through a variable**: AUTHZ-5 only fires when the
+  `SYS_CONTEXT` call is in the condition itself. `v := SYS_CONTEXT(...)`
+  then `IF v = 'admin'` isn't followed.
+- **Other HTP output**: XSS-1/2 cover `HTP.P/PRINT/PRN`. Tag helpers
+  (`HTP.TABLEDATA(v)`, `HTP.ANCHOR(...)`) and APEX region source
+  aren't checked.
 - **Definer-rights exposure**: AUTHZ-1/2 flag the clause. Who holds
   `EXECUTE` on the unit, and what the owning schema can reach, comes from
   the grants (often in a separate schema/DBA repo), not from this code.

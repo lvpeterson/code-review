@@ -1,4 +1,6 @@
-"""Language + dialect detection for SQL targets.
+"""Language + dialect detection for SQL targets. Which files count (including
+.txt files whose contents look like SQL) is decided by
+checks.plsql.iter_plsql_files.
 
 "Framework" here means SQL dialect -- the only thing that changes which
 rules apply. Only Oracle PL/SQL has an analyzer so far, so a repo of plain

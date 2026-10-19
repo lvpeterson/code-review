@@ -22,7 +22,8 @@ class Rule:
     description: str
     pattern: str
     note: str = ""
-    file_exts: tuple = (".sql", ".pls", ".pkb", ".pks", ".pck", ".fnc", ".prc", ".trg", ".typ")
+    # .txt only counts once looks_like_sql() says so -- see iter_plsql_files.
+    file_exts: tuple = (".sql", ".pls", ".pkb", ".pks", ".pck", ".fnc", ".prc", ".trg", ".typ", ".txt")
     # If block_suppress is set the finding is dropped when the pattern matches
     # anywhere in the extracted enclosing program-unit body.
     block_suppress: str | None = None
@@ -56,6 +57,13 @@ class Rule:
     #   "handler" → only the exception handler starting at the matched line,
     #               up to the next sibling WHEN ... THEN or the closing END
     block_scope: str = "unit"
+    # Name of a function in _POST_CHECKS that gets the match plus the whole
+    # file (both masked views) and decides whether the finding is kept. For
+    # rules a per-line regex can't express on its own: following a variable
+    # back to its assignment, splitting a call's argument into || operands,
+    # reading a unit header that wraps onto several lines. When it keeps the
+    # finding, block_note is attached as the explanation.
+    post_check: str | None = None
 
 
 # ── User-configurable "this counts as error logging" identifiers ────────────
@@ -104,10 +112,26 @@ RULES: list[Rule] = [
 
     Rule("INJ-4", "SQL Injection", "MEDIUM",
          "EXECUTE IMMEDIATE with a variable first argument (verify taint)",
-         r"(?i)\bEXECUTE\s+IMMEDIATE\s+(?!')[A-Za-z_]\w*",
+         # [nNqQ]? covers N'...' and q'[...]' literals. Matched against fully
+         # masked text, which keeps a literal's quotes, so a parameterized
+         # EXECUTE IMMEDIATE '...' USING x never reaches USING as the "variable".
+         r"(?i)\bEXECUTE\s+IMMEDIATE\s+(?![nNqQ]?')[A-Za-z_]\w*",
          "The SQL string starts with a variable, not a literal; trace every assignment "
          + "to that variable and confirm no unsanitised input reaches it.",
          confidence="REVIEW"),
+
+    Rule("INJ-6", "SQL Injection", "HIGH",
+         "Dynamic SQL variable built by concatenating a non-literal",
+         r"(?i)(?:\bEXECUTE\s+IMMEDIATE\s+|\bOPEN\s+\w+\s+FOR\s+"
+         r"|\bDBMS_SQL\s*\.\s*PARSE\s*\(\s*\w+\s*,\s*)"
+         r"(?![nNqQ]?')(?!(?:SELECT|WITH)\b)(?P<var>[A-Za-z_][\w$#]*)\b(?!\s*[(.])",
+         "The variable executed here is assigned, somewhere in this unit, from a || "
+         + "chain that includes a non-literal operand -- the two-statement form of "
+         + "INJ-1/2/3. Rebuild it with bind placeholders and pass the values via USING "
+         + "(or DBMS_SQL.BIND_VARIABLE); wrap any dynamic identifier in DBMS_ASSERT.",
+         post_check="var_built_by_concat",
+         block_note="Assignment found in this unit that concatenates a non-literal into "
+                    + "this variable."),
 
     Rule("INJ-5", "SQL Injection", "HIGH",
          "Dynamic identifier built via || without DBMS_ASSERT validation",
@@ -167,12 +191,14 @@ RULES: list[Rule] = [
 
     Rule("AUTHZ-2", "Invoker & Definer Rights", "MEDIUM",
          "CREATE PROCEDURE/FUNCTION/PACKAGE without explicit AUTHID clause",
-         r'(?i)\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:PROCEDURE|FUNCTION|PACKAGE\b)',
+         # Not PACKAGE BODY: AUTHID is only legal in the package spec, so a body
+         # can never carry it and used to be flagged unconditionally.
+         r'(?i)\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:PROCEDURE|FUNCTION|PACKAGE\b(?!\s+BODY\b))',
          "Without an explicit AUTHID clause the unit runs with DEFINER "
          + "(schema-owner) rights by default; document and review whether this "
          + "privilege elevation is intentional for each program unit.",
-         block_suppress=r'(?i)\bAUTHID\b',
-         block_note="No AUTHID clause found in the body -- "
+         post_check="header_lacks_authid",
+         block_note="No AUTHID clause in the unit header -- "
                     + "unit defaults to DEFINER (owner) rights.",
          confidence="REVIEW"),
 
@@ -191,6 +217,21 @@ RULES: list[Rule] = [
          "Highly privileged roles and ANY-level system privileges should almost "
          + "never be granted to application accounts; use fine-grained object "
          + "privileges scoped to the exact objects the account needs."),
+
+    Rule("AUTHZ-5", "Invoker & Definer Rights", "HIGH",
+         "Access decision based on a client-supplied USERENV attribute",
+         r"(?i)\bSYS_CONTEXT\s*\(\s*'USERENV'\s*,\s*'(?:CLIENT_IDENTIFIER|CLIENT_INFO"
+         r"|MODULE|ACTION|OS_USER|HOST|TERMINAL)'\s*\)",
+         "CLIENT_IDENTIFIER, CLIENT_INFO, MODULE and ACTION are set by the client "
+         + "(DBMS_SESSION / DBMS_APPLICATION_INFO, or connection attributes), and "
+         + "OS_USER/HOST/TERMINAL are whatever the client machine reports; any session "
+         + "can spoof them. Base the decision on SESSION_USER, an enabled role, or an "
+         + "application context that only a trusted package can set.",
+         match_in_strings=True,
+         post_check="in_condition",
+         block_note="Compared or tested in a condition on this line -- looks like it "
+                    + "drives a decision, not just logging.",
+         confidence="REVIEW"),
 
     # ── Hardcoded Credentials ──────────────────────────────────────────────
     Rule("CRED-1", "Hardcoded Credentials", "HIGH",
@@ -318,6 +359,27 @@ RULES: list[Rule] = [
          + "namespace is protected and only the intended trusted package sets it.",
          confidence="REVIEW"),
 
+    # ── Web Output (PL/SQL Web Toolkit / APEX) ─────────────────────────────
+    Rule("XSS-1", "Web Output", "HIGH",
+         "HTP output concatenating an unescaped non-literal",
+         r'(?i)\bHTP\s*\.\s*(?:P|PRINT|PRN)\s*\(',
+         "HTP.P/PRINT/PRN write straight into the HTML response. Wrap every "
+         + "non-literal operand in HTF.ESCAPE_SC() or APEX_ESCAPE.HTML() (or use "
+         + "HTP.PRINTS / HTP.PS, which escape), or it's reflected/stored XSS "
+         + "whenever that value can come from a user.",
+         post_check="htp_concat_unescaped",
+         block_note="At least one || operand is neither a literal nor wrapped in an "
+                    + "escaping function."),
+
+    Rule("XSS-2", "Web Output", "MEDIUM",
+         "HTP output of a single unescaped value (verify it's pre-escaped HTML)",
+         r'(?i)\bHTP\s*\.\s*(?:P|PRINT|PRN)\s*\(',
+         "The argument is one non-literal value passed straight through. Fine if "
+         + "it's HTML this code built and escaped itself; XSS if it holds user "
+         + "input. Trace where it's assigned.",
+         post_check="htp_single_unescaped",
+         confidence="REVIEW"),
+
     # ── Public Synonyms ────────────────────────────────────────────────────
     Rule("SYN-1", "Object Exposure", "MEDIUM",
          "CREATE PUBLIC SYNONYM -- object resolvable by every database user",
@@ -385,8 +447,13 @@ def _mask_plsql(lines: list[str], mask_strings: bool) -> list[str]:
       - -- line comments (to end of line)
       - /* ... */ block comments (spanning lines)
 
-    When mask_strings=True also blanks single-quoted string contents.
-    The '' in-string escape sequence for a literal quote is handled.
+    When mask_strings=True also blanks single-quoted string contents, but
+    keeps the delimiting quotes themselves -- so 'abc' becomes '   '. Rules
+    still can't see keywords inside a literal, but can tell a literal was
+    there (INJ-4's "first argument isn't a literal" check depends on it), and
+    the operand walker can find literal boundaries without re-lexing. The ''
+    in-string escape is blanked to two spaces, so in fully masked text every
+    remaining quote is a real delimiter.
     in_string persists across lines because PL/SQL allows multi-line literals.
     """
     out: list[str] = []
@@ -418,7 +485,7 @@ def _mask_plsql(lines: list[str], mask_strings: bool) -> list[str]:
                         result.append('  ' if mask_strings else "''")
                         i += 2          # '' = escaped quote -- stay in string
                     else:
-                        result.append(' ' if mask_strings else ch)
+                        result.append(ch)
                         i += 1
                         in_string = False
                 else:
@@ -435,7 +502,7 @@ def _mask_plsql(lines: list[str], mask_strings: bool) -> list[str]:
                 i += 2
                 in_block_comment = True
             elif ch == "'":
-                result.append(' ' if mask_strings else ch)
+                result.append(ch)
                 i += 1
                 in_string = True
             else:
@@ -519,20 +586,13 @@ def _find_matching_end(masked_lines: list[str], start_i: int, limit: int) -> int
     return None
 
 
-def extract_plsql_block(
-    masked_lines:  list[str],   # comment+string masked -- for depth counting
-    text_lines:    list[str],   # comment-only masked -- for suppression patterns
-    match_line_idx: int,
-) -> str:
+def plsql_block_bounds(masked_lines: list[str], match_line_idx: int) -> tuple[int, int]:
     """
-    Extract the tightest enclosing PROCEDURE / FUNCTION / TRIGGER / PACKAGE BODY
-    that contains match_line_idx.
-
-    Depth counting runs on fully masked lines so 'BEGIN' or 'END' inside a
-    string literal can't corrupt the counter. The returned text comes from
-    comment-only masked lines so real string-literal arguments (e.g. the
-    'EXCEPTION' keyword in a RAISE_APPLICATION_ERROR call) remain visible
-    to block_suppress / block_require pattern checks.
+    (first, last) line index, inclusive, of the tightest enclosing
+    PROCEDURE / FUNCTION / TRIGGER / PACKAGE BODY that contains
+    match_line_idx -- or a fixed +/-60 line window when no enclosing header
+    is found. Depth counting runs on fully masked lines so 'BEGIN' or 'END'
+    inside a string literal can't corrupt the counter.
     """
     total = len(masked_lines)
 
@@ -543,24 +603,29 @@ def extract_plsql_block(
     # subprogram declared in the same declare section whose body closes
     # before match_line_idx is ever reached; in that case keep walking
     # backward for the real enclosing unit.
-    block_start = None
-    block_end = None
     for i in range(match_line_idx, max(-1, match_line_idx - 250), -1):
         if not _HEADER_RE.search(masked_lines[i]):
             continue
         candidate_end = _find_matching_end(masked_lines, i, min(i + 500, total))
         if candidate_end is not None and candidate_end >= match_line_idx:
-            block_start = i
-            block_end = candidate_end
-            break
+            return i, candidate_end
 
-    if block_start is None:
-        # No enclosing header found -- return a fixed ±60 line window
-        return "\n".join(
-            text_lines[max(0, match_line_idx - 60):min(total, match_line_idx + 60)]
-        )
+    return max(0, match_line_idx - 60), min(total, match_line_idx + 60) - 1
 
-    return "\n".join(text_lines[block_start:block_end + 1])
+
+def extract_plsql_block(
+    masked_lines:  list[str],   # comment+string masked -- for depth counting
+    text_lines:    list[str],   # comment-only masked -- for suppression patterns
+    match_line_idx: int,
+) -> str:
+    """
+    Text of the enclosing unit (see plsql_block_bounds). The returned text
+    comes from comment-only masked lines so real string-literal arguments
+    (e.g. the 'EXCEPTION' keyword in a RAISE_APPLICATION_ERROR call) remain
+    visible to block_suppress / block_require pattern checks.
+    """
+    first, last = plsql_block_bounds(masked_lines, match_line_idx)
+    return "\n".join(text_lines[first:last + 1])
 
 
 # END LOOP / END CASE / END IF are matched as one token so their trailing
@@ -718,6 +783,157 @@ def find_chain_start_col(rule: Rule, match: re.Match) -> int:
     return match.start() + (q.start() if q else 0)
 
 
+# ── Post checks (Rule.post_check) ────────────────────────────────────────────
+@dataclass
+class FileView:
+    """Both masked views of one file, per-line and joined. Masking is
+    length-preserving, so a single offset indexes into either joined string,
+    and fully_masked keeps literal quotes (see _mask_plsql), so walking it
+    sees exactly where each literal starts and ends while comment_masked
+    supplies the actual operand text."""
+    fully_masked:   list[str]
+    comment_masked: list[str]
+    joined_fm:      str
+    joined_cm:      str
+    offsets:        list[int]   # offsets[i] = start of line i in either joined string
+
+
+def top_level_operands(view: FileView, start: int, max_scan: int = 4000) -> list[str] | None:
+    """
+    Split the expression starting at `start` into its top-level || operands,
+    stopping at the first depth-0 ';', ',' or unmatched ')' -- i.e. the end of
+    an assignment's right-hand side or of a call's first argument. Parens
+    are depth-tracked, so `HTF.ESCAPE_SC(a || b)` stays one operand.
+    Returns None when the end isn't found within max_scan (inconclusive).
+    """
+    fm, cm = view.joined_fm, view.joined_cm
+    end = min(len(fm), start + max_scan)
+    parts: list[str] = []
+    depth = 0
+    in_str = False
+    seg = start
+    i = start
+    while i < end:
+        ch = fm[i]
+        if ch == "'":
+            in_str = not in_str
+        elif in_str:
+            pass
+        elif ch == '(':
+            depth += 1
+        elif ch == ')' and depth > 0:
+            depth -= 1
+        elif depth == 0 and (ch in ');,'):
+            parts.append(cm[seg:i])
+            return parts
+        elif depth == 0 and fm.startswith('||', i):
+            parts.append(cm[seg:i])
+            i += 2
+            seg = i
+            continue
+        i += 1
+    return None
+
+
+# A whole operand that's a literal: '...' / N'...' / q'[...]', a number,
+# CHR(n), or NULL.
+_LITERAL_OPERAND_RE = re.compile(
+    r"(?is)^\s*(?:[nN]?'.*'|[qQ]'.*'|\d+(?:\.\d+)?|CHR\s*\(\s*\d+\s*\)|NULL)\s*$"
+)
+_ASSERT_OPERAND_RE = re.compile(r"(?is)^\s*(?:SYS\s*\.\s*)?DBMS_ASSERT\s*\.\s*\w+\s*\(")
+_ESCAPED_OPERAND_RE = re.compile(
+    r"(?is)^\s*(?:SYS\s*\.\s*)?(?:HTF\s*\.\s*ESCAPE_(?:SC|URL)|APEX_ESCAPE\s*\.\s*\w+"
+    r"|UTL_URL\s*\.\s*ESCAPE)\s*\("
+)
+
+
+def _is_literal(operand: str) -> bool:
+    return bool(_LITERAL_OPERAND_RE.match(operand))
+
+
+def _post_var_built_by_concat(match: re.Match, line_idx: int, view: FileView) -> bool:
+    """INJ-6: keep when the executed variable is assigned anywhere in the
+    enclosing unit from a || chain with at least one operand that's not a
+    literal, not the variable itself (`v := v || ' AND ...'`), and not
+    wrapped in DBMS_ASSERT."""
+    var = match.group("var")
+    first, last = plsql_block_bounds(view.fully_masked, line_idx)
+    unit_start = view.offsets[first]
+    unit_end = view.offsets[last] + len(view.fully_masked[last])
+    # `v :=` or a declaration `v [CONSTANT] TYPE[(n)] [NOT NULL] :=`.
+    assign_re = re.compile(
+        rf"(?i)\b{re.escape(var)}\b"
+        r"(?:\s+(?:CONSTANT\s+)?[\w.%]+(?:\s*\(\s*[\w\s,]*\))?(?:\s+NOT\s+NULL)?)?\s*:="
+    )
+    self_re = re.compile(rf"(?i)^\s*{re.escape(var)}\s*$")
+    for m in assign_re.finditer(view.joined_fm, unit_start, unit_end):
+        operands = top_level_operands(view, m.end())
+        if operands is None or len(operands) < 2:
+            continue
+        if any(
+            not (_is_literal(op) or self_re.match(op) or _ASSERT_OPERAND_RE.match(op))
+            for op in operands
+        ):
+            return True
+    return False
+
+
+def _htp_unsafe_operands(match: re.Match, line_idx: int, view: FileView) -> tuple[int, int] | None:
+    """(operand count, unsafe count) for an HTP.P(...) argument, or None."""
+    operands = top_level_operands(view, view.offsets[line_idx] + match.end())
+    if operands is None:
+        return None
+    unsafe = sum(
+        1 for op in operands
+        if op.strip() and not (_is_literal(op) or _ESCAPED_OPERAND_RE.match(op))
+    )
+    return len(operands), unsafe
+
+
+def _post_htp_concat_unescaped(match: re.Match, line_idx: int, view: FileView) -> bool:
+    counts = _htp_unsafe_operands(match, line_idx, view)
+    return counts is not None and counts[0] >= 2 and counts[1] > 0
+
+
+def _post_htp_single_unescaped(match: re.Match, line_idx: int, view: FileView) -> bool:
+    counts = _htp_unsafe_operands(match, line_idx, view)
+    return counts is not None and counts == (1, 1)
+
+
+def _post_header_lacks_authid(match: re.Match, line_idx: int, view: FileView) -> bool:
+    """AUTHZ-2: AUTHID can only appear in the header, between CREATE and the
+    IS/AS that starts the body -- which may wrap onto later lines."""
+    start = view.offsets[line_idx] + match.start()
+    header_end = re.compile(r"(?i)\b(?:IS|AS)\b").search(view.joined_fm, start, start + 3000)
+    header = view.joined_fm[start:header_end.start() if header_end else start + 3000]
+    return not re.search(r"(?i)\bAUTHID\b", header)
+
+
+_CONDITION_BEFORE_RE = re.compile(r"(?i)\b(?:IF|ELSIF|WHEN|WHERE|AND|OR|CASE)\b")
+_COMPARISON_AFTER_RE = re.compile(r"(?i)^\s*(?:=|!=|<>|\^=|~=|\bIN\b|\bLIKE\b|\bNOT\s+IN\b)")
+
+
+def _post_in_condition(match: re.Match, line_idx: int, view: FileView) -> bool:
+    """AUTHZ-5: keep only when the SYS_CONTEXT call sits in a condition on
+    its own line -- after IF/ELSIF/WHEN/WHERE/AND/OR/CASE, or directly
+    compared. A plain assignment (usually logging) isn't flagged. Known gap:
+    reading it into a variable and comparing that later isn't followed."""
+    line = view.fully_masked[line_idx]
+    return bool(
+        _CONDITION_BEFORE_RE.search(line[:match.start()])
+        or _COMPARISON_AFTER_RE.match(line[match.end():])
+    )
+
+
+_POST_CHECKS = {
+    "var_built_by_concat":   _post_var_built_by_concat,
+    "htp_concat_unescaped":  _post_htp_concat_unescaped,
+    "htp_single_unescaped":  _post_htp_single_unescaped,
+    "header_lacks_authid":   _post_header_lacks_authid,
+    "in_condition":          _post_in_condition,
+}
+
+
 # ── Deduplication ─────────────────────────────────────────────────────────────
 def dedup(findings: list[PlsqlHit]) -> list[PlsqlHit]:
     """
@@ -766,6 +982,13 @@ def scan_file(path: Path, rules: list[Rule]) -> list[PlsqlHit]:
         cm_offsets.append(_off)
         _off += len(cml) + 1
     joined_cm = "\n".join(comment_masked)
+    view = FileView(
+        fully_masked=fully_masked,
+        comment_masked=comment_masked,
+        joined_fm="\n".join(fully_masked),
+        joined_cm=joined_cm,
+        offsets=cm_offsets,
+    )
 
     for rule in rules:
         if not any(str(path).lower().endswith(ext) for ext in rule.file_exts):
@@ -800,11 +1023,16 @@ def scan_file(path: Path, rules: list[Rule]) -> list[PlsqlHit]:
                 if not plsql_chain_contains_variable(joined_cm, chain_start):
                     continue
 
+            if rule.post_check and not _POST_CHECKS[rule.post_check](match, i - 1, view):
+                continue
+
             keep, block_note = apply_block_check(
                 rule, fully_masked, comment_masked, i - 1
             )
             if not keep:
                 continue
+            if rule.post_check:
+                block_note = block_note or rule.block_note
 
             findings.append(PlsqlHit(
                 rule=rule,
@@ -818,16 +1046,54 @@ def scan_file(path: Path, rules: list[Rule]) -> list[PlsqlHit]:
     return findings
 
 
+# Extensions that hold SQL only some of the time -- code delivered as .txt
+# is common (pasted out of a ticket, emailed, exported from a DB client), but
+# so are requirements.txt, LICENSE.txt and READMEs. These are scanned only
+# when their contents look like SQL statements.
+SNIFFED_EXTENSIONS = {".txt"}
+_SNIFF_MAX_BYTES = 10 * 1024 * 1024
+
+# Statement shapes, anchored at line start, that prose and dependency lists
+# don't produce: a CREATE of a stored unit followed by its name, a line
+# that's only BEGIN/DECLARE, EXECUTE IMMEDIATE, or a GRANT ... TO ...; that
+# ends in a semicolon.
+_SQL_SNIFF_RE = re.compile(
+    r"(?im)^\s*(?:"
+    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:(?:NON)?EDITIONABLE\s+)?"
+    r"(?:PROCEDURE|FUNCTION|PACKAGE(?:\s+BODY)?|TRIGGER|TYPE(?:\s+BODY)?)\s+[\w\"$#.]+"
+    r"\s*(?:\(|\b(?:IS|AS|AUTHID|RETURN|BEFORE|AFTER|INSTEAD|FOR|UNDER|ACCESSIBLE)\b|$)"
+    r"|(?:BEGIN|DECLARE)\s*$"
+    r"|EXECUTE\s+IMMEDIATE\b"
+    r"|GRANT\s+[^;\n]+\s+TO\s+[^;\n]+;"
+    r")"
+)
+
+
+def looks_like_sql(path: Path) -> bool:
+    try:
+        if path.stat().st_size > _SNIFF_MAX_BYTES:
+            return False
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return bool(_SQL_SNIFF_RE.search(text))
+
+
 def iter_plsql_files(root: Path):
     """Yield PL/SQL source files under root. Extension match is case-
     insensitive (.SQL/.PKB are common on Oracle shops), and IGNORE_DIRS is
     checked against the path *relative to root* so a target that itself
-    lives under e.g. a "build" folder isn't skipped wholesale."""
+    lives under e.g. a "build" folder isn't skipped wholesale. A .txt is
+    yielded only if looks_like_sql()."""
     for path in root.rglob("*"):
         if any(part in IGNORE_DIRS for part in path.relative_to(root).parts):
             continue
-        if path.suffix.lower() in PLSQL_EXTENSIONS and path.is_file():
-            yield path
+        suffix = path.suffix.lower()
+        if suffix not in PLSQL_EXTENSIONS or not path.is_file():
+            continue
+        if suffix in SNIFFED_EXTENSIONS and not looks_like_sql(path):
+            continue
+        yield path
 
 
 def scan_project(root: Path) -> list[PlsqlHit]:

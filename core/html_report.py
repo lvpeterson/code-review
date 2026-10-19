@@ -38,7 +38,11 @@ _LEXER_NAME_BY_LANGUAGE = {"python": "python", "java": "java", "javascript": "ja
 
 def _get_lexer(language: str, filename: str):
     try:
-        return get_lexer_for_filename(filename, stripnl=False)
+        lexer = get_lexer_for_filename(filename, stripnl=False)
+        # SQL delivered as .txt maps to Pygments' plain-text lexer -- prefer
+        # the scan's own language when there is one.
+        if lexer.name != "Text only" or language not in _LEXER_NAME_BY_LANGUAGE:
+            return lexer
     except ClassNotFound:
         pass
     name = _LEXER_NAME_BY_LANGUAGE.get(language)
