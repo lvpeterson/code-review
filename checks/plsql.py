@@ -1051,7 +1051,10 @@ def scan_file(path: Path, rules: list[Rule]) -> list[PlsqlHit]:
 # so are requirements.txt, LICENSE.txt and READMEs. These are scanned only
 # when their contents look like SQL statements.
 SNIFFED_EXTENSIONS = {".txt"}
-_SNIFF_MAX_BYTES = 10 * 1024 * 1024
+# Sniffing streams the file in chunks cut at line boundaries (every sniff
+# pattern fits on one line), so a large SQL dump is accepted as soon as its
+# first matching line is read and memory stays flat regardless of file size.
+_SNIFF_CHUNK_CHARS = 1024 * 1024
 
 # Statement shapes, anchored at line start, that prose and dependency lists
 # don't produce: a CREATE of a stored unit followed by its name, a line
@@ -1071,12 +1074,19 @@ _SQL_SNIFF_RE = re.compile(
 
 def looks_like_sql(path: Path) -> bool:
     try:
-        if path.stat().st_size > _SNIFF_MAX_BYTES:
-            return False
-        text = path.read_text(encoding="utf-8", errors="ignore")
+        with path.open(encoding="utf-8", errors="ignore") as fh:
+            carry = ""
+            while True:
+                chunk = fh.read(_SNIFF_CHUNK_CHARS)
+                if not chunk:
+                    return bool(carry) and bool(_SQL_SNIFF_RE.search(carry))
+                buf = carry + chunk
+                cut = buf.rfind("\n") + 1
+                if cut and _SQL_SNIFF_RE.search(buf, 0, cut):
+                    return True
+                carry = buf[cut:]
     except OSError:
         return False
-    return bool(_SQL_SNIFF_RE.search(text))
 
 
 def iter_plsql_files(root: Path):

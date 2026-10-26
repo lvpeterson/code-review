@@ -7,6 +7,7 @@ needs to open straight from disk, including on an air-gapped machine.
 """
 from __future__ import annotations
 
+import functools
 import hashlib
 import html
 import itertools
@@ -82,14 +83,22 @@ def _vscode_uri(target_path: Path, file_rel: str, line: int) -> str:
     return f"vscode://file/{str(full).replace(chr(92), '/')}:{line}"
 
 
+@functools.lru_cache(maxsize=8)
+def _file_lines(full_path: Path) -> list[str]:
+    """Split once per file per report -- a large file (e.g. an 80MB SQL dump
+    delivered as .txt) can carry hundreds of findings, and re-reading it for
+    each snippet dominated render time. Cleared at the start of render_html
+    so a long-lived process never serves a stale copy. OSError propagates
+    (and isn't cached)."""
+    return full_path.read_text(encoding="utf-8", errors="ignore").split("\n")
+
+
 def _read_lines(target_path: Path, file_rel: str, start: int, end: int) -> tuple[list[tuple[int, str]], str | None]:
-    full_path = target_path / file_rel
     try:
-        text = full_path.read_text(encoding="utf-8", errors="ignore")
+        lines = _file_lines(target_path / file_rel)
     except OSError as exc:
         return [], f"couldn't read {file_rel}: {exc}"
 
-    lines = text.split("\n")
     start = max(1, start)
     end = min(len(lines), end)
     if start > end:
@@ -680,6 +689,7 @@ def _render_entry_points_tab(results: list[ScanResult], target_path: Path, item_
 
 
 def render_html(results: list[ScanResult], target_path: Path) -> str:
+    _file_lines.cache_clear()
     all_findings = [f for r in results for f in r.findings]
     all_routes = [rt for r in results for rt in r.routes]
     # Scoped to findings that actually attach to a route card -- the

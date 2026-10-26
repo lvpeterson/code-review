@@ -316,6 +316,28 @@ def test_sql_delivered_as_txt_is_scanned_and_detected(tmp_path):
     assert '<span class="k">EXECUTE</span>' in html_out
 
 
+def test_large_sql_txt_is_scanned_not_skipped(tmp_path):
+    # Over the old 10MB sniff cap, with the only SQL at the very end.
+    filler = "-- exported row comment, nothing to see here\n" * 260_000
+    _write(
+        tmp_path,
+        "big_dump.txt",
+        filler + _proc("  EXECUTE IMMEDIATE 'DELETE FROM t WHERE c = ''' || p_in || '''';\n"),
+    )
+    assert (tmp_path / "big_dump.txt").stat().st_size > 10 * 1024 * 1024
+    assert "INJ-1" in _ids(tmp_path)
+
+
+def test_sql_sniff_across_chunk_boundaries(tmp_path, monkeypatch):
+    # Tiny chunks force the matching line to straddle reads; it must still
+    # be recognised, and a non-SQL file must still be rejected.
+    monkeypatch.setattr(plsql, "_SNIFF_CHUNK_CHARS", 7)
+    _write(tmp_path, "a.txt", "notes line one\nmore notes\n  EXECUTE IMMEDIATE v_sql;")
+    _write(tmp_path, "b.txt", "javalang==0.13.0\npygments>=2.17\n" * 50)
+    assert plsql.looks_like_sql(tmp_path / "a.txt")
+    assert not plsql.looks_like_sql(tmp_path / "b.txt")
+
+
 def test_non_sql_txt_files_are_ignored(tmp_path):
     _write(tmp_path, "requirements.txt", "javalang==0.13.0\npygments>=2.17\n")
     _write(
