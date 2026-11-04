@@ -7,3 +7,4 @@ from . import detector  # noqa: F401
 from . import flask_analyzer  # noqa: F401
 from . import fastapi_analyzer  # noqa: F401
 from . import django_analyzer  # noqa: F401
+from . import lambda_analyzer  # noqa: F401

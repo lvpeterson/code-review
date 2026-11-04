@@ -8,7 +8,7 @@ from pathlib import Path
 import languages  # noqa: F401  (import triggers analyzer registration)
 from core.models import ScanResult
 from core.registry import get_analyzer
-from languages import dotnet, go, java, javascript, python, ruby, sql
+from languages import crypto, dotnet, go, infra, java, javascript, python, ruby, sql
 
 # Maps a language name to its package (which exposes .detector).
 # Add an entry here whenever you add a new languages/<name>/ package.
@@ -20,6 +20,8 @@ LANGUAGE_MODULES = {
     "ruby": ruby,
     "dotnet": dotnet,
     "sql": sql,
+    "infra": infra,
+    "crypto": crypto,
 }
 
 

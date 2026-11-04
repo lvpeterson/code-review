@@ -41,6 +41,8 @@ def print_console(results: list[ScanResult]) -> None:
             for finding in sorted(result.findings, key=lambda f: _SEVERITY_ORDER.get(f.severity, 9)):
                 badge = f" [{finding.confidence}]" if finding.confidence == "REVIEW" else ""
                 print(f"  [{finding.severity.upper():6}] {finding.check_id}{badge}  {finding.title}")
+                if finding.category:
+                    print(f"           OWASP {finding.category}")
                 print(f"           {finding.description}")
                 print(f"           {finding.file}:{finding.line}")
         else:
@@ -68,6 +70,7 @@ def _finding_to_dict(finding: Finding) -> dict:
         "file": finding.file,
         "line": finding.line,
         "confidence": finding.confidence,
+        "category": finding.category,
     }
 
 

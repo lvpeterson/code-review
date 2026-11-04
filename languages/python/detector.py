@@ -25,6 +25,13 @@ def detect_frameworks(target_path: Path) -> list[str]:
         manifest_text += read_text_safe(target_path / name).lower()
 
     found: set[str] = set()
+    # Lambda handlers are detected from source regardless of the manifest --
+    # a Lambda is often a lone .py file with no requirements.txt at all, and
+    # can sit in the same repo as a Flask/Django app.
+    from checks.aws_lambda import is_lambda_source
+
+    if any(is_lambda_source(read_text_safe(p)) for p in iter_files(target_path, (".py",))):
+        found.add("aws_lambda")
     if "django" in manifest_text or any_file_exists(target_path, "manage.py"):
         found.add("django")
     if "fastapi" in manifest_text:
@@ -32,7 +39,7 @@ def detect_frameworks(target_path: Path) -> list[str]:
     if "flask" in manifest_text:
         found.add("flask")
 
-    if found:
+    if found - {"aws_lambda"}:
         return sorted(found)
 
     # Manifest didn't tell us anything -- fall back to scanning source for

@@ -51,12 +51,16 @@ def _rule(check_id: str, sample: Finding) -> dict:
     # a reasonable approximation without needing a second, separate
     # "generic description per check_id" registry to maintain in parallel
     # with every checks/*.py module.
-    return {
+    rule = {
         "id": check_id,
         "shortDescription": {"text": sample.title},
         "fullDescription": {"text": sample.description},
         "defaultConfiguration": {"level": _SEVERITY_TO_SARIF_LEVEL.get(sample.severity, "warning")},
     }
+    if sample.category:
+        # SARIF viewers (and GitHub Code Scanning) filter on rule tags.
+        rule["properties"] = {"tags": ["owasp-infrastructure-top-10", sample.category.split(":", 1)[0], sample.category]}
+    return rule
 
 
 def _result(finding: Finding) -> dict:
@@ -73,8 +77,13 @@ def _result(finding: Finding) -> dict:
             }
         ],
     }
+    properties = {}
     if finding.confidence:
-        result["properties"] = {"confidence": finding.confidence}
+        properties["confidence"] = finding.confidence
+    if finding.category:
+        properties["owaspInfrastructureRisk"] = finding.category
+    if properties:
+        result["properties"] = properties
     return result
 
 

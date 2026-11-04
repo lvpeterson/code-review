@@ -22,6 +22,7 @@ from pygments.lexers import get_lexer_by_name, get_lexer_for_filename
 from pygments.util import ClassNotFound
 
 from core.models import EntryPoint, Finding, Route, ScanResult
+from core.owasp_isr import ISR_TITLES, isr_code
 from core.paths import extract_path_param_names
 from core.sarif_report import build_sarif
 
@@ -435,12 +436,18 @@ def _render_standalone_finding(finding: Finding, target_path: Path, item_id: str
         '<span class="finding-confidence" title="The check itself can\'t decide this one -- needs manual verification">review</span>'
         if finding.confidence == "REVIEW" else ""
     )
+    isr = isr_code(finding.category)
+    isr_badge = (
+        f'<span class="finding-isr" title="OWASP Top 10 Infrastructure Security Risks: {_esc(finding.category)}">{_esc(isr)}</span>'
+        if isr else ""
+    )
     return f"""
-    <div class="finding sev-{_esc(finding.severity)}">
+    <div class="finding sev-{_esc(finding.severity)}" data-isr="{_esc(isr or '')}">
       <div class="finding-head">
         <input type="checkbox" class="review-toggle" data-item-id="{_esc(item_id)}" title="Mark reviewed" aria-label="Mark this finding reviewed">
         <span class="finding-tag">{_esc(finding.check_id)}</span>
         <span class="finding-sev">{_esc(_SEVERITY_LABEL.get(finding.severity, finding.severity))}</span>
+        {isr_badge}
         {review_badge}
         <a class="ide-link finding-loc" href="{_esc(ide_link)}">{_esc(finding.file)}:{finding.line} &rarr;</a>
       </div>
@@ -552,8 +559,10 @@ def _render_findings_tab(results: list[ScanResult], target_path: Path, item_ids:
     """
     # (finding, language) pairs so each snippet gets its own language's lexer
     # fallback -- .pkb/.pks have no Pygments filename mapping of their own.
+    # Infrastructure/crypto results have their own tab.
     pairs = sorted(
-        ((f, r.language) for r in results for f in r.findings if f.route is None and not _is_auth_finding(f)),
+        ((f, r.language) for r in results if not _is_infra_result(r)
+         for f in r.findings if f.route is None and not _is_auth_finding(f)),
         key=lambda pair: _SEVERITY_RANK.get(pair[0].severity, 9),
     )
     findings = [f for f, _ in pairs]
@@ -566,6 +575,100 @@ def _render_findings_tab(results: list[ScanResult], target_path: Path, item_ids:
       <h2 class="section-title">Findings<span class="count">{len(findings)} finding{"s" if len(findings) != 1 else ""}</span><span class="section-reviewed">0 / {len(findings)} reviewed</span></h2>
       {findings_html or '<p class="no-findings">No project-wide findings outside routes/authentication.</p>'}
     </section>"""
+
+
+_INFRA_LANGUAGES = ("infra", "crypto")
+
+# Click (or Enter on) a coverage-table row to show only that ISR's findings
+# in the Infrastructure tab; click it again to clear. Scoped to the tab.
+_ISR_FILTER_JS = """
+<script>
+(function () {
+  const panel = document.getElementById('tab-panel-infra');
+  if (!panel) return;
+  let active = null;
+  function apply() {
+    panel.querySelectorAll('.isr-row').forEach(r => r.classList.toggle('isr-active', r.dataset.isr === active));
+    panel.querySelectorAll('.infra-section .finding').forEach(f => {
+      f.classList.toggle('isr-hidden', active !== null && f.dataset.isr !== active);
+    });
+  }
+  panel.querySelectorAll('.isr-row').forEach(row => {
+    const toggle = () => { active = active === row.dataset.isr ? null : row.dataset.isr; apply(); };
+    row.addEventListener('click', toggle);
+    row.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+  });
+})();
+</script>"""
+_INFRA_SECTION_TITLES = {
+    ("infra", "terraform"): "Terraform",
+    ("infra", "gitlab_ci"): "GitLab CI/CD",
+    ("infra", "iam_policy"): "IAM / resource policy documents (JSON)",
+    ("infra", "shell"): "Shell scripts",
+    ("infra", "repo_files"): "Sensitive files in the tree",
+    ("crypto", "java"): "Cryptography: Java / Bouncy Castle FIPS",
+    ("crypto", "php"): "Cryptography: PHP",
+}
+
+
+def _is_infra_result(result: ScanResult) -> bool:
+    return result.language in _INFRA_LANGUAGES
+
+
+def _render_isr_coverage(results: list[ScanResult]) -> str:
+    """OWASP Top 10 Infrastructure Security Risks coverage table. Counts every
+    categorised finding in the scan (Lambda findings included, even though
+    they render in the Findings/Entry Points tabs). A category with zero
+    findings is either clean or something these heuristics can't see --
+    the row says so instead of implying a pass."""
+    categorised = [f for r in results for f in r.findings if f.category]
+    rows = ""
+    for code, title in ISR_TITLES.items():
+        hits = [f for f in categorised if isr_code(f.category) == code]
+        counts = {sev: sum(1 for f in hits if f.severity == sev) for sev in _SEVERITY_RANK}
+        cells = "".join(
+            f'<td class="isr-count sev-{sev}">{counts[sev] or ""}</td>' for sev in _SEVERITY_RANK
+        )
+        status = (f'<td class="isr-total">{len(hits)}</td>' if hits
+                  else '<td class="isr-total isr-none" title="No automated hits -- review this area manually">manual</td>')
+        rows += (f'<tr class="isr-row{" isr-empty" if not hits else ""}" data-isr="{code}" tabindex="0">'
+                 f'<td class="isr-code">{code}</td><td>{_esc(title)}</td>{cells}{status}</tr>')
+    return f"""
+    <section class="auth-section isr-coverage">
+      <h2 class="section-title">OWASP Top 10 Infrastructure Security Risks (2024)<span class="count">click a row to filter</span></h2>
+      <table class="auth-table isr-table">
+        <thead><tr><th>ID</th><th>Risk</th><th>High</th><th>Med</th><th>Low</th><th>Info</th><th>Total</th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+      <p class="group-note">"manual" = no automated hits. That is not a pass: ISR02/ISR04/ISR10 in particular are
+      mostly about process and runtime state (monitoring coverage, joiner/leaver handling, asset inventory)
+      that a source scan can only partially see.</p>
+    </section>"""
+
+
+def _render_infra_tab(results: list[ScanResult], target_path: Path, item_ids: itertools.count) -> str:
+    """Infrastructure-as-code + crypto findings, one section per artifact
+    type (Terraform, GitLab CI, policies, shell, committed files, Java/PHP
+    crypto), headed by the OWASP ISR coverage table."""
+    sections = ""
+    for result in results:
+        if not _is_infra_result(result):
+            continue
+        findings = sorted(result.findings, key=lambda f: (_SEVERITY_RANK.get(f.severity, 9), f.file, f.line))
+        body = "".join(
+            _render_standalone_finding(f, target_path, f"finding-{next(item_ids)}", result.language) for f in findings
+        )
+        title = _INFRA_SECTION_TITLES.get((result.language, result.framework), f"{result.language} / {result.framework}")
+        notes = "".join(f'<p class="group-note">{_esc(n)}</p>' for n in result.notes)
+        sections += f"""
+    <section class="auth-section infra-section">
+      <h2 class="section-title">{_esc(title)}<span class="count">{len(findings)} finding{"s" if len(findings) != 1 else ""}</span><span class="section-reviewed">0 / {len(findings)} reviewed</span></h2>
+      {notes}
+      {body or '<p class="no-findings">No findings.</p>'}
+    </section>"""
+    if not sections:
+        sections = '<p class="no-findings">No infrastructure-as-code or crypto artifacts detected in target.</p>'
+    return _render_isr_coverage(results) + sections + _ISR_FILTER_JS
 
 
 _ENTRY_POINT_LABELS = {
@@ -702,14 +805,18 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
     severity_counts = {sev: sum(1 for f in routes_tab_findings if f.severity == sev) for sev in _SEVERITY_RANK}
     auth_findings = [f for f in all_findings if _is_auth_finding(f)]
     auth_attention_count = sum(1 for f in auth_findings if f.severity in ("high", "medium"))
-    general_findings = [f for f in all_findings if f.route is None and not _is_auth_finding(f)]
+    general_findings = [f for r in results if not _is_infra_result(r)
+                        for f in r.findings if f.route is None and not _is_auth_finding(f)]
     general_attention_count = sum(1 for f in general_findings if f.severity in ("high", "medium"))
+    infra_findings = [f for r in results if _is_infra_result(r) for f in r.findings]
+    infra_attention_count = sum(1 for f in infra_findings if f.severity in ("high", "medium"))
+    app_results = [r for r in results if not _is_infra_result(r)]
     all_entry_points = [ep for r in results for ep in r.entry_points]
     entry_point_attention_count = sum(
         1 for ep in all_entry_points
         if any(f.severity in ("high", "medium") for f in _findings_within_entry_point(ep, all_findings))
     )
-    languages = sorted({r.language for r in results})
+    languages = sorted({r.language for r in app_results})
     methods_present = sorted(
         {m for r in all_routes for m in r.methods},
         key=lambda m: (_METHOD_ORDER.get(m, 99), m),
@@ -730,11 +837,14 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
     )
 
     route_ids = itertools.count(1)
-    groups_html = "".join(_render_group(r, target_path, route_ids) for r in results) or '<p class="no-findings">No supported language/framework detected in target.</p>'
+    groups_html = "".join(_render_group(r, target_path, route_ids) for r in app_results) or (
+        '<p class="no-findings">No application framework detected -- see the Infrastructure tab.</p>' if results
+        else '<p class="no-findings">No supported language/framework detected in target.</p>')
     item_ids = itertools.count(1)
     entry_points_tab_html = _render_entry_points_tab(results, target_path, item_ids)
     auth_tab_html = _render_auth_tab(results, target_path, item_ids)
     findings_tab_html = _render_findings_tab(results, target_path, item_ids)
+    infra_tab_html = _render_infra_tab(results, target_path, item_ids)
 
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
     # Namespaces this report's "reviewed" checklist in localStorage so two
@@ -786,7 +896,7 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
       <button id="collapse-all" type="button">Collapse all</button>
       <label class="hide-reviewed-toggle"><input type="checkbox" id="hide-reviewed"> Hide reviewed</label>
       <button id="reset-reviewed" type="button">Reset reviewed</button>
-      <button id="download-sarif" type="button" title="Download the Findings tab items as SARIF (route-tied findings already have a fuller view on their route card, and Authentication tab items already have their own reviewed checkboxes) -- open in VS Code's SARIF Viewer extension, or upload to GitHub Code Scanning, to triage them one by one">Download SARIF</button>
+      <button id="download-sarif" type="button" title="Download the Findings and Infrastructure tab items as SARIF (route-tied findings already have a fuller view on their route card, and Authentication tab items already have their own reviewed checkboxes) -- open in VS Code's SARIF Viewer extension, or upload to GitHub Code Scanning, to triage them one by one">Download SARIF</button>
     </div>
   </header>
 
@@ -802,6 +912,9 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
     </button>
     <button class="tab-button" id="tab-btn-findings" data-tab="findings" type="button" title="{general_attention_count} needing attention (high/medium) of {len(general_findings)} total finding{"s" if len(general_findings) != 1 else ""}">
       Findings <span class="tab-count{" tab-count-warn" if general_attention_count else ""}">{general_attention_count}</span>
+    </button>
+    <button class="tab-button" id="tab-btn-infra" data-tab="infra" type="button" title="{infra_attention_count} needing attention (high/medium) of {len(infra_findings)} infrastructure/crypto finding{"s" if len(infra_findings) != 1 else ""}">
+      Infrastructure <span class="tab-count{" tab-count-warn" if infra_attention_count else ""}">{infra_attention_count}</span>
     </button>
   </nav>
 
@@ -854,6 +967,12 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
   <div class="tab-panel" id="tab-panel-findings" data-tab="findings" hidden>
     <main class="content auth-content">
       {findings_tab_html}
+    </main>
+  </div>
+
+  <div class="tab-panel" id="tab-panel-infra" data-tab="infra" hidden>
+    <main class="content auth-content">
+      {infra_tab_html}
     </main>
   </div>
 </div>
@@ -1190,6 +1309,24 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   color: var(--text-muted); border: 1px solid var(--border); border-radius: 3px; padding: 0 5px;
 }
 .finding-snippet { margin-top: 8px; }
+.finding-isr {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.04em;
+  color: var(--accent); border: 1px solid var(--accent); border-radius: 3px; padding: 0 5px;
+}
+.isr-table td, .isr-table th { text-align: left; }
+.isr-row { cursor: pointer; }
+.isr-row:hover td, .isr-row:focus-visible td { background: rgba(94, 200, 216, 0.08); }
+.isr-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.isr-row.isr-active td { background: rgba(94, 200, 216, 0.16); }
+.isr-row.isr-empty td { color: var(--text-muted); }
+.isr-code { font-weight: 600; white-space: nowrap; }
+.isr-count { text-align: center !important; width: 52px; }
+.isr-count.sev-high { color: var(--sev-high); }
+.isr-count.sev-medium { color: var(--sev-medium); }
+.isr-count.sev-low { color: var(--sev-low); }
+.isr-total { font-weight: 600; width: 64px; }
+.isr-none { font-weight: 400; font-style: italic; }
+.finding.isr-hidden { display: none; }
 .finding.reviewed .finding-snippet { display: none; }
 .finding-desc { margin: 0; color: var(--text-muted); font-size: 12.5px; }
 .no-findings { color: var(--text-muted); font-size: 12.5px; font-style: italic; margin: 0; }

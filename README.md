@@ -67,7 +67,7 @@ Security-tab alerts, or open it in VS Code's SARIF Viewer extension.
 ### `--html`: the interactive report
 
 Writes a single self-contained HTML file (no external assets, so it opens
-fine offline), split into four tabs:
+fine offline), split into five tabs:
 
 - **Routes** -- one collapsible card per route, syntax-highlighted.
   Expanding a card shows the full handler source with line numbers, an
@@ -104,8 +104,19 @@ fine offline), split into four tabs:
   PL/SQL finding). Each card shows the flagged line with 2 lines of
   context either side, plus a "review" badge when the check itself marks
   the finding as needing manual verification (`Finding.confidence`).
-- **Download SARIF** button (topbar) -- exports just the Findings tab's own
-  contents (route-tied findings already have a richer view on their own
+- **Infrastructure** -- infrastructure-as-code and crypto findings
+  (`infra/*` and `crypto/*` results: Terraform, GitLab CI, IAM/resource
+  policy JSON, shell scripts, sensitive committed files, Java/Bouncy Castle
+  FIPS, PHP key generation), one section per artifact type. Headed by an
+  **OWASP Top 10 Infrastructure Security Risks (2024)** coverage table
+  (ISR01-ISR10 x severity, counting every categorised finding in the scan
+  including Lambda); click a row to filter the tab to that category. A
+  category with no hits says "manual" rather than implying a pass. Each
+  finding carries an ISR badge (`core/owasp_isr.py`), also exported as a
+  SARIF rule tag and as `category` in JSON. See `languages/infra/README.md`
+  and `languages/crypto/README.md`.
+- **Download SARIF** button (topbar) -- exports the Findings and
+  Infrastructure tabs' contents (route-tied findings already have a richer view on their own
   card, and `AUTH-*` project-wide findings already have their own reviewed
   checkboxes in the Authentication tab, so including either here would just
   be re-triaging the same finding twice in two views). Uses a native
@@ -136,6 +147,8 @@ core/
   paths.py                     path-param extraction + mount-prefix resolution (shared)
   bodyscan.py                  regex scan for request.X/req.X field reads (shared)
   allowlist.py                 --allow-path glob suppression of AUTH-001
+  rulescan.py                  line-regex rule engine + comment masking for the file-oriented (no-route) analyzers
+  owasp_isr.py                 check id -> OWASP Top 10 Infrastructure Security Risks (2024) category
 checks/                    heuristics that build Finding objects from Route data
   idor.py                    IDOR-001 -- id-like path or query/body params (all languages)
   auth.py                    AUTH-001..006 -- auth coverage + infrastructure (AUTH-001 all languages, 002-006 Spring only so far)
@@ -147,7 +160,16 @@ checks/                    heuristics that build Finding objects from Route data
   binding.py                      MASS-001/SORT-001 -- request-binding shape checks (Spring only)
   sqli.py                          SQLI-001 -- SQL/JPQL built via string concatenation (Spring only)
   aop.py                            PROXY-001 -- AOP proxy self-invocation bypass (Spring only)
-  plsql.py                           Oracle PL/SQL rule engine (INJ/EXC/AUTHZ/CRED/NET/CRYPTO/PRIV/... -- see languages/sql/README.md)languages/<lang>/
+  plsql.py                           Oracle PL/SQL rule engine (INJ/EXC/AUTHZ/CRED/NET/CRYPTO/PRIV/... -- see languages/sql/README.md)
+  hcl.py                             dependency-free, line-accurate HCL block parser + jsonencode()/heredoc policy loader
+  terraform.py                       TF-* -- AWS Terraform misconfigurations, supply chain, state, inline policies
+  iam_policy.py                      POL-* -- IAM/resource/trust policy rules (shared by .json files and Terraform)
+  gitlab_ci.py                       GL-* -- GitLab CI pipelines (debug trace, includes, images, apply gates, plan artifacts)
+  shell.py                           SH-* -- shell/wrapper scripts (also applied to CI script lines)
+  repo_files.py                      REPO-* -- state files, keys, plans, .env in the tree
+  secrets.py                         SECRET-* -- hardcoded credentials / default passwords (shared)
+  crypto.py                          JC-*/JC-FIPS-*/PHP-* -- Java JCA + Bouncy Castle FIPS, PHP OpenSSL/key generation
+  aws_lambda.py                      LMB-* -- Python Lambda handlers: event taint -> sinks, config checkslanguages/<lang>/
   README.md                 what this language's analyzer(s) check, and what's still manual -- READ THIS FIRST when reviewing a codebase in this language
   detector.py               detect_language() / detect_frameworks() for that language
   <framework>_analyzer.py    route extraction + baseline checks for one framework
@@ -156,7 +178,8 @@ tests/                     pytest suite -- pure-logic unit tests + one integrati
 ```
 
 Currently implemented (route extraction + baseline checks):
-- **python**: flask, fastapi, django
+- **python**: flask, fastapi, django, aws_lambda (handlers as entry points,
+  event-taint into sinks)
 - **java**: spring
 - **javascript**: express, nextjs, hono
 - **go**: gin, net_http
@@ -165,6 +188,10 @@ Currently implemented (route extraction + baseline checks):
 - **sql**: plsql (Oracle). No routes: every finding is project-wide and
   goes in the Findings tab. T-SQL/PL/pgSQL files are detected but have no
   analyzer yet.
+- **infra** (no routes, Infrastructure tab): terraform, gitlab_ci,
+  iam_policy, shell, repo_files -- see `languages/infra/README.md`.
+- **crypto** (no routes, Infrastructure tab): java (JCA + Bouncy Castle
+  FIPS), php -- see `languages/crypto/README.md`.
 
 **Every `languages/<lang>/README.md` is the fast reference for that
 language** -- exactly which checks run, exactly what triggers each one, and

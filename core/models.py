@@ -177,6 +177,10 @@ class Finding:
     # IMMEDIATE argument); None for checks that don't make that distinction.
     # Rendered as a badge in the HTML report, carried into JSON/SARIF.
     confidence: Optional[str] = None
+    # OWASP Top 10 Infrastructure Security Risks label (e.g. "ISR05:2024
+    # Insecure Use of Cryptography") -- set for infra/crypto/lambda checks
+    # via core/owasp_isr.py; None for the application-route checks.
+    category: Optional[str] = None
 
 
 @dataclass

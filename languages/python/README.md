@@ -1,4 +1,4 @@
-# Python: flask, fastapi, django
+# Python: flask, fastapi, django, aws_lambda
 
 Route extraction uses the stdlib `ast` module (no dependency). Shared
 decorator/call-parsing helpers live in `_ast_utils.py`.
@@ -90,6 +90,47 @@ ever treating it as a route.
   route** -- not derived from the actual view logic, so AUTH-001's
   sensitive-method severity scoring is only ever approximate here, never
   refined per-view.
+
+## AWS Lambda (`aws_lambda`)
+
+Detected from source, not the manifest: any `.py` with a
+`def x(event, context)` handler (a Lambda is often a lone file with no
+requirements.txt, and can live next to a Flask/Django app). Implemented in
+`lambda_analyzer.py` + `checks/aws_lambda.py`.
+
+Handlers are listed as **Entry Points** (kind `LambdaHandler`, with a
+best-guess trigger -- API Gateway / S3 / SQS / SNS / EventBridge -- from the
+event keys the handler reads), not Routes: the HTTP path, if any, lives in
+API Gateway / function-URL config. LMB findings show up in the Findings tab,
+correlated onto their handler's card, and count toward the OWASP ISR
+coverage table in the Infrastructure tab.
+
+Taint: names derived from `event` are followed through assignments, loops,
+`with`, f-strings, and into helper functions in the **same module** (the
+helper's parameter becomes tainted). Sinks:
+
+| id | what |
+|---|---|
+| LMB-001 | event data -> `os.system`/`subprocess(shell=True)` (high); shell with any non-literal (REVIEW) |
+| LMB-002 | `eval`/`exec`/`compile` |
+| LMB-003 | `pickle`/`marshal`/`dill`/`jsonpickle`, `yaml.load` without SafeLoader |
+| LMB-004 | SQL built with f-strings/`%`/`+`/`.format` (high when tainted) |
+| LMB-005 | event data -> outbound request URL (SSRF, incl. the Lambda runtime API / VPC services) |
+| LMB-006 | event data -> filesystem path (`/tmp` is shared across warm invocations) |
+| LMB-016 | event data chooses the `RoleArn` for `sts.assume_role` |
+
+Configuration-style (no taint needed): LMB-007 whole event logged
+(headers/tokens into CloudWatch); LMB-008 `verify=False`; LMB-009 requests
+without `timeout`; LMB-010 md5/sha1, `random` in token-generating code;
+LMB-011 secrets read from env vars; LMB-012 `str(e)`/tracebacks returned to
+the caller; LMB-013 `ACL="public-read"`; LMB-014 static boto3 keys; LMB-015
+`Access-Control-Allow-Origin: *`; LMB-017 fixed `/tmp` paths; LMB-018
+presigned URLs valid > 24h. Plus SECRET-xxx.
+
+Not followed: attributes on objects, data from other modules / layers,
+values round-tripped through S3/DynamoDB. The Terraform side of the same
+function (runtime, env vars, function URL auth, invoke permissions) is
+checked by `infra/terraform` (TF-LMB-xxx).
 
 ## What still needs a human
 
