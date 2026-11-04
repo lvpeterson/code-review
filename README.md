@@ -170,7 +170,8 @@ checks/                    heuristics that build Finding objects from Route data
   secrets.py                         SECRET-* -- hardcoded credentials / default passwords (shared)
   crypto.py                          JC-*/JC-FIPS-*/PHP-* -- Java JCA + Bouncy Castle FIPS, PHP OpenSSL/key generation
   java_crypto_ast.py                 javalang pass for JC-* -- resolves constants, fields, locals, call-site args to each crypto sink
-  aws_lambda.py                      LMB-* -- Python Lambda handlers: event taint -> sinks, config checkslanguages/<lang>/
+  aws_lambda.py                      LMB-* -- Python Lambda handlers: event taint -> sinks, config checks
+languages/<lang>/
   README.md                 what this language's analyzer(s) check, and what's still manual -- READ THIS FIRST when reviewing a codebase in this language
   detector.py               detect_language() / detect_frameworks() for that language
   <framework>_analyzer.py    route extraction + baseline checks for one framework
