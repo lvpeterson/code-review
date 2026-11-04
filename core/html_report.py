@@ -606,6 +606,7 @@ _INFRA_SECTION_TITLES = {
     ("infra", "iam_policy"): "IAM / resource policy documents (JSON)",
     ("infra", "shell"): "Shell scripts",
     ("infra", "repo_files"): "Sensitive files in the tree",
+    ("infra", "dependencies"): "Vulnerable dependencies (osv-scanner)",
     ("crypto", "java"): "Cryptography: Java / Bouncy Castle FIPS",
     ("crypto", "php"): "Cryptography: PHP",
 }

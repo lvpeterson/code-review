@@ -49,6 +49,8 @@ _EXACT = {
     "TF-IAM-005": "ISR07",
     "TF-SUP-004": "ISR10",
     "TF-NET-005": "ISR03",
+    "TF-ECS-002": "ISR08", "TF-CB-002": "ISR08", "TF-DB-010": "ISR03", "TF-IAM-006": "ISR07",
+    "GL-TF-004": "ISR07", "LMB-019": "ISR04",
     # IAM policy documents
     "POL-005": "ISR09", "POL-008": "ISR05", "POL-009": "ISR07", "POL-010": "ISR07", "POL-011": "ISR03",
     # GitLab CI
@@ -76,6 +78,7 @@ _EXACT = {
 _PREFIX = [
     ("TF-NET-", "ISR06"), ("TF-ENC-", "ISR05"), ("TF-KMS-", "ISR05"), ("TF-TLS-", "ISR05"),
     ("TF-LOG-", "ISR02"), ("TF-SUP-", "ISR01"), ("TF-ASSET-", "ISR10"),
+    ("TF-ECS-", "ISR03"), ("TF-CB-", "ISR03"), ("TF-OIDC-", "ISR07"), ("SCA-", "ISR01"),
     ("POL-", "ISR04"), ("SECRET-", "ISR07"), ("GL-IMG-", "ISR01"), ("GL-INC-", "ISR01"),
     ("GL-TF-", "ISR03"), ("JC-", "ISR05"), ("PHP-", "ISR05"), ("LMB-", "ISR03"),
 ]

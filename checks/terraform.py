@@ -11,9 +11,12 @@ Runs over every .tf / .tfvars / .hcl file. Three layers:
      JSON, and data "aws_iam_policy_document" -- is converted to IAM JSON
      shape and run through checks/iam_policy.py (POL-xxx).
 
-Attribute checks only see literal values. `acl = var.bucket_acl` isn't
-resolved, so a variable that defaults to "public-read" is missed -- check
-variable defaults / tfvars by hand when a rule's subject is a variable.
+Before any rule runs, checks/tf_resolve.py substitutes var./local./module
+input references with the values they resolve to (tfvars > calling module >
+default), so `acl = var.bucket_acl` with a "public-read" default is caught;
+the finding text says where the value came from. checks/tf_graph.py adds
+the cross-resource model (role permissions, GitLab OIDC trust, Lambda ->
+role) used by the TF-OIDC rules here and by the Lambda / GitLab analyzers.
 """
 from __future__ import annotations
 
@@ -22,9 +25,9 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Optional
 
-from checks import iam_policy, secrets
-from checks.hcl import Attr, Block, expr_to_py, load_policy_value, parse_hcl
-from core.fsutil import _SKIP_DIRS, read_text_safe
+from checks import iam_policy, secrets, tf_graph
+from checks.hcl import Attr, Block, load_policy_value
+from checks.tf_graph import iter_tf_files  # noqa: F401  (re-exported for callers)
 from core.models import Finding
 from core.rulescan import LineRule, make_finding, rel, scan_text
 
@@ -70,6 +73,7 @@ class _Ctx:
     def add(self, block: Block, check_id: str, severity: str, title: str, note: str,
             line: Optional[int] = None, confidence: Optional[str] = None) -> None:
         name = ".".join(block.labels)
+        note += _resolution_note(block, line or block.line, title + " " + note)
         self.findings.append(make_finding(
             check_id, severity, f"{title} [{name}]" if name else title, note,
             rel(block.file, self.root), line or block.line, confidence,
@@ -92,30 +96,32 @@ class _Ctx:
         return out
 
 
-def iter_tf_files(root: Path):
-    for path in root.rglob("*"):
-        if not path.is_file() or any(p in _SKIP_DIRS or p == ".terraform" for p in path.parts):
-            continue
-        if path.suffix in TF_EXTENSIONS or path.name.endswith(".tfvars.json"):
-            yield path
+def _resolution_note(block: Block, line: int, text: str) -> str:
+    """' Value resolved: acl = var.bucket_acl -> "public-read" (terraform.tfvars:3).'
+    for resolved attributes on the finding's line or named in its text."""
+    named, on_line = [], []
+    for b in block.walk():
+        nested_here = b is not block and b.line == line   # finding points at a nested block (ingress {...})
+        for a in b.attrs.values():
+            if a.raw is None:
+                continue
+            note = f"`{a.name} = {' '.join(a.raw.split())[:50]}` resolves via {a.via}"
+            if re.search(rf"\b{re.escape(a.name)}\b", text):
+                named.append(note)
+            elif a.line == line or nested_here:
+                on_line.append(note)
+    hits = named or on_line
+    return (" Value resolved: " + " | ".join(hits[:2]) + ".") if hits else ""
 
 
 def scan_project(root: Path) -> list[Finding]:
+    proj = tf_graph.load(root)
     ctx = _Ctx(root)
-    texts: dict[Path, str] = {}
-    for path in iter_tf_files(root):
-        text = read_text_safe(path)
-        texts[path] = text
-        if path.suffix == ".tf":
-            ctx.dirs_with_tf.add(path.parent)
-        if path.suffix in (".tf", ".hcl"):
-            for b in parse_hcl(text, path):
-                ctx.blocks.append(b)
-                if b.kind in ("resource", "data") and b.labels:
-                    key = b.labels[0] if b.kind == "resource" else f"data.{b.labels[0]}"
-                    ctx.by_type[key].append(b)
-                else:
-                    ctx.by_type[b.kind].append(b)
+    ctx.proj = proj
+    texts = proj.texts
+    ctx.dirs_with_tf = set(proj.tf_dirs)
+    ctx.blocks = proj.blocks
+    ctx.by_type = proj.by_type
 
     for b in ctx.blocks:
         if b.kind == "resource" and b.labels:
@@ -669,7 +675,125 @@ def _subnet(ctx: _Ctx, b: Block) -> None:
                 "Everything launched here gets a public IP by default.", _line(b, "map_public_ip_on_launch"))
 
 
+def _container_defs(b: Block) -> list[dict]:
+    a = b.attr("container_definitions")
+    if not a:
+        return []
+    from checks.hcl import expr_to_py, heredoc_body
+    v = a.value.strip()
+    data = expr_to_py(v) if v.startswith(("jsonencode", "[")) else None
+    if data is None:
+        body = heredoc_body(v)
+        if body is not None:
+            data = iam_policy._parse_jsonish(body)
+    if data is None:
+        fp = tf_graph._file_path(v, b.file.parent.resolve())
+        if fp is not None and fp.is_file():
+            data = iam_policy._parse_jsonish(fp.read_text(encoding="utf-8", errors="replace"))
+    return [c for c in data if isinstance(c, dict)] if isinstance(data, list) else []
+
+
+def _ecs_task(ctx: _Ctx, b: Block) -> None:
+    line = _line(b, "container_definitions")
+    for c in _container_defs(b):
+        cname = c.get("name", "?")
+        if c.get("privileged") is True:
+            ctx.add(b, "TF-ECS-001", "high", f"ECS container '{cname}' runs privileged",
+                    "A privileged container has full access to the host's devices and kernel capabilities; "
+                    "an RCE in it is a host (and on EC2, instance-role) compromise.", line)
+        env_names = [e.get("name", "") for e in c.get("environment", []) or [] if isinstance(e, dict)]
+        secretish = [n for n in env_names if _SECRETISH_NAME.search(str(n))]
+        if secretish:
+            ctx.add(b, "TF-ECS-002", "medium", f"Secret-looking plaintext env vars in ECS container '{cname}': "
+                    + ", ".join(secretish[:4]),
+                    "`environment` values are visible to anyone with ecs:DescribeTaskDefinition and are stored in "
+                    "state. Use the container `secrets` block (valueFrom Secrets Manager / SSM SecureString).", line)
+    if _lit(b, "network_mode") == "host" or _lit(b, "pid_mode") == "host":
+        ctx.add(b, "TF-ECS-003", "medium", "ECS task shares the host network/PID namespace",
+                "network_mode/pid_mode = \"host\" removes container isolation from the host's network "
+                "stack or processes.", _line(b, "network_mode") if b.attr("network_mode") else _line(b, "pid_mode"))
+
+
+def _codebuild(ctx: _Ctx, b: Block) -> None:
+    env = b.block("environment")
+    if env is None:
+        return
+    if _bool(env, "privileged_mode") is True:
+        ctx.add(b, "TF-CB-001", "low", "CodeBuild project runs in privileged mode",
+                "Needed for Docker builds, but a malicious build (e.g. from a pull request source) gets "
+                "root on the build host. Restrict which sources/branches can trigger it.",
+                _line(env, "privileged_mode"), confidence="REVIEW")
+    for ev in env.blocks("environment_variable"):
+        name = _lit(ev, "name") or ""
+        vtype = _lit(ev, "type") or "PLAINTEXT"
+        if vtype == "PLAINTEXT" and _SECRETISH_NAME.search(name) and _lit(ev, "value"):
+            ctx.add(b, "TF-CB-002", "medium", f"CodeBuild plaintext environment variable '{name}'",
+                    "PLAINTEXT values are visible in the console/API and state. Use type = "
+                    "\"SECRETS_MANAGER\" or \"PARAMETER_STORE\".", ev.line)
+
+
+def _efs(ctx: _Ctx, b: Block) -> None:
+    if _bool(b, "encrypted") is not True:
+        ctx.add(b, "TF-ENC-003", "medium", "EFS file system not encrypted at rest",
+                "Set encrypted = true (with kms_key_id). Encryption can't be added after creation.")
+
+
+def _kinesis(ctx: _Ctx, b: Block) -> None:
+    if _lit(b, "encryption_type") != "KMS":
+        ctx.add(b, "TF-ENC-004", "low", "Kinesis stream not encrypted with KMS",
+                "Set encryption_type = \"KMS\" and kms_key_id.")
+
+
+def _firehose(ctx: _Ctx, b: Block) -> None:
+    if _bool(b.block("server_side_encryption"), "enabled") is not True:
+        ctx.add(b, "TF-ENC-004", "low", "Firehose delivery stream without server-side encryption",
+                "Add server_side_encryption { enabled = true }.")
+
+
+def _dynamodb(ctx: _Ctx, b: Block) -> None:
+    if _bool(b.block("point_in_time_recovery"), "enabled") is not True:
+        ctx.add(b, "TF-DB-010", "low", "DynamoDB point-in-time recovery disabled",
+                "Without PITR, a bad write or delete can't be rolled back.")
+
+
+def _sfn(ctx: _Ctx, b: Block) -> None:
+    lc = b.block("logging_configuration")
+    if lc is None or (_lit(lc, "level") or "OFF") == "OFF":
+        ctx.add(b, "TF-LOG-009", "low", "Step Functions state machine logging off",
+                "Set logging_configuration { level = \"ERROR\" (or ALL), log_destination = ... }.",
+                lc.line if lc else None)
+
+
+def _iam_role(ctx: _Ctx, b: Block) -> None:
+    a = b.attr("max_session_duration")
+    n = a.as_number() if a else None
+    if n is not None and n > 3600:
+        ctx.add(b, "TF-IAM-006", "low", f"Role sessions last up to {int(n // 3600)}h",
+                "Stolen session credentials stay valid for the whole window. Keep federated/CI role "
+                "sessions at the 1h default unless a job genuinely needs longer.", a.line)
+
+
+def _oidc_provider(ctx: _Ctx, b: Block) -> None:
+    url = _lit(b, "url") or ""
+    if url.startswith("http://"):
+        ctx.add(b, "TF-OIDC-002", "high", "OIDC provider configured over plain HTTP",
+                "Token signing keys are fetched without TLS -- an attacker on the path can supply their "
+                "own keys and mint tokens for any role trusting this provider.", _line(b, "url"))
+    if "*" in _list_literals(b.attr("client_id_list")):
+        ctx.add(b, "TF-OIDC-002", "medium", "OIDC provider accepts any audience",
+                "client_id_list contains \"*\". Pin the expected audience(s).", _line(b, "client_id_list"))
+
+
 _RESOURCE_CHECKS: dict[str, Callable[[_Ctx, Block], None]] = {
+    "aws_ecs_task_definition": _ecs_task,
+    "aws_codebuild_project": _codebuild,
+    "aws_efs_file_system": _efs,
+    "aws_kinesis_stream": _kinesis,
+    "aws_kinesis_firehose_delivery_stream": _firehose,
+    "aws_dynamodb_table": _dynamodb,
+    "aws_sfn_state_machine": _sfn,
+    "aws_iam_role": _iam_role,
+    "aws_iam_openid_connect_provider": _oidc_provider,
     "aws_s3_bucket": _s3_bucket,
     "aws_s3_bucket_acl": _s3_bucket_acl,
     "aws_s3_bucket_public_access_block": _s3_pab,
@@ -755,35 +879,9 @@ def _check_resource_policies(ctx: _Ctx, b: Block) -> None:
 
 
 def _check_policy_document_data(ctx: _Ctx, b: Block) -> None:
-    sts, lines = [], []
-    for s in b.blocks("statement"):
-        stmt: dict = {"Effect": (_lit(s, "effect") or "Allow").capitalize()}
-        for tf_name, key in (("actions", "Action"), ("not_actions", "NotAction"),
-                             ("resources", "Resource"), ("not_resources", "NotResource")):
-            if s.attr(tf_name):
-                v = expr_to_py(s.attr(tf_name).value)
-                stmt[key] = v if isinstance(v, list) else _list_literals(s.attr(tf_name)) or ["${ref}"]
-        principals: dict[str, list] = {}
-        for p in s.blocks("principals"):
-            ptype = _lit(p, "type") or "AWS"
-            ids = expr_to_py(p.attr("identifiers").value) if p.attr("identifiers") else []
-            principals.setdefault(ptype if ptype != "*" else "AWS", []).extend(ids if isinstance(ids, list) else ["${ref}"])
-        if principals:
-            stmt["Principal"] = principals
-        cond: dict[str, dict] = {}
-        for c in s.blocks("condition"):
-            test = _lit(c, "test") or "StringEquals"
-            var = _lit(c, "variable") or "unknown"
-            vals = expr_to_py(c.attr("values").value) if c.attr("values") else []
-            cond.setdefault(test, {})[var] = vals if isinstance(vals, list) else ["${ref}"]
-        if cond:
-            stmt["Condition"] = cond
-        sts.append(stmt)
-        lines.append(s.line)
-    if not sts:
-        return
-    doc = {"Version": _lit(b, "version") or "2012-10-17", "Statement": sts}
-    _emit_policy_issues(ctx, b, doc, b.line, lines)
+    doc, lines = tf_graph.policy_doc_from_data(b)
+    if doc is not None:
+        _emit_policy_issues(ctx, b, doc, b.line, lines)
 
 
 def _check_provisioners(ctx: _Ctx, b: Block) -> None:
@@ -876,9 +974,27 @@ def _check_module(ctx: _Ctx, b: Block) -> None:
                 "Every init may pull a newer, unreviewed release. Add version = \"x.y.z\".", src_attr.line)
 
 
+# Names that mention a secret but hold metadata about it (ARNs, ids, policy
+# settings, flags), checked on a word basis: minimum_password_length,
+# task_exec_secret_arns, create_access_key, iam_access_key_id...
+_NOT_A_SECRET_NAME = re.compile(
+    r"(?i)(?:^|_|(?<=[a-z])(?=[A-Z]))(?:arns?|ids?|fingerprint|status|encrypted|policy|policies|expire\w*|length|age|"
+    r"reuse|prevention|rotation|ttl|version|names?|paths?|specs?|type|kms|count|days|reset|required|enabled|"
+    r"recovery|window|identifier|source|location|ref|uri|url|header|parameter|wo_version)(?:_|$|(?=[A-Z]))"
+    r"|^(?:create|allow|enable|manage|use|include|attach|rotate|generate|is|has|should|max|min|minimum|maximum)_")
+
+
+def _secret_name(name: str) -> bool:
+    return bool(_SECRETISH_NAME.search(name)) and not _NOT_A_SECRET_NAME.search(name)
+
+
 def _check_variable(ctx: _Ctx, b: Block) -> None:
     name = b.labels[0] if b.labels else ""
-    if not _SECRETISH_NAME.search(name):
+    if not _secret_name(name):
+        return
+    vtype = (b.attr("type").value.strip() if b.attr("type") else "")
+    dflt = b.attr("default").value.strip() if b.attr("default") else ""
+    if vtype in ("bool", "number") or re.fullmatch(r"true|false|-?\d+(?:\.\d+)?", dflt):
         return
     if _bool(b, "sensitive") is not True:
         ctx.add(b, "TF-VAR-001", "low", f"Secret-looking variable '{name}' not marked sensitive",
@@ -893,8 +1009,8 @@ def _check_variable(ctx: _Ctx, b: Block) -> None:
 def _check_output(ctx: _Ctx, b: Block) -> None:
     name = b.labels[0] if b.labels else ""
     value = b.attr("value").value if b.attr("value") else ""
-    if (_SECRETISH_NAME.search(name) or re.search(r"\.(password|secret|private_key|secret_string|token|"
-                                                    r"secret_access_key|private_key_pem)\b", value)) \
+    if (_secret_name(name) or re.search(r"\.(password|secret|private_key|secret_string|token|"
+                                        r"secret_access_key|private_key_pem|ses_smtp_password_v4)\b", value)) \
             and _bool(b, "sensitive") is not True:
         ctx.add(b, "TF-VAR-003", "medium", f"Output '{name}' exposes a secret without sensitive = true",
                 "The value is printed in apply output / CI logs and returned by `terraform output`.")
@@ -954,22 +1070,71 @@ def _detection_checks(ctx: _Ctx) -> None:
             ))
 
 
+def _waf_checks(ctx: _Ctx) -> None:
+    """Internet-facing ALBs / API stages with no WAF association."""
+    assoc_text = " ".join((a.attr("resource_arn").value if a.attr("resource_arn") else "")
+                          for a in ctx.by_type.get("aws_wafv2_web_acl_association", []) +
+                          ctx.by_type.get("aws_wafregional_web_acl_association", []))
+    targets = [b for t in ("aws_lb", "aws_alb") for b in ctx.by_type.get(t, [])
+               if (_lit(b, "load_balancer_type") or "application") == "application" and _bool(b, "internal") is not True]
+    targets += ctx.by_type.get("aws_api_gateway_stage", [])
+    for b in targets:
+        if len(b.labels) > 1 and f"{b.labels[0]}.{b.labels[1]}." not in assoc_text:
+            ctx.add(b, "TF-NET-008", "low", "Internet-facing endpoint without a WAF web ACL",
+                    "No aws_wafv2_web_acl_association targets this resource. Confirm WAF is applied "
+                    "elsewhere (Firewall Manager, another stack) if the endpoint takes untrusted traffic.",
+                    confidence="REVIEW")
+    for b in ctx.by_type.get("aws_cloudfront_distribution", []):
+        if not b.attr("web_acl_id"):
+            ctx.add(b, "TF-NET-008", "low", "CloudFront distribution without a WAF web ACL",
+                    "Set web_acl_id if the distribution fronts an application.", confidence="REVIEW")
+
+
+def _gitlab_trust_checks(ctx: _Ctx) -> None:
+    root = ctx.root
+    for t in ctx.proj.gitlab_trusts:
+        r = t.role
+        if not t.subs:
+            continue  # POL-009 (high) already reports "no sub condition"
+        if not (t.any_ref or t.any_project):
+            continue
+        scope = "any project in the matched group/instance" if t.any_project else "any branch or merge request of the project"
+        sev = "high" if (r.privileged or r.can_write) else "medium"
+        perms = r.summary(root)
+        ctx.add(r.block, "TF-OIDC-001", sev, f"GitLab OIDC role assumable from {scope}",
+                f"Trust `sub` = {', '.join(t.subs[:3])}. GitLab issues id_tokens to every pipeline, including "
+                "ones for unprotected branches and merge requests, so anyone who can push a branch can run a "
+                "job that assumes this role. What they get: " + perms + ". Pin `sub` to protected refs "
+                "(e.g. project_path:group/project:ref_type:branch:ref:main) and keep plan-only roles "
+                "read-only.")
+
+
 def _project_checks(ctx: _Ctx) -> None:
     _asset_checks(ctx)
     _detection_checks(ctx)
+    _waf_checks(ctx)
+    _gitlab_trust_checks(ctx)
     root_dirs: set[Path] = set()
     for b in ctx.blocks:
         if b.kind == "provider" or (b.kind == "terraform" and b.blocks("backend")):
             root_dirs.add(b.file.parent)
-    for d in sorted(root_dirs):
-        if not (d / ".terraform.lock.hcl").exists():
-            ctx.findings.append(make_finding(
-                "TF-SUP-004", "low", "No .terraform.lock.hcl committed for root module",
-                "Without the dependency lock file, provider binaries aren't checksum-pinned and "
-                "`terraform init` in CI may fetch different builds than were reviewed. Commit it "
-                "(and use `terraform init -lockfile=readonly` in CI).",
-                rel(d, ctx.root) if d != ctx.root else ".", 1,
-            ))
+    missing = [d for d in sorted(root_dirs) if not (d / ".terraform.lock.hcl").exists()]
+    if missing:
+        # One finding, not one per examples/ directory.
+        real = [d for d in missing if not {"examples", "example", "test", "tests", "fixtures"} & set(d.relative_to(ctx.root).parts)] \
+            if all(d.is_relative_to(ctx.root) for d in missing) else missing
+        listed = real or missing
+        names = ", ".join((rel(d, ctx.root) if d != ctx.root else ".") for d in listed[:6])
+        ctx.findings.append(make_finding(
+            "TF-SUP-004", "low" if real else "info",
+            f"No .terraform.lock.hcl committed for {len(listed)} root module(s)"
+            + ("" if real else " (examples/tests only)"),
+            "Without the dependency lock file, provider binaries aren't checksum-pinned and "
+            "`terraform init` in CI may fetch different builds than were reviewed. Commit it "
+            f"(and use `terraform init -lockfile=readonly` in CI). Missing in: {names}"
+            + (f" (+{len(listed) - 6} more)" if len(listed) > 6 else "") + ".",
+            rel(listed[0], ctx.root) if listed[0] != ctx.root else ".", 1,
+        ))
 
 
 _TF_LINE_RULES = [

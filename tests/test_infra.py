@@ -508,9 +508,10 @@ def test_python_detector_reports_lambda_without_manifest(tmp_path):
 
 def test_every_new_rule_id_has_an_owasp_isr_category():
     ids = set()
-    for name in ("terraform", "iam_policy", "gitlab_ci", "shell", "crypto", "aws_lambda", "repo_files", "secrets"):
+    for name in ("terraform", "iam_policy", "gitlab_ci", "shell", "crypto", "aws_lambda", "repo_files", "secrets",
+                 "java_crypto_ast", "tf_graph", "sca"):
         text = (Path(__file__).parent.parent / "checks" / f"{name}.py").read_text(encoding="utf-8")
-        ids |= set(re.findall(r'"((?:TF|POL|GL|SH|JC|PHP|LMB|REPO|SECRET)-[A-Z0-9-]*\d)"', text))
+        ids |= set(re.findall(r'"((?:TF|POL|GL|SH|JC|PHP|LMB|REPO|SECRET|SCA)-[A-Z0-9-]*\d)"', text))
     assert len(ids) > 100
     missing = sorted(i for i in ids if isr_for(i) is None)
     assert missing == []

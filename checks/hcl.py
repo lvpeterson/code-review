@@ -29,8 +29,10 @@ _HEREDOC = re.compile(r"<<-?\s*([A-Za-z_]\w*)")
 @dataclass
 class Attr:
     name: str
-    value: str  # raw source text of the value (comments masked)
+    value: str  # source text of the value (comments masked); var/local refs substituted by tf_resolve
     line: int
+    raw: Optional[str] = None   # original text when tf_resolve substituted references
+    via: Optional[str] = None   # where the substituted value came from
 
     def literal(self) -> Optional[str]:
         """The string value if this is a plain "..." literal with no interpolation."""

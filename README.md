@@ -41,7 +41,12 @@ python main.py <target_path> --sarif report.sarif
 python main.py <target_path> --language python --framework flask   # skip detection
 python main.py <target_path> --allow-path "/health" --allow-path "/api/public/*"
 python main.py <target_path> --fail-on medium   # exit 1 if any medium+ finding exists (CI use)
+python main.py <target_path> --sca              # + known-vulnerable dependencies via osv-scanner (on PATH)
 ```
+
+`--sca` runs osv-scanner over the target's lockfiles/manifests and adds an
+SCA-001 finding per vulnerable package. It queries api.osv.dev with package
+names/versions; `--sca-offline` downloads the databases and matches locally.
 
 `--allow-path` (repeatable, glob-style) suppresses AUTH-001 on routes you've
 already confirmed are intentionally public -- health checks, login itself,
@@ -162,9 +167,13 @@ checks/                    heuristics that build Finding objects from Route data
   aop.py                            PROXY-001 -- AOP proxy self-invocation bypass (Spring only)
   plsql.py                           Oracle PL/SQL rule engine (INJ/EXC/AUTHZ/CRED/NET/CRYPTO/PRIV/... -- see languages/sql/README.md)
   hcl.py                             dependency-free, line-accurate HCL block parser + jsonencode()/heredoc policy loader
-  terraform.py                       TF-* -- AWS Terraform misconfigurations, supply chain, state, inline policies
+  terraform.py                       TF-* -- AWS Terraform misconfigurations, supply chain, state, inline policies, GitLab OIDC trust
+  tf_resolve.py                      substitutes var./local./module inputs (tfvars > caller > default) before TF rules run
+  tf_graph.py                        cached project model: role permissions, policy-file links, Lambda -> role, GitLab trust
   iam_policy.py                      POL-* -- IAM/resource/trust policy rules (shared by .json files and Terraform)
-  gitlab_ci.py                       GL-* -- GitLab CI pipelines (debug trace, includes, images, apply gates, plan artifacts)
+  gitlab_ci.py                       GL-* -- GitLab CI pipelines (debug trace, includes, images, apply gates, MR plans with creds)
+  gitlab_merge.py                    merges extends:/anchors/!reference/default:/local includes into each job's effective config
+  sca.py                             SCA-001 -- optional osv-scanner wrapper (--sca)
   shell.py                           SH-* -- shell/wrapper scripts (also applied to CI script lines)
   repo_files.py                      REPO-* -- state files, keys, plans, .env in the tree
   secrets.py                         SECRET-* -- hardcoded credentials / default passwords (shared)

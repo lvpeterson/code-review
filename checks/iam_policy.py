@@ -46,7 +46,8 @@ SENSITIVE_READ_ACTIONS = [
 ]
 
 _READ_ONLY_PREFIXES = ("get", "list", "describe", "head", "view", "lookup", "search", "batchget", "query", "scan", "select")
-_OIDC_HOSTS = re.compile(r"(?i)token\.actions\.githubusercontent\.com|gitlab|oidc|app\.terraform\.io|bitbucket")
+_OIDC_HOSTS = re.compile(r"(?i)token\.actions\.githubusercontent\.com|gitlab|oidc|openid_connect_provider|"
+                         r"app\.terraform\.io|bitbucket")
 
 
 @dataclass
@@ -370,8 +371,11 @@ def scan_policy_files(root):
     from core.fsutil import read_text_safe
     from core.rulescan import make_finding, rel
 
+    links = _terraform_links(root)
     findings = []
     for path in _iter_policy_candidates(root):
+        attached = links.get(path.resolve())
+        attached_note = (" Attached in Terraform via: " + "; ".join(attached[:3]) + ".") if attached else ""
         text = read_text_safe(path)
         if '"Statement"' not in text and "'Statement'" not in text:
             continue
@@ -397,10 +401,21 @@ def scan_policy_files(root):
                 if issue.statement_index >= 0:
                     sid_val = statements(doc)[issue.statement_index].get("Sid")
                     sid = f" [Sid {sid_val}]" if sid_val else ""
-                findings.append(make_finding(issue.id, issue.severity, issue.title + sid, issue.note,
+                findings.append(make_finding(issue.id, issue.severity, issue.title + sid, issue.note + attached_note,
                                              rel(path, root), line, issue.confidence))
             offset += n
     return findings
+
+
+def _terraform_links(root) -> dict:
+    """policy file -> Terraform resources that load it with file()/templatefile()."""
+    try:
+        from checks import tf_graph
+        if not any(True for _ in tf_graph.iter_tf_files(root)):
+            return {}
+        return tf_graph.load(root).policy_file_links
+    except Exception:
+        return {}
 
 
 def has_policy_files(root) -> bool:

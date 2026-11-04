@@ -127,6 +127,15 @@ the caller; LMB-013 `ACL="public-read"`; LMB-014 static boto3 keys; LMB-015
 `Access-Control-Allow-Origin: *`; LMB-017 fixed `/tmp` paths; LMB-018
 presigned URLs valid > 24h. Plus SECRET-xxx.
 
+**LMB-019** -- when the same repo deploys the function with Terraform, each
+handler file is matched to its `aws_lambda_function` (via `handler` +
+`archive_file` source_dir/source_file) and gets: the execution role's
+permissions (admin / privilege escalation / writes, from every attached
+policy), and its public triggers (function URL with no auth, invoke
+permission to `*`, API Gateway). That context is appended to every finding
+in the file, and LMB-019 is high when an admin-level role meets a
+high-severity code finding or a public trigger.
+
 Not followed: attributes on objects, data from other modules / layers,
 values round-tripped through S3/DynamoDB. The Terraform side of the same
 function (runtime, env vars, function URL auth, invoke permissions) is

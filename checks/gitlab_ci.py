@@ -5,10 +5,18 @@ than by loading YAML (which would lose line numbers), and the shared shell
 rules from checks/shell.py run over every line as well, since `script:`
 entries are just shell.
 
+Job inheritance (`extends:`, YAML anchors, `!reference`, `default:`,
+`include: local:`) is merged by checks/gitlab_merge.py before the job rules
+run; only templates from `include: project/remote/template/component`
+can't be seen, and findings that depend on them are marked REVIEW.
+
+GL-TF-004 ties the pipeline to the Terraform in the same repo: a job that
+runs terraform (directly or through a wrapper script) in pipelines for
+unprotected branches / merge requests, with cloud credentials, is matched to
+the IAM role it assumes and that role's GitLab trust policy and permissions
+(checks/tf_graph.py).
+
 Limitations worth remembering when reading the results:
-  * `extends:` / `!reference` / `include:`d templates are not merged in --
-    a job that inherits `when: manual` from a template will still be
-    flagged by GL-TF-001. Those findings are marked REVIEW.
   * Project / group CI/CD variable settings (masked, protected, environment
     scope) and protected-branch rules live in the GitLab UI, not the repo.
     They decide whether most of these findings are exploitable -- check
@@ -19,6 +27,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Optional
 from pathlib import Path
 
 from checks import secrets, shell
@@ -229,15 +238,112 @@ def _include_checks(masked: str, relative: str) -> list[Finding]:
     return findings
 
 
-def _job_checks(job: Job, relative: str) -> list[Finding]:
+_TF_RUN = re.compile(r"\b(?:terraform|tofu|terragrunt|gitlab-terraform)\s+(?:-chdir=\S+\s+)?(init|validate|plan|apply|destroy|import|refresh)\b")
+_SCRIPT_CALL = re.compile(r"(?:^|[\s;&|(])(?:bash\s+|sh\s+|\.\s+|source\s+)?((?:\.{0,2}/)?[\w.\-/]+\.sh)\b")
+_PROTECTED_IF = re.compile(
+    r"^\s*['\"]?\$CI_COMMIT_(?:BRANCH|REF_NAME)\s*==\s*(?:\$CI_DEFAULT_BRANCH|['\"](?:main|master|prod|production|release[\w/.-]*)['\"])['\"]?\s*$"
+    r"|CI_COMMIT_REF_PROTECTED\s*==\s*['\"]?true|^\s*['\"]?\$CI_COMMIT_TAG['\"]?\s*$")
+_MR_IF = re.compile(r"merge_request_event|CI_MERGE_REQUEST_|external_pull_request_event")
+
+
+def _rule_items(text: str) -> list[tuple[str, str]]:
+    """(if-expression, when) for each item of a `rules:` key."""
+    m = re.search(r"(?m)^(\s*)rules\s*:\s*$", text)
+    if not m:
+        return []
+    base = len(m.group(1))
+    items, cur = [], None
+    for ln in text[m.end():].split("\n")[1:]:
+        if ln.strip() and len(ln) - len(ln.lstrip()) <= base:
+            break
+        if re.match(r"^\s*-\s", ln):
+            if cur is not None:
+                items.append(cur)
+            cur = ln
+        elif cur is not None:
+            cur += "\n" + ln
+    if cur is not None:
+        items.append(cur)
+    out = []
+    for it in items:
+        cond = re.search(r"\bif\s*:\s*(.+)", it)
+        when = re.search(r"\bwhen\s*:\s*['\"]?(\w+)", it)
+        out.append((cond.group(1).strip() if cond else "", when.group(1) if when else "on_success"))
+    return out
+
+
+def _cond_scope(cond: str) -> str:
+    """An `if:` allows only protected refs when every `||` alternative has a
+    protected-ref clause (`$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH`,
+    `$CI_COMMIT_REF_PROTECTED == "true"`, a tag...) in its `&&` chain."""
+    cond = cond.strip().strip("'\"")
+    if _MR_IF.search(cond):
+        return "mr"
+    for alt in re.split(r"\s*\|\|\s*", cond):
+        parts = [p.strip().strip("()").strip() for p in re.split(r"\s*&&\s*", alt.strip())]
+        if not any(_PROTECTED_IF.search(p) for p in parts):
+            return "any"
+    return "protected"
+
+
+def ref_scope(text: str) -> str:
+    """Which pipelines a job (or workflow) runs in: "protected", "mr" or "any"."""
+    items = _rule_items(text)
+    if items:
+        scopes = []
+        for cond, when in items:
+            if when == "never":
+                continue
+            scopes.append(_cond_scope(cond) if cond else "any")
+        if not scopes:
+            return "protected"   # every rule is `when: never`
+        return "mr" if "mr" in scopes else "any" if "any" in scopes else "protected"
+    only = _list_value_simple(text, "only")
+    if only:
+        if any(v in ("merge_requests", "external_pull_requests") for v in only):
+            return "mr"
+        if all(v in ("main", "master", "tags", "/^release.*$/", "production", "prod") for v in only):
+            return "protected"
+        return "any"
+    return "any"
+
+
+def _list_value_simple(text: str, key: str) -> list[str]:
+    from checks.gitlab_merge import _list_value
+    vals = _list_value(text, key)
+    if not vals:
+        m = re.search(rf"(?m)^\s*{key}\s*:\s*$\n\s*refs\s*:", text)
+        if m:
+            vals = _list_value(text[m.start():], "refs")
+    return vals
+
+
+def _wrapper_scripts_running_tf(eff_text: str, root: Path) -> list[str]:
+    out = []
+    for m in _SCRIPT_CALL.finditer(eff_text):
+        rp = m.group(1).lstrip("./") if not m.group(1).startswith("../") else m.group(1)
+        cand = root / rp
+        if cand.is_file() and _TF_RUN.search(read_text_safe(cand)):
+            out.append(rp)
+    return list(dict.fromkeys(out))
+
+
+def _job_checks(job, relative: str, reg=None, root: Optional[Path] = None) -> list[Finding]:
     findings = []
-    if job.name in _RESERVED:
+    if job.name in _RESERVED or job.name.startswith("."):
         return findings
     t = job.text
-    if _TF_APPLY.search(t):
-        manual = re.search(r"\bwhen\s*:\s*[\"']?manual\b", t)
-        restricted = re.search(r"\b(?:rules|only)\s*:", t)
-        env = re.search(r"\benvironment\s*:", t)
+    eff = reg.effective(job) if reg is not None else None
+    et = eff.text if eff else t
+    inherited = (" Inherited: " + "; ".join(eff.sources[:3]) + ".") if eff and eff.sources else ""
+    unresolved = eff.unresolved if eff else []
+    review = "REVIEW" if unresolved else None
+    unresolved_note = (f" Templates not in this repo ({', '.join(unresolved[:3])}) may change this -- "
+                       "check them.") if unresolved else ""
+    if _TF_APPLY.search(et):
+        manual = re.search(r"\bwhen\s*:\s*[\"']?manual\b", et)
+        restricted = re.search(r"\b(?:rules|only)\s*:", et)
+        env = re.search(r"\benvironment\s*:", et)
         if not manual:
             findings.append(make_finding(
                 "GL-TF-001", "medium" if not restricted else "low",
@@ -245,21 +351,27 @@ def _job_checks(job: Job, relative: str) -> list[Finding]:
                 "terraform apply runs automatically"
                 + (" on every pipeline (no rules:/only:)" if not restricted else "")
                 + ". Use a manual job on the default/protected branch with a deployment `environment:` "
-                "(protected environments add required approvers) and apply the saved, reviewed plan.",
-                relative, _line_in(job, _TF_APPLY.pattern), "REVIEW" if "extends" in t else None))
+                "(protected environments add required approvers) and apply the saved, reviewed plan."
+                + inherited + unresolved_note,
+                relative, _line_in(job, _TF_APPLY.pattern) if _TF_APPLY.search(t) else job.start, review))
         if not env:
             findings.append(make_finding(
                 "GL-TF-002", "low", f"Job '{job.name}' applies Terraform without an environment",
                 "Without `environment:` the job can't be a protected environment, so deploy approvals "
-                "and environment-scoped (production-only) variables don't apply.",
-                relative, job.start))
-    art = re.search(r"\bartifacts\s*:", t)
+                "and environment-scoped (production-only) variables don't apply." + inherited + unresolved_note,
+                relative, job.start, review))
+    if root is not None:
+        findings += _untrusted_ref_credentials(job, et, relative, reg, root, unresolved_note, review)
+    art_keys = re.search(r"(?ms)^\s*artifacts\s*:.*", et)
+    art = art_keys is not None
     if art:
-        plan_path = re.search(r"(?m)^\s*-\s*[\"']?[^\n]*(?:\.tfplan|tfplan|plan\.(?:cache|out|json|bin)|\.tfstate|\.terraform/)", t)
-        report_plan = re.search(r"\bterraform\s*:\s*[\"']?[^\n]*plan", t)
+        from checks.gitlab_merge import child_keys
+        art_text = child_keys(et.split("\n")[1:]).get("artifacts", "")
+        plan_path = re.search(r"(?m)^\s*-\s*[\"']?[^\n]*(?:\.tfplan|tfplan|plan\.(?:cache|out|json|bin)|\.tfstate|\.terraform/)", art_text)
+        report_plan = re.search(r"\bterraform\s*:\s*[\"']?[^\n]*plan", art_text)
         if plan_path or report_plan:
-            restricted = re.search(r"\baccess\s*:\s*[\"']?(?:developer|maintainer|none)\b|\bpublic\s*:\s*false\b", t)
-            expires = re.search(r"\bexpire_in\s*:", t)
+            restricted = re.search(r"\baccess\s*:\s*[\"']?(?:developer|maintainer|none)\b|\bpublic\s*:\s*false\b", art_text)
+            expires = re.search(r"\bexpire_in\s*:", art_text)
             findings.append(make_finding(
                 "GL-TF-003", "low" if restricted else "medium",
                 f"Job '{job.name}' saves a Terraform plan/state as an artifact",
@@ -269,12 +381,12 @@ def _job_checks(job: Job, relative: str) -> list[Finding]:
                    "artifacts:access: 'developer' (or encrypt the plan). ")
                 + ("" if expires else "Also set a short expire_in."),
                 relative, _line_in(job, r"\bartifacts\s*:")))
-    if re.search(r"\ballow_failure\s*:\s*true\b", t) and _SCANNERS.search(job.name + "\n" + t):
+    if re.search(r"\ballow_failure\s*:\s*true\b", et) and _SCANNERS.search(job.name + "\n" + et):
         findings.append(make_finding(
             "GL-006", "low", f"Security scanning job '{job.name}' allowed to fail",
             "allow_failure: true means findings (or a broken scanner) never block a merge.",
             relative, _line_in(job, r"\ballow_failure\s*:")))
-    if re.search(r"\bprivileged\s*:\s*true|docker:[\w.\-]*dind", t):
+    if re.search(r"\bprivileged\s*:\s*true|docker:[\w.\-]*dind", et):
         findings.append(make_finding(
             "GL-011", "low", f"Job '{job.name}' uses Docker-in-Docker",
             "dind needs a privileged runner; a privileged container can take over the runner host "
@@ -283,7 +395,78 @@ def _job_checks(job: Job, relative: str) -> list[Finding]:
     return findings
 
 
-def scan_file(path: Path, root: Path) -> list[Finding]:
+_ROLE_ARN = re.compile(r"arn:aws[\w-]*:iam::(?:\d{12}|\$\{?\w+\}?):role/(?:[\w+=,.@-]+/)*([\w+=,.@-]+)")
+
+
+def _untrusted_ref_credentials(job, et: str, relative: str, reg, root: Path,
+                               unresolved_note: str, review: Optional[str]) -> list[Finding]:
+    """GL-TF-004: terraform with cloud credentials in pipelines anyone who can
+    push a branch (or open an MR) controls."""
+    direct = _TF_RUN.search(et)
+    wrappers = [] if direct else _wrapper_scripts_running_tf(et, root)
+    if not direct and not wrappers:
+        return []
+    scope = ref_scope(et)
+    wf_scope = ref_scope(reg.workflow) if reg is not None and reg.workflow.strip() else "any"
+    if scope == "protected" or wf_scope == "protected":
+        return []
+    oidc = re.search(r"\bid_tokens\s*:", et)
+    static = re.search(r"AWS_(?:SECRET_ACCESS_KEY|ACCESS_KEY_ID|SESSION_TOKEN)", et)
+    role_names = [m.group(1) for m in _ROLE_ARN.finditer(et + "\n" + (reg.global_vars if reg else ""))]
+    if not (oidc or static or role_names):
+        return []
+
+    trust_txt, sev, conf = "", "medium", "REVIEW"
+    try:
+        from checks import tf_graph
+        proj = tf_graph.load(root) if any(True for _ in tf_graph.iter_tf_files(root)) else None
+    except Exception:
+        proj = None
+    trust = None
+    if proj is not None and proj.gitlab_trusts:
+        named = [t for t in proj.gitlab_trusts if t.role.name in role_names
+                 or t.role.address.split(".", 1)[1] in role_names]
+        if named:
+            trust = named[0]
+        elif len(proj.gitlab_trusts) == 1 and oidc:
+            trust = proj.gitlab_trusts[0]
+            trust_txt = "(assuming it uses the only GitLab-trusted role in this repo's Terraform) "
+    if trust is not None:
+        if trust.any_ref or trust.any_project or not trust.subs:
+            sev = "high" if (trust.role.privileged or trust.role.can_write) else "medium"
+            conf = review
+            trust_txt += (f"It can assume {trust.role.summary(root)}, whose trust policy accepts "
+                          f"{'any sub' if not trust.subs else ', '.join(trust.subs[:2])} -- i.e. tokens from "
+                          "unprotected branches and MRs. ")
+        else:
+            sev, conf = "low", "REVIEW"
+            trust_txt += (f"The role it maps to ({trust.role.address}) only trusts {', '.join(trust.refs[:3])}, so the "
+                          "token from an MR/unprotected branch should be rejected -- confirm those refs are "
+                          "protected in GitLab. ")
+    elif static and not oidc:
+        trust_txt = ("Static AWS keys are referenced; unprotected branches only receive them if the CI/CD "
+                     "variables are not marked Protected -- check Settings > CI/CD > Variables. ")
+    else:
+        trust_txt = ("The role it assumes couldn't be matched to Terraform in this repo -- check that role's "
+                     "trust policy `sub` condition. ")
+
+    where = "merge request pipelines" if scope == "mr" else "pipelines for any branch"
+    what = direct.group(0) if direct else f"terraform via {', '.join(wrappers[:2])}"
+    return [make_finding(
+        "GL-TF-004", sev, f"Job '{job.name}' runs `{what}` with cloud credentials in {where}",
+        "Anyone who can push a branch controls everything this job executes: the .tf files (a `data "
+        "\"external\"` block, a malicious provider in required_providers, or a local-exec runs during "
+        "init/plan), and the job's own scripts. With credentials in the job, that is code execution as "
+        "the deploy identity. " + trust_txt
+        + "Run credentialed jobs only on protected refs (rules: if: $CI_COMMIT_REF_PROTECTED == \"true\"), "
+        "give MR plans a read-only role whose trust is pinned to MR refs, or plan without credentials."
+        + unresolved_note,
+        relative, _line_in(job, _TF_RUN.pattern) if _TF_RUN.search(job.text) else job.start, conf)]
+
+
+def scan_file(path: Path, root: Path, reg=None) -> list[Finding]:
+    from checks.gitlab_merge import Registry
+
     text = read_text_safe(path)
     relative = rel(path, root)
     masked = mask_comments(text, "hash")
@@ -291,17 +474,22 @@ def scan_file(path: Path, root: Path) -> list[Finding]:
     findings = scan_text(text, rules, relative, "hash")
     findings += _image_checks(masked, relative)
     findings += _include_checks(masked, relative)
-    for job in split_jobs(masked):
-        findings += _job_checks(job, relative)
+    if reg is None:
+        reg = Registry(root, [path])
+    for job in reg.by_file.get(path.resolve(), []):
+        findings += _job_checks(job, relative, reg, root)
     return findings
 
 
 def scan_project(root: Path) -> list[Finding]:
+    from checks.gitlab_merge import Registry
+
     findings: list[Finding] = []
     files = list(iter_ci_files(root))
+    reg = Registry(root, files)
     all_text = ""
     for path in files:
-        findings.extend(scan_file(path, root))
+        findings.extend(scan_file(path, root, reg))
         all_text += mask_comments(read_text_safe(path), "hash")
     main_ci = next((p for p in files if p.name in (".gitlab-ci.yml", ".gitlab-ci.yaml")), files[0] if files else None)
     if main_ci and not _SCANNERS.search(all_text):

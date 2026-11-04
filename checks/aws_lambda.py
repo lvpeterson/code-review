@@ -412,4 +412,47 @@ def scan_project(root: Path) -> tuple[list[Finding], list[EntryPoint]]:
         f, e = scan_file(path, root)
         findings += f
         entry_points += e
+    _terraform_context(root, findings, entry_points)
     return findings, entry_points
+
+
+def _terraform_context(root: Path, findings: list[Finding], entry_points: list[EntryPoint]) -> None:
+    """When the same repo deploys the function with Terraform, tie each
+    handler file to its aws_lambda_function: execution-role permissions
+    (blast radius of any code finding) and public triggers (who can send
+    `event`). Adds LMB-019 per handler and appends the context to every
+    finding in that file."""
+    try:
+        from checks import tf_graph
+        if not any(True for _ in tf_graph.iter_tf_files(root)):
+            return
+        proj = tf_graph.load(root)
+    except Exception:
+        return
+    rroot = root.resolve()
+    for lam in proj.lambdas:
+        fn_addr = f"aws_lambda_function.{lam.block.labels[1]}"
+        fn_where = f"{rel(lam.block.file.resolve(), rroot)}:{lam.block.line}"
+        for code in lam.code_files:
+            relative = rel(code, rroot)
+            role_txt = lam.role.summary(rroot) if lam.role else "role not resolvable from Terraform"
+            public = ("Reachable by: " + "; ".join(lam.public_via) + ". ") if lam.public_via else ""
+            note = f" Deployed as {fn_addr} ({fn_where}); runs as {role_txt}. {public}".rstrip()
+            in_file = [f for f in findings if f.file == relative]
+            for f in in_file:
+                f.description += note
+            handler_fn = (lam.handler or "").rsplit(".", 1)[-1]
+            ep = next((e for e in entry_points if e.file == relative and e.handler_name.endswith("." + handler_fn)), None)
+            if ep is not None and lam.public_via:
+                ep.detail = "; ".join(x for x in (ep.detail, f"public: {lam.public_via[0]}") if x)
+            privileged = bool(lam.role and lam.role.privileged)
+            serious = [f for f in in_file if f.severity in ("high", "critical")]
+            sev = "high" if privileged and (serious or lam.public_via) else "medium" if privileged else "info"
+            findings.append(make_finding(
+                "LMB-019", sev,
+                f"Handler '{lam.handler}' runs as {lam.role.address if lam.role else 'an unresolved role'}"
+                + (" with admin-level / privilege-escalation permissions" if privileged else ""),
+                "Every finding in this handler executes with the execution role's permissions. "
+                + (f"{len(serious)} high-severity code finding(s) here combine with it. " if serious and privileged else "")
+                + "Scope the role to the specific actions and resources the function uses." + note,
+                relative, ep.line if ep else 1, None if privileged else "REVIEW"))

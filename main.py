@@ -8,6 +8,7 @@ Usage:
     python main.py <target_path> --language python --framework flask
     python main.py <target_path> --allow-path "/health" --allow-path "/api/public/*"
     python main.py <target_path> --fail-on medium   # exit 1 if any medium+ finding exists (CI use)
+    python main.py <target_path> --sca              # + osv-scanner dependency CVEs (needs osv-scanner on PATH)
 """
 from __future__ import annotations
 
@@ -48,6 +49,13 @@ def main() -> int:
         default=None,
         help="Exit 1 if any finding at or above this severity exists (for CI use)",
     )
+    parser.add_argument(
+        "--sca", action="store_true",
+        help="Also run osv-scanner (must be on PATH) for known-vulnerable dependencies. Sends package "
+        "names/versions to api.osv.dev unless --sca-offline is given",
+    )
+    parser.add_argument("--sca-offline", action="store_true",
+                        help="With --sca: download the OSV databases and match locally")
     args = parser.parse_args()
 
     if not args.target.exists():
@@ -60,6 +68,10 @@ def main() -> int:
         force_language=args.language,
         force_framework=args.framework,
     )
+
+    if args.sca or args.sca_offline:
+        from checks import sca
+        results.append(sca.run(target_path, offline=args.sca_offline))
 
     if args.allow_path:
         apply_allowlist(results, args.allow_path)

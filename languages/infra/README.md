@@ -24,9 +24,45 @@ line.
 
 ## Terraform (AWS)
 
-Per-resource checks only see **literal values**. `acl = var.acl` isn't
-resolved, so check variable defaults and `.tfvars` by hand when the setting
-you care about is a variable.
+### Variable resolution (`checks/tf_resolve.py`)
+
+Before any rule runs, `var.*`, `local.*` and module inputs are replaced by
+the value they resolve to, in Terraform's precedence order:
+
+1. `.tfvars` in the module's directory (`terraform.tfvars` / `*.auto.tfvars`
+   first, then other `*.tfvars`). A `.tfvars` in a folder with no `.tf` files
+   (`envs/prod.tfvars`) applies to every root module.
+2. The argument a calling `module "x" { source = "./modules/y" }` passes
+   (local sources only), resolved in the caller's own context.
+3. The variable's `default`.
+
+It follows chains (a local built from a variable that a caller passes from
+its own tfvars), `"${var.x}"` interpolation, refs inside lists/objects, and
+`var.flag ? a : b`. When several tfvars/callers disagree, the first wins and
+the rest are listed. Every finding that depended on a resolved value ends
+with the chain, e.g.
+`Value resolved: acl = var.acl resolves via var.acl = "public-read" (module.logs in main.tf:14) <- local.open = true <- var.allow_public = true (terraform.tfvars:1) [other values: false in default in variables.tf:2]`.
+
+Not resolved (left as-is, so the rule stays quiet): function calls
+(`lookup`, `try`, `coalesce`...), resource/data attributes, `count`/`for_each`
+values, remote module sources, variables with no value anywhere.
+
+### Project model (`checks/tf_graph.py`)
+
+Built once per scan and shared with the policy-JSON, GitLab CI and Lambda
+analyzers:
+
+- **Role permissions**: every policy reaching each `aws_iam_role` (inline,
+  `managed_policy_arns`, `aws_iam_role_policy`, `*_policy_attachment` with
+  AWS-managed or customer policies; bodies from `jsonencode`, heredoc,
+  `data "aws_iam_policy_document"`, `file()` and `templatefile()`),
+  summarised as admin / privilege escalation / writes / data reads on `*`.
+- **Policy files** loaded via `file()`/`templatefile()` -> the resources that
+  use them; POL findings in the JSON say "Attached in Terraform via ...".
+- **Lambda**: function -> execution role, handler source file (handler +
+  `archive_file` source_dir/source_file), public triggers (URL with
+  `NONE` auth, permission to `*`, API Gateway).
+- **GitLab OIDC trust**: which project/refs each role's `sub` allows.
 
 | area | ids | what |
 |---|---|---|
@@ -44,6 +80,11 @@ you care about is a variable.
 | supply chain | TF-SUP-001..004 | git modules without `?ref=` or pinned to a branch; registry modules without `version`; providers without version constraints; root modules without `.terraform.lock.hcl` |
 | execution | TF-EXEC-001/002 | `local-exec`/`remote-exec` interpolating `${var.*}` into a shell command; `data "external"` (runs at **plan** time, so in MR pipelines) |
 | assets | TF-ASSET-001 | taggable resources with no `tags` and no provider `default_tags` |
+| GitLab OIDC | TF-OIDC-001/002 | role whose GitLab trust `sub` allows any branch/MR (or any project) -- **high when the role can write / is admin**, with the role's actual permissions in the finding; OIDC provider over `http://` or accepting any audience |
+| containers / build | TF-ECS-001..003, TF-CB-001/002 | privileged ECS containers, secret-looking plaintext `environment`, host network/PID; privileged CodeBuild, PLAINTEXT secret env vars |
+| more data stores | TF-ENC-003/004, TF-DB-010, TF-LOG-009 | unencrypted EFS / Kinesis / Firehose; DynamoDB without PITR; Step Functions logging off |
+| edge | TF-NET-008 | internet-facing ALB / API stage / CloudFront with no WAF association (REVIEW) |
+| sessions | TF-IAM-006 | role `max_session_duration` > 1h |
 
 ## IAM / resource policies (POL-xxx)
 
@@ -63,9 +104,25 @@ Same rules for `.json` files and for policies inside Terraform.
 
 ## GitLab CI
 
-`extends:`, `!reference` and included templates are **not** merged in, so a
-job that inherits `when: manual` from a template is still flagged by
-GL-TF-001 (marked REVIEW when the job uses `extends`).
+Job inheritance is merged before the job rules run (`checks/gitlab_merge.py`):
+`extends:` (lists, multi-level), YAML anchors (`<<: *x`), `!reference`,
+top-level `default:` (unless `inherit: default: false`) and `include: local:`
+files. A job that gets `when: manual` + protected-branch `rules:` from a
+template is therefore *not* flagged. Templates from `include:
+project/remote/template/component` can't be read; findings that depend on
+them are REVIEW and name the missing template.
+
+- **GL-TF-004** -- terraform (`init`/`validate`/`plan`/`apply`, directly or
+  through a repo script like `./scripts/plan.sh`) running with cloud
+  credentials (`id_tokens`, AWS key variables, a role ARN) in pipelines for
+  merge requests or any branch. Anyone who can push a branch controls the
+  `.tf` files and scripts that job runs (`data "external"`, a malicious
+  provider, local-exec), so it's code execution as the deploy identity.
+  The job is matched to the IAM role it assumes (role ARN in the CI file,
+  or the only GitLab-trusted role in the repo's Terraform): **high** when
+  that role's trust accepts unprotected refs and it can write; **low** when
+  the trust is pinned to specific refs (check they're protected). A
+  `workflow:` restricted to protected refs suppresses it.
 
 - **GL-001** `CI_DEBUG_TRACE` / `CI_DEBUG_SERVICES` on (dumps every variable, masked ones included).
 - **GL-002** commit message / MR title / description in a script; **GL-003** branch/tag names inside `eval` / `sh -c`.
@@ -93,10 +150,20 @@ Standalone-script only: SH-020 no `set -e` (medium when the script wraps terrafo
 
 REPO-001 `*.tfstate`; REPO-002 private keys / keystores (`.key`, `.p12`, `.pfx`, `.jks`, `.bcfks`, `id_rsa`, PEMs containing a private key); REPO-003 `.env` files (not `.env.example`); REPO-004 saved plans / `crash.log`; REPO-005 `.gitignore` not excluding state/plans/`.terraform`. When the target is a git checkout, tracked files are high and untracked ones medium/low.
 
+## Dependencies (opt-in, `--sca`)
+
+`python main.py <target> --sca` runs [osv-scanner](https://google.github.io/osv-scanner/)
+(must be on PATH) over every lockfile/manifest and reports each vulnerable
+package as **SCA-001** (ISR01) in a "Vulnerable dependencies" section. By
+default osv-scanner sends package names + versions to api.osv.dev; add
+`--sca-offline` to download the databases and match locally if that's a
+concern for the engagement.
+
 ## Still manual
 
 - GitLab project/group settings: CI/CD variables (protected? masked? environment-scoped?), protected branches/tags, protected environments + approvers, which runners (shared? privileged?) pick up deploy jobs, "Allow access to this project with a CI_JOB_TOKEN" allow-list.
-- Whether a variable's runtime value makes a resource public / unencrypted (only literals are evaluated).
+- Values set outside the repo (`-var` on the command line, `TF_VAR_*` CI variables, Terraform Cloud workspace variables) and values computed by functions -- the resolver only sees tfvars, module callers and defaults.
 - What actually lives in the state bucket and who can read it (`s3:GetObject` on the state bucket = every secret in the stack).
 - Effective permissions: SCPs, permission boundaries, resource policies in other repos.
-- Anything in `extends`/included CI templates and in remote modules.
+- CI templates from other projects / remote URLs / the GitLab template catalog, and remote Terraform modules.
+- Which GitLab branches/tags are actually protected (GL-TF-004 / TF-OIDC-001 tell you which refs matter).
