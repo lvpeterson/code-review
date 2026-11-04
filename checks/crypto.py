@@ -2,7 +2,8 @@
 focus) and PHP (OpenSSL / key generation scripts).
 
 Java:
-  JC-0xx       line rules -- weak algorithms, ECB, static IVs, hardcoded keys,
+  JC-0xx       AST rules in checks/java_crypto_ast.py (the line rules below are
+               the fallback for files javalang can't parse) -- weak algorithms, ECB, static IVs, hardcoded keys,
                weak randomness, small keys, trust-all TrustManagers...
   JC-FIPS-0xx  project rules -- BC FIPS jar/dependency inventory, non-FIPS
                Bouncy Castle on the same classpath, approved-only mode not
@@ -229,17 +230,24 @@ def _iter(root: Path, exts: tuple[str, ...]):
 
 
 def scan_java(root: Path) -> list[Finding]:
+    """JC-0xx come from the javalang AST pass (checks/java_crypto_ast.py),
+    which follows constants, fields, locals and method parameters to each
+    sink. Files it can't parse (Kotlin, syntax errors) get the line rules."""
+    from checks import java_crypto_ast
+
     findings: list[Finding] = []
-    java_texts: dict[Path, str] = {}
-    for path in _iter(root, (".java", ".kt")):
-        text = read_text_safe(path)
-        java_texts[path] = text
-        findings += scan_text(text, JAVA_RULES + secrets.secret_rules(), rel(path, root), "c")
-    findings += _bc_project_checks(root, java_texts)
+    java_texts: dict[Path, str] = {path: read_text_safe(path) for path in _iter(root, (".java", ".kt"))}
+    ast_findings, facts = java_crypto_ast.scan(root, java_texts)
+    findings += ast_findings
+    for path, text in java_texts.items():
+        rules = secrets.secret_rules() + ([] if path in facts.parsed else JAVA_RULES)
+        findings += scan_text(text, rules, rel(path, root), "c")
+    findings += _bc_project_checks(root, java_texts, facts)
     return findings
 
 
-def _bc_project_checks(root: Path, java_texts: dict[Path, str]) -> list[Finding]:
+def _bc_project_checks(root: Path, java_texts: dict[Path, str], facts) -> list[Finding]:
+    unparsed = {p: t for p, t in java_texts.items() if p not in facts.parsed}
     findings: list[Finding] = []
     inv = bc_inventory(root)
     fips = [i for i in inv if "fips" in i[0]]
@@ -284,18 +292,23 @@ def _bc_project_checks(root: Path, java_texts: dict[Path, str]) -> list[Finding]
                 "and anything using the \"BC\" provider runs unvalidated crypto. Replace every non-FIPS "
                 "BC artifact with its -fips counterpart (bcpkix-fips, bctls-fips, bcpg-fips...).",
                 rel(p, root), line))
-        for path, text in java_texts.items():
+        bc_uses = list(facts.bc_provider_uses)
+        for path, text in unparsed.items():
             for m in re.finditer(r"new\s+BouncyCastleProvider\s*\(|getInstance\([^;]*,\s*\"BC\"\s*\)|"
                                  r"BouncyCastleProvider\.PROVIDER_NAME", mask_comments(text, "c")):
-                findings.append(make_finding(
-                    "JC-FIPS-003", "high", "Non-FIPS Bouncy Castle provider used in a FIPS project",
-                    "This uses the non-validated \"BC\" provider instead of \"BCFIPS\".",
-                    rel(path, root), text.count("\n", 0, m.start()) + 1))
+                bc_uses.append((path, text.count("\n", 0, m.start()) + 1, m.group(0)))
+        for path, line, what in bc_uses:
+            findings.append(make_finding(
+                "JC-FIPS-003", "high", "Non-FIPS Bouncy Castle provider used in a FIPS project",
+                f"{what} uses the non-validated \"BC\" provider instead of \"BCFIPS\".",
+                rel(path, root), line))
         add = _first_match(root, java_texts, r"Security\.addProvider\s*\(\s*new\s+BouncyCastleFipsProvider")
         if add and not re.search(r"insertProviderAt\s*\([^;]*BouncyCastleFipsProvider|security\.provider\.1\s*=\s*\S*BouncyCastleFipsProvider",
                                  all_java + other_text):
-            unpinned = len(re.findall(r"(?:Cipher|KeyGenerator|KeyPairGenerator|Signature|MessageDigest|Mac|SecureRandom|"
-                                      r"KeyFactory|SecretKeyFactory|KeyAgreement|KeyStore)\.getInstance\(\s*\"[^\"]+\"\s*\)", all_java))
+            unpinned = facts.unpinned_getinstance + len(re.findall(
+                r"(?:Cipher|KeyGenerator|KeyPairGenerator|Signature|MessageDigest|Mac|SecureRandom|"
+                r"KeyFactory|SecretKeyFactory|KeyAgreement|KeyStore)\.getInstance\(\s*\"[^\"]+\"\s*\)",
+                "\n".join(unparsed.values())))
             if unpinned:
                 findings.append(make_finding(
                     "JC-FIPS-004", "medium", f"BCFIPS added at lowest priority; {unpinned} getInstance() call(s) don't name a provider",
@@ -304,12 +317,13 @@ def _bc_project_checks(root: Path, java_texts: dict[Path, str]) -> list[Finding]
                     "Security.insertProviderAt(new BouncyCastleFipsProvider(), 1), configure java.security, "
                     "or pass \"BCFIPS\" explicitly.",
                     rel(add[0], root), add[1], "REVIEW"))
-        if re.search(r"KeyStore\.getInstance\(\s*\"(?:JKS|JCEKS|PKCS12)\"", all_java):
-            m_at = _first_match(root, java_texts, r"KeyStore\.getInstance\(\s*\"(?:JKS|JCEKS|PKCS12)\"")
+        ks_at = facts.keystore_types[0][:2] if facts.keystore_types else \
+            _first_match(root, unparsed, r"KeyStore\.getInstance\(\s*\"(?:JKS|JCEKS|PKCS12)\"")
+        if ks_at:
             findings.append(make_finding(
                 "JC-FIPS-007", "low", "Non-FIPS keystore type in a FIPS project",
                 "JKS/JCEKS use non-approved protection; PKCS12 under BC FIPS needs care. BCFKS is the "
-                "FIPS keystore format.", rel(m_at[0], root), m_at[1], "REVIEW"))
+                "FIPS keystore format.", rel(ks_at[0], root), ks_at[1], "REVIEW"))
 
     for a, v, p, line in fips:
         if a == "bc-fips":

@@ -11,7 +11,25 @@ Detected when there's any Bouncy Castle jar/dependency, or `.java`/`.kt`
 code using `javax.crypto` / `java.security` / `org.bouncycastle` /
 `SSLContext` / `KeyStore`.
 
-Line rules (comments masked, so commented-out code doesn't count):
+JC rules run on a **javalang AST** (`checks/java_crypto_ast.py`), not line
+regex. The value reaching each sink is resolved through:
+
+- constants in any class (`Config.TRANSFORM`), static imports, string concatenation
+- fields, including ones assigned in a constructor and used in another method
+- local variables (every assignment), ternaries, casts
+- method parameters, by resolving the argument at every call site
+  (`util.encrypt(data, FIXED_IV)` -> `new GCMParameterSpec(128, iv)`)
+- return values of helpers (`getTransform() { return X; }`)
+- `"..".getBytes()` / `.toCharArray()`, Base64/Hex decoding of literals
+- byte arrays allocated but never filled (all-zero IV/key) vs. filled by
+  `SecureRandom.nextBytes`
+- the algorithm a `KeyPairGenerator` was created with (EC 256 is fine, RSA 1024 isn't)
+
+Each finding's description ends with the chain it followed, e.g.
+`Value resolved via parameter nonce of encryptGcm(), called from Service.java:8 <- via field Config.FIXED_IV (Config.java:5)`.
+Comments are never matched. Files javalang can't parse (Kotlin, syntax
+errors) fall back to the equivalent line regexes in `checks/crypto.py`.
+If the analyzer itself throws on a file, that file also falls back.
 
 | id | what |
 |---|---|
@@ -21,16 +39,17 @@ Line rules (comments masked, so commented-out code doesn't count):
 | JC-004 | MD5/SHA-1 digests, SHA1withRSA signatures, HmacMD5, PBKDF2WithHmacSHA1 |
 | JC-005 | static / zero IV or GCM nonce |
 | JC-006 | hardcoded `SecretKeySpec` key |
-| JC-007 | `java.util.Random` / `Math.random` in files that handle keys/tokens (REVIEW) |
+| JC-007 | `java.util.Random` / `Math.random` / `ThreadLocalRandom` in a method/class whose names involve keys, tokens, sessions, salts... (REVIEW) |
 | JC-008 | SHA1PRNG; SecureRandom seeded with a constant or the clock |
 | JC-009 | RSA/DSA < 2048, symmetric keys < 128 bits |
 | JC-010 | `PBEWithMD5AndDES`-style schemes; PBKDF2 iterations < 100k |
-| JC-011 | trust-all `TrustManager`, `HostnameVerifier` returning true |
+| JC-011 | `checkServerTrusted`/`checkClientTrusted` that neither validates nor throws (incl. anonymous classes), `verify()` / lambdas returning true, `NoopHostnameVerifier`, `TrustAllStrategy` |
 | JC-012 | `SSLContext` SSL/TLSv1/TLSv1.1 |
 | JC-013 | hardcoded keystore / key passwords (`"changeit".toCharArray()`) |
 | JC-014 | GCM tag < 128 bits |
 | JC-015 | AES/CBC with no HMAC anywhere in the file (REVIEW) |
-| JC-016 | keys / passwords logged |
+| JC-016 | keys / passwords logged (by declared type `PrivateKey`/`SecretKey`/`char[]`, `getEncoded()`/`getPrivate()`, or name) |
+| JC-017 | constant salt passed to `PBEKeySpec` |
 
 Project rules for **Bouncy Castle FIPS**. Jars are inventoried by filename
 (`bc-fips-1.0.2.4.jar`) and from `pom.xml` / Gradle dependency declarations:
@@ -73,6 +92,11 @@ Detected when any `.php`/`.phtml`/`.inc` uses OpenSSL, sodium, `rand`/`mt_rand`,
 | PHP-015 | AES-CBC with no `hash_hmac` in the file |
 
 ## Still manual
+
+- Values from outside the source tree (properties files, env vars, Spring
+  `@Value`, a keystore on disk) resolve to "unknown" and are not flagged;
+  check where those come from. Inherited fields and overloaded methods are
+  matched by name/arity only.
 
 - How the JVM is actually launched in each environment (approved-only flag, `java.security` provider order, `-Djava.security.properties`).
 - Whether the deployed jars match the ones in the repo (container images, app-server lib dirs).

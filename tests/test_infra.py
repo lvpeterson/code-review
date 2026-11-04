@@ -361,6 +361,85 @@ def test_java_crypto_and_bc_fips_project_rules(tmp_path):
     assert "JC-FIPS-008" not in ids  # bcprov 1.80 is past the CVE fixes
 
 
+_JAVA_CONFIG = '''package a;
+public final class Config {
+    public static final String TRANSFORM = "AES/" + "ECB" + "/PKCS5Padding";
+    public static final String KEY = "0123456789abcdef";
+    public static final byte[] FIXED_IV = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+    public static final int RSA_BITS = 1024;
+    public static final String KS_PASS = "changeit";
+}
+'''
+
+_JAVA_UTIL = '''package a;
+public class Util {
+    private final byte[] zeroIv = new byte[16];
+    private final byte[] goodIv = new byte[12];
+    private final SecureRandom rnd = new SecureRandom();
+    Util() { rnd.nextBytes(goodIv); }
+    private String transform() { return Config.TRANSFORM; }
+    byte[] ecb(Key k, byte[] d) throws Exception {
+        Cipher c = Cipher.getInstance(transform());
+        c.init(1, k, new IvParameterSpec(zeroIv));
+        return c.doFinal(d);
+    }
+    byte[] gcm(Key k, byte[] d, byte[] nonce) throws Exception {
+        Cipher c = Cipher.getInstance("AES/GCM/NoPadding", "BCFIPS");
+        c.init(1, k, new GCMParameterSpec(128, nonce));
+        c.init(1, k, new GCMParameterSpec(128, goodIv));
+        byte[] iv = new byte[12];
+        rnd.nextBytes(iv);
+        c.init(1, k, new GCMParameterSpec(128, iv));
+        return c.doFinal(d);
+    }
+    KeyPair kp() throws Exception {
+        KeyPairGenerator g = KeyPairGenerator.getInstance("RSA");
+        g.initialize(Config.RSA_BITS);
+        KeyPairGenerator ec = KeyPairGenerator.getInstance("EC");
+        ec.initialize(256);
+        return g.generateKeyPair();
+    }
+    SecretKeySpec key() { return new SecretKeySpec(Config.KEY.getBytes(), "AES"); }
+}
+'''
+
+_JAVA_CALLER = '''package a;
+public class Caller {
+    private final Util util = new Util();
+    void run(Key k, byte[] body, InputStream in) throws Exception {
+        util.gcm(k, body, Config.FIXED_IV);
+        char[] pw = Config.KS_PASS.toCharArray();
+        KeyStore ks = KeyStore.getInstance("BCFKS");
+        ks.load(in, pw);
+    }
+}
+'''
+
+
+def test_java_crypto_follows_constants_fields_helpers_and_call_sites(tmp_path):
+    """The values reaching each sink live in another class / field / caller --
+    regex on the sink line can't see any of them."""
+    _write(tmp_path, "src/a/Config.java", _JAVA_CONFIG)
+    _write(tmp_path, "src/a/Util.java", _JAVA_UTIL)
+    _write(tmp_path, "src/a/Caller.java", _JAVA_CALLER)
+    f = crypto.scan_java(tmp_path)
+    util = [x for x in f if x.file.endswith("Util.java")]
+    by = lambda cid: sorted(x.line for x in util if x.check_id == cid)  # noqa: E731
+    assert by("JC-002") == [9]            # ECB via helper return -> Config.TRANSFORM (concatenated)
+    assert by("JC-005") == [10, 15]       # zero IV field; nonce param from Caller's constant
+    assert by("JC-009") == [24]           # RSA 1024 via constant; EC 256 stays quiet
+    assert by("JC-006") == [29]           # key from Config.KEY.getBytes()
+    nonce = next(x for x in util if x.check_id == "JC-005" and x.line == 15)
+    assert "Caller.java:5" in nonce.description and "Config.FIXED_IV" in nonce.description
+    jc013 = [x for x in f if x.check_id == "JC-013"]
+    assert [(x.file.endswith("Caller.java"), x.line) for x in jc013] == [(True, 8)]
+
+
+def test_java_unparseable_file_falls_back_to_line_rules(tmp_path):
+    _write(tmp_path, "src/Broken.java", 'class B { void f( { Cipher.getInstance("DES/CBC/PKCS5Padding"); }\n')
+    assert "JC-001" in _ids(crypto.scan_java(tmp_path))
+
+
 def test_bc_fips_approved_only_via_system_property(tmp_path):
     _write(tmp_path, "src/C.java", "class C { Object p = new BouncyCastleFipsProvider(); }")
     _write(tmp_path, "run.sh", "java -Dorg.bouncycastle.fips.approved_only=true -jar app.jar\n")
