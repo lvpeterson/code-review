@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="15.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <TargetFrameworkVersion>v4.7.2</TargetFrameworkVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System.Web" />
+    <Reference Include="System.Web.Mvc, Version=5.2.7.0" />
+    <Reference Include="System.Data" />
+    <Reference Include="System.DirectoryServices" />
+    <Reference Include="System.Xml" />
+    <Reference Include="System.Web.Http" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="Orders.cs" />
+    <Compile Include="Props.cs" />
+    <Compile Include="Out.cs" />
+    <Compile Include="Helpers.cs" />
+    <Compile Include="Nav.cs" />
+    <Compile Include="Flow.cs" />
+    <Compile Include="Builder.cs" />
+    <Compile Include="Guards.cs" />
+    <Compile Include="Crlf.cs" />
+    <Compile Include="Linq.cs" />
+    <Compile Include="OrdersController.cs" />
+    <Compile Include="IOrderService.cs" />
+    <Compile Include="OrderService.cs" />
+    <Compile Include="OrderRepository.cs" />
+    <Compile Include="SafeRepository.cs" />
+    <Compile Include="IWriter.cs" />
+    <Compile Include="SqlImplA.cs" />
+    <Compile Include="SqlImplB.cs" />
+    <Compile Include="WriteController.cs" />
+    <Compile Include="Rec.cs" />
+    <Compile Include="Misc.cs" />
+    <Compile Include="Accum.cs" />
+    <Compile Include="UsesAccum.cs" />
+    <Compile Include="Ext.cs" />
+    <Compile Include="UsesExt.cs" />
+    <Compile Include="Variadic.cs" />
+    <Compile Include="SetSink.cs" />
+    <Compile Include="Holder.cs" />
+    <Compile Include="Svc.cs" />
+    <Compile Include="UsesSetters.cs" />
+    <Compile Include="Lonely.cs" />
+    <Compile Include="SelfRec.cs" />
+    <Compile Include="Chain.cs" />
+    <Compile Include="Shared.cs" />
+    <Compile Include="TwoRoutesController.cs" />
+    <Compile Include="CycleSrc.cs" />
+    <Compile Include="CycleOuter.cs" />
+    <Compile Include="Dup1.cs" />
+    <Compile Include="Dup2.cs" />
+    <Compile Include="UsesDup.cs" />
+    <Compile Include="UsesExtField.cs" />
+    <Compile Include="UsesDup1.cs" />
+    <Compile Include="UsesDup2.cs" />
+    <Compile Include="Gaps.cs" />
+    <Compile Include="Tables.cs" />
+    <Compile Include="CodeSinksController.cs" />
+    <Compile Include="ApiSsrfController.cs" />
+    <Compile Include="HomeController.cs" />
+    <Compile Include="ShopContext.cs" />
+    <Compile Include="OrderLookup.cs" />
+    <Compile Include="ObjectsController.cs" />
+    <Compile Include="ObjectsApiController.cs" />
+    <Content Include="Views\Home\Show.cshtml" />
+  </ItemGroup>
+</Project>

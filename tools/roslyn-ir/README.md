@@ -46,6 +46,10 @@ path or the GAC, so semantic resolution works the same on Linux.
    "projects": [{"name": "Web", "language": "cs", "files": ["<abs>", "..."], "references": []}]}
   ```
 
+  A project may also carry `"imports": ["System.Data.SqlClient", ...]` (VB
+  only): extra global imports added to the template defaults, for namespaces a
+  `.vbproj` imports project-wide. Invalid entries are skipped.
+
   Writes JSON Lines to stdout, one object per file, in input order. A file that
   cannot be read or lowered yields `{"path": rel, "error": "<message>"}` and the
   run continues. stdout carries only JSON; diagnostics go to stderr.
@@ -66,15 +70,27 @@ failure), 2 usage.
   `methods`, `line`, `end_line`. Nested types are flattened as `Outer.Inner`.
 - Attr: `name` (qualifier and `Attribute` suffix stripped), `args`, `named`, `line`.
 - Field: `name`, `type`, `line`, `init`, `is_const`. Enum members are const fields.
-- Prop: `name`, `type`, `attributes`, `line`.
+- Prop: `name`, `type`, `attributes`, `line`, and optional `get` / `set` (Stmt
+  lists) when an accessor has a body or expression body; auto-properties omit
+  both. C# `=> expr` lowers as `get: [return expr]`; the C# setter value is
+  `name value` and the VB setter parameter keeps its declared name (`init`
+  accessors count as `set`). VB properties with a `Set` block also carry
+  `set_param`, the setter's value parameter name (default `Value`).
 - Method: `name` (`.ctor` for constructors), `modifiers`, `return_type`
-  (`void` for C# void and VB Sub, null for constructors), `params`,
+  (`void` for C# void and VB Sub, null for constructors), `params` (each
+  `{name, type, attributes}` plus an optional lowercased `modifiers` list when
+  the parameter has any: C# `this`, `params`, `ref`, `out`, `in`; VB `byref`,
+  `byval`, `paramarray`, `optional`),
   `attributes`, `handles` (VB `Handles`), `body`, `line`, `end_line`.
 - Stmt `k`: `local`, `assign` (`op` is `=`, `+=`, `-=` or `concat=`; other
   compound ops lower to `=` with a `bin` value), `expr`, `return`, `throw`,
   `if`, `loop`, `try`, `using`, `with`, `other {text}`.
 - Expr `k`: `lit`, `name`, `member`, `call`, `new`, `bin`, `interp`, `cond`,
-  `index` (C# only), `cast`, `lambda`, `unknown {text}`.
+  `index` (C# only), `cast`, `lambda`, `unary {op, e}`, `unknown {text}`.
+  `lambda {body, params?}`: `body` is an Expr or a Stmt list, `params` the lowered
+  parameter names (omitted when there are none).
+  `unary` ops: C# `!`, `-`, `~`, `++`, `--` (prefix and postfix alike), VB `Not`, `-`;
+  a negated numeric literal still folds to a `lit`.
 
 Optional semantic keys (additive; omitted when the symbol does not resolve,
 which is normal for third-party types):
@@ -83,6 +99,11 @@ which is normal for third-party types):
   for methods, properties, fields and events (e.g.
   `System.Data.SqlClient.SqlCommand.ExecuteReader`; extension methods name
   their static class, a VB default-property call names `Item`).
+- `index` (C#): `sym` -- the indexer's containing type + `.Item` (e.g.
+  `System.Collections.Specialized.NameValueCollection.Item`); arrays have none.
+- `name`: `sym` -- containing type + `.` + member, only when the identifier binds
+  to a field or property (e.g. a WebForms designer field `MyPage.txtName`);
+  locals, parameters, types and namespaces get none.
 - `new`: `type_full` -- the created type.
 - `local`: `type_full` -- the declared or inferred type (`var`, `Dim x = New ...`).
 
@@ -105,7 +126,8 @@ Lowering notes worth knowing when consuming the IR:
 - C# `switch` / VB `Select Case` lower to one flat `if` per section, `cond`
   being the governing expression; `lock`/`SyncLock`/`unsafe`/`checked`/`fixed`
   bodies are inlined; C# `using var x = ...;` wraps the rest of its block.
-- `await`, parentheses and `!` (null-forgiving) are transparent.
+- `await`, parentheses and the C# null-forgiving `!` suffix are transparent (a
+  prefix `!x` is a `unary`).
 - VB `x?.Y` lowers like C# (`member {obj: x, name: Y}`; the null check is dropped).
 - Once the emitted JSON reaches 400 levels of nesting, the remaining syntax at
   that point degrades to a single `unknown`/`other` node whose text covers

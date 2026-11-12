@@ -23,6 +23,8 @@ class ParamIR:
     name: str
     type: str | None = None
     attributes: list[Attr] = field(default_factory=list)
+    # Lowercased parameter modifiers (`this`, `params`, `ref`, `paramarray`, `optional`, ...).
+    modifiers: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -40,6 +42,11 @@ class PropertyIR:
     type: str | None = None
     attributes: list[Attr] = field(default_factory=list)
     line: int = 0
+    # Accessor bodies (Stmt dicts); None for auto properties / absent accessors.
+    get: list[dict] | None = None
+    set: list[dict] | None = None
+    # VB setter value parameter name (C# setters always use `value`).
+    set_param: str | None = None
 
 
 @dataclass
@@ -97,7 +104,7 @@ def _attrs(lst) -> list[Attr]:
 def _method(d: dict) -> MethodIR:
     return MethodIR(
         name=d.get("name", ""), modifiers=d.get("modifiers") or [], return_type=d.get("return_type"),
-        params=[ParamIR(p.get("name", ""), p.get("type"), _attrs(p.get("attributes"))) for p in d.get("params") or []],
+        params=[ParamIR(p.get("name", ""), p.get("type"), _attrs(p.get("attributes")), p.get("modifiers") or []) for p in d.get("params") or []],
         attributes=_attrs(d.get("attributes")), handles=d.get("handles") or [],
         body=d.get("body") or [], line=d.get("line", 0), end_line=d.get("end_line", 0),
     )
@@ -109,7 +116,8 @@ def _type(d: dict, path: str) -> TypeIR:
         modifiers=d.get("modifiers") or [], bases=d.get("bases") or [], attributes=_attrs(d.get("attributes")),
         fields=[FieldIR(f.get("name", ""), f.get("type"), f.get("line", 0), f.get("init"), bool(f.get("is_const")))
                 for f in d.get("fields") or []],
-        properties=[PropertyIR(p.get("name", ""), p.get("type"), _attrs(p.get("attributes")), p.get("line", 0))
+        properties=[PropertyIR(p.get("name", ""), p.get("type"), _attrs(p.get("attributes")), p.get("line", 0),
+                    p.get("get"), p.get("set"), p.get("set_param"))
                     for p in d.get("properties") or []],
         methods=[_method(m) for m in d.get("methods") or []],
         line=d.get("line", 0), end_line=d.get("end_line", 0), file=path,

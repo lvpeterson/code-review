@@ -15,10 +15,12 @@ def helper(roslyn_helper):
     return roslyn_helper
 
 
-def run_parse(helper, root, projects):
-    """projects: [(name, language, [paths])] -> list of decoded JSON Lines."""
+def run_parse(helper, root, projects, imports=None):
+    """projects: [(name, language, [paths])] -> list of decoded JSON Lines.
+    imports: optional {project name: [VB global imports]}."""
     req = {"root": str(root), "projects": [
-        {"name": n, "language": lang, "files": [str(p) for p in files], "references": []}
+        {"name": n, "language": lang, "files": [str(p) for p in files], "references": [],
+         **({"imports": imports[n]} if imports and n in imports else {})}
         for n, lang, files in projects]}
     req_path = root / "_request.json"
     req_path.write_text(json.dumps(req), encoding="utf-8")
@@ -355,3 +357,71 @@ def test_probe_fails_without_reference_assemblies(roslyn_helper, tmp_path):
     assert proc.returncode != 0
     assert "no reference assemblies" in proc.stderr
     assert proc.stdout.strip() == ""
+
+
+def test_unary_ir(roslyn_helper, tmp_path):
+    ir = parse_one(roslyn_helper, tmp_path, "U.cs", "cs", "class U { bool F(bool b, int i) { i++; return !b; } }")
+    body = ir["types"][0]["methods"][0]["body"]
+    assert body[0]["expr"] == {"k": "unary", "op": "++", "e": {"k": "name", "id": "i", "line": 1}, "line": 1}
+    assert body[1]["value"]["k"] == "unary" and body[1]["value"]["op"] == "!"
+
+
+def test_vb_not_unary(roslyn_helper, tmp_path):
+    ir = parse_one(roslyn_helper, tmp_path, "U.vb", "vb", "Module U\n Function F(b As Boolean) As Boolean\n  Return Not b\n End Function\nEnd Module\n")
+    assert ir["types"][0]["methods"][0]["body"][0]["value"]["op"] == "Not"
+
+
+def test_property_accessor_bodies(roslyn_helper, tmp_path):
+    ir = parse_one(roslyn_helper, tmp_path, "P.cs", "cs",
+        "class P { string _q; public string Q { get { return _q; } set { _q = value; } } public int A { get; set; } public int B => 1; }")
+    props = {p["name"]: p for p in ir["types"][0]["properties"]}
+    assert props["Q"]["get"][0]["k"] == "return" and props["Q"]["set"][0]["value"] == {"k": "name", "id": "value", "line": 1}
+    assert "get" not in props["A"] and "set" not in props["A"]
+    assert props["B"]["get"][0]["k"] == "return" and "set" not in props["B"]
+
+
+def test_vb_property_accessor_bodies(roslyn_helper, tmp_path):
+    ir = parse_one(roslyn_helper, tmp_path, "P.vb", "vb",
+        "Class P\n Private _q As String\n Public Property Q As String\n  Get\n   Return _q\n  End Get\n  Set(v As String)\n   _q = v\n  End Set\n End Property\n Public Property A As Integer\nEnd Class\n")
+    props = {p["name"]: p for p in ir["types"][0]["properties"]}
+    assert props["Q"]["get"][0]["k"] == "return"
+    assert props["Q"]["set"][0]["value"]["id"] == "v"
+    assert "get" not in props["A"] and "set" not in props["A"]
+
+
+def test_index_and_name_sym(roslyn_helper, tmp_path):
+    ir = parse_one(roslyn_helper, tmp_path, "W.cs", "cs",
+        "using System.Web; class W { HttpRequest r; string F(string s) { return r.QueryString[\"q\"] + r + s; } }")
+    ret = ir["types"][0]["methods"][0]["body"][0]["value"]
+    inner = ret["l"]
+    assert inner["l"]["k"] == "index" and inner["l"]["sym"] == "System.Collections.Specialized.NameValueCollection.Item"
+    assert inner["r"]["sym"] == "W.r"
+    assert "sym" not in ret["r"]  # parameter
+
+
+def test_vb_name_sym(roslyn_helper, tmp_path):
+    ir = parse_one(roslyn_helper, tmp_path, "N.vb", "vb",
+        "Class N\n Private t As String\n Function F(s As String) As String\n  Dim l = s\n  Return t & s & l\n End Function\nEnd Class\n")
+    v = ir["types"][0]["methods"][0]["body"][1]["value"]
+    assert v["l"]["l"]["sym"] == "N.t"
+    assert "sym" not in v["l"]["r"] and "sym" not in v["r"]
+
+
+def test_vb_project_imports(roslyn_helper, tmp_path):
+    src = tmp_path / "I.vb"; src.write_text("Module I\n Function F() As Object\n  Return New SqlCommand(\"x\")\n End Function\nEnd Module\n")
+    lines = run_parse(roslyn_helper, tmp_path, [("p", "vb", [src])], imports={"p": ["System.Data.SqlClient"]})
+    assert lines[0]["types"][0]["methods"][0]["body"][0]["value"]["type_full"] == "System.Data.SqlClient.SqlCommand"
+
+
+def test_param_modifiers_and_vb_set_param(roslyn_helper, tmp_path):
+    cs = parse_one(roslyn_helper, tmp_path, "E.cs", "cs",
+        "static class E { public static void F(this string s, params object[] a) {} public static void G(int x, ref int y) {} }")
+    ms = {m["name"]: m for m in cs["types"][0]["methods"]}
+    assert ms["F"]["params"][0]["modifiers"] == ["this"] and ms["F"]["params"][1]["modifiers"] == ["params"]
+    assert "modifiers" not in ms["G"]["params"][0] and ms["G"]["params"][1]["modifiers"] == ["ref"]
+    vb = parse_one(roslyn_helper, tmp_path, "E.vb", "vb",
+        "Class E\n Sub F(ParamArray a As Object(), Optional b As Integer = 1)\n End Sub\n"
+        " Private _q As String\n Public Property Q As String\n  Get\n   Return _q\n  End Get\n  Set(v As String)\n   _q = v\n  End Set\n End Property\nEnd Class\n")
+    f = vb["types"][0]["methods"][0]
+    assert f["params"][0]["modifiers"] == ["paramarray"] and f["params"][1]["modifiers"] == ["optional"]
+    assert vb["types"][0]["properties"][0]["set_param"] == "v"

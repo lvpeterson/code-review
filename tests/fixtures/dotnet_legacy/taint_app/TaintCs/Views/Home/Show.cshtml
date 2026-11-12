@@ -1,0 +1,8 @@
+@model Cs.Home.Profile
+<p>@Model.Name</p>
+@Html.Raw(ViewBag.Msg)
+@Html.Raw(Model.Bio)
+@Html.Raw("<b>x</b>")
+@{
+    var note = Html.Raw(Request.QueryString["n"]);
+}

@@ -181,10 +181,29 @@ internal sealed class VbLowering
                 _ => null,
             };
             if (p is null) continue;
+            var accessors = (m as PropertyBlockSyntax)?.Accessors ?? default;
             j.WriteStartObject();
             w.Str("name", p.Identifier.ValueText);
             w.Str("type", AsType(p.AsClause));
             Attributes("attributes", p.AttributeLists);
+            // Optional get/set Stmt lists from Property Get/Set blocks; an
+            // auto-property has no block and omits both.
+            foreach (var acc in accessors)
+            {
+                string? key = acc.Kind() switch
+                {
+                    SyntaxKind.GetAccessorBlock => "get",
+                    SyntaxKind.SetAccessorBlock => "set",
+                    _ => null,
+                };
+                if (key is null) continue;
+                j.WriteStartArray(key);
+                Seq(acc.Statements);
+                j.WriteEndArray();
+                // The setter's value parameter keeps its declared name (default `Value`).
+                if (key == "set")
+                    w.Str("set_param", acc.AccessorStatement.ParameterList?.Parameters.FirstOrDefault()?.Identifier.Identifier.ValueText ?? "Value");
+            }
             j.WriteNumber("line", DeclLine(p, p.AttributeLists));
             j.WriteEndObject();
         }
@@ -244,6 +263,7 @@ internal sealed class VbLowering
             w.Str("name", p.Identifier.Identifier.ValueText);
             w.Str("type", p.AsClause?.Type.ToString() ?? "Object");
             Attributes("attributes", p.AttributeLists);
+            if (p.Modifiers.Count > 0) w.StrArray("modifiers", p.Modifiers.Select(m => m.ValueText.ToLowerInvariant()));
             j.WriteEndObject();
         }
         j.WriteEndArray();
@@ -295,6 +315,13 @@ internal sealed class VbLowering
     {
         if (w.AtDepthCap) w.Text("other", line, fallbackText());
         else write();
+    }
+
+    /// <summary>Optional `params` key of a lambda: its parameter names, omitted when it has none.</summary>
+    void LambdaParams(ParameterListSyntax? list)
+    {
+        var names = (list?.Parameters ?? default).Select(p => p.Identifier.Identifier.ValueText).ToList();
+        if (names.Count > 0) w.StrArray("params", names);
     }
 
     void Body(string prop, SyntaxList<StatementSyntax> list, SyntaxNode fallback)
@@ -556,7 +583,19 @@ internal sealed class VbLowering
                 w.Lit(CSharpLowering.Negate(num.Token.Value), "number", line);
                 break;
 
-            case IdentifierNameSyntax id: w.Name(id.Identifier.ValueText, line); break;
+            case UnaryExpressionSyntax un when un.Kind() is SyntaxKind.NotExpression or SyntaxKind.UnaryMinusExpression:
+                w.Begin("unary", line);
+                w.Str("op", un.IsKind(SyntaxKind.NotExpression) ? "Not" : "-");
+                ExprProp("e", un.Operand);
+                w.End();
+                break;
+
+            case IdentifierNameSyntax id:
+                w.Begin("name", line);
+                w.Str("id", id.Identifier.ValueText);
+                w.OptStr("sym", sem?.NameSym(id));
+                w.End();
+                break;
             case GenericNameSyntax g: w.Name(g.Identifier.ValueText, line); break;
             case PredefinedTypeSyntax pt: w.Name(pt.Keyword.ValueText, line); break;
             case MeExpressionSyntax: w.Name("this", line); break;
@@ -677,6 +716,7 @@ internal sealed class VbLowering
 
             case SingleLineLambdaExpressionSyntax sl:
                 w.Begin("lambda", line);
+                LambdaParams(sl.SubOrFunctionHeader.ParameterList);
                 j.WritePropertyName("body");
                 if (sl.Body is ExpressionSyntax body) Expr(body);
                 else
@@ -689,6 +729,7 @@ internal sealed class VbLowering
                 break;
             case MultiLineLambdaExpressionSyntax ml:
                 w.Begin("lambda", line);
+                LambdaParams(ml.SubOrFunctionHeader.ParameterList);
                 Body("body", ml.Statements, ml);
                 w.End();
                 break;

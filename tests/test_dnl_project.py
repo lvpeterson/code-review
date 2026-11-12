@@ -129,3 +129,27 @@ def test_sdk_project_with_explicit_compile_claims_whole_dir(tmp_path):
     projs = project.load_projects(tmp_path)
     assert [p.name for p in projs] == ["S"]
     assert {f.name for f in projs[0].compile_files} == {"a.cs", "b.cs"}
+
+
+# -- accessor bodies and VB imports (taint groundwork) ---------------------------
+
+def test_property_bodies_loaded(roslyn_helper):
+    project._CACHE.clear()
+    m = project.prepare(FX / "model_with_props", False)
+    props = {p.name: p for t in m.types() for p in t.properties}
+    q = props["Q"]
+    assert q.get and q.get[0]["k"] == "return" and q.set is not None
+    assert props["Auto"].get is None and props["Auto"].set is None
+
+
+def test_vbproj_imports_parsed():
+    projs = project.load_projects(FX / "mvc5_app")
+    vb = next(p for p in projs if p.name == "MvcVb")
+    assert "System.Data.SqlClient" in vb.imports
+
+
+def test_request_sends_imports_for_vb_only(mvc_fixture):
+    req = project._request(project.load_projects(mvc_fixture))
+    vb = next(r for r in req if r["name"] == "MvcVb")
+    assert "System.Data.SqlClient" in vb["imports"]
+    assert all("imports" not in r for r in req if r["language"] == "cs")

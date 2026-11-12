@@ -9,9 +9,10 @@ nothing and only config still reports.
 """
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
-from checks.dnl import auth, project, routes, rules_auth, rules_config
+from checks.dnl import auth, project, routes, rules_auth, rules_config, rules_object, rules_taint, rules_xss
 from checks.dnl.files import iter_dnl_files
 from checks.dnl.project import ProjectModel
 from checks.dnl.webconfig import load_configs
@@ -64,8 +65,13 @@ def _code_results(model: ProjectModel) -> dict[str, tuple[list[Route], list[Find
         return cached
     out: dict[str, tuple[list[Route], list[Finding]]] = {k: ([], []) for k in ("mvc", "webapi", "webforms", "config")}
     if not model.degraded:
+        # Deeply nested expressions recurse through the evaluator; give it headroom.
+        sys.setrecursionlimit(max(sys.getrecursionlimit(), 4000))
         refs = routes.discover_mvc_webapi(model) + routes.discover_webforms(model)
         findings = rules_auth.check_routes(model, refs, auth.global_filters(model), auth.chain_for_model(model))
+        findings += rules_taint.check(model, refs)
+        findings += rules_xss.check(model, refs)
+        findings += rules_object.check(model, refs)
         for ref in refs:
             out[ref.route.meta["kind"]][0].append(ref.route)
         for f in findings:

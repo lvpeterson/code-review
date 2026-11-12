@@ -73,6 +73,14 @@ _add(["DNL-INV-001"], "A02", "A05", "API9", "always")
 _add(["DNL-RES-001"], "A06", "A04", "API4")
 _add([f"DNL-AUTHZ-00{n}" for n in range(1, 5)], "A01", "A01", "API5")
 _add(["DNL-CSRF-001"], "A01", "A01", None)
+# Taint-analysis rules (Plan 2).
+_add([f"DNL-INJ-00{n}" for n in range(1, 7)], "A05", "A03", "API8")
+_add(["DNL-XSS-001", "DNL-XSS-003", "DNL-XSS-004"], "A05", "A03", None)
+_add(["DNL-PATH-001", "DNL-REDIR-001"], "A01", "A01", None)
+_add(["DNL-SSRF-001"], "A01", "A10", "API7")
+_add(["DNL-LOG-001"], "A09", "A09", None)
+_add(["DNL-AUTHZ-005"], "A01", "A01", "API1")
+_add(["DNL-AUTHZ-006", "DNL-AUTHZ-007"], "A06", "A04", "API3")
 
 _PREFIX: list[tuple[str, tuple[str, str, Optional[str], str]]] = []
 

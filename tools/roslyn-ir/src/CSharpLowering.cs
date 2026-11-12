@@ -146,6 +146,7 @@ internal sealed class CSharpLowering
             w.Str("name", p.Identifier.ValueText);
             w.Str("type", p.Type.ToString());
             Attributes("attributes", p.AttributeLists);
+            Accessors(p);
             j.WriteNumber("line", DeclLine(p, p.AttributeLists));
             j.WriteEndObject();
         }
@@ -191,6 +192,7 @@ internal sealed class CSharpLowering
             w.Str("name", p.Identifier.ValueText);
             w.Str("type", p.Type?.ToString());
             Attributes("attributes", p.AttributeLists);
+            if (p.Modifiers.Count > 0) w.StrArray("modifiers", p.Modifiers.Select(m => m.ValueText.ToLowerInvariant()));
             j.WriteEndObject();
         }
         j.WriteEndArray();
@@ -223,6 +225,37 @@ internal sealed class CSharpLowering
         j.WriteNumber("line", DeclLine(node, attrs));
         j.WriteNumber("end_line", EndLine(node));
         j.WriteEndObject();
+    }
+
+    /// <summary>Optional get/set Stmt lists: accessor blocks or expression
+    /// bodies. "=> expr" lowers as get: [return expr]; auto-properties omit both.</summary>
+    void Accessors(PropertyDeclarationSyntax p)
+    {
+        var j = w.J;
+        if (p.ExpressionBody is { } arrow)
+        {
+            j.WriteStartArray("get");
+            Return(arrow.Expression, Line(arrow.Expression));
+            j.WriteEndArray();
+            return;
+        }
+        if (p.AccessorList is null) return;
+        foreach (var acc in p.AccessorList.Accessors)
+        {
+            string? key = acc.Keyword.Kind() switch
+            {
+                SyntaxKind.GetKeyword => "get",
+                SyntaxKind.SetKeyword or SyntaxKind.InitKeyword => "set",
+                _ => null,
+            };
+            if (key is null) continue;
+            if (acc.Body is null && acc.ExpressionBody is null) continue;
+            j.WriteStartArray(key);
+            if (acc.Body is not null) Seq(acc.Body.Statements);
+            else if (key == "get") Return(acc.ExpressionBody!.Expression, Line(acc.ExpressionBody.Expression));
+            else ExpressionStmt(acc.ExpressionBody!.Expression, Line(acc.ExpressionBody.Expression));
+            j.WriteEndArray();
+        }
     }
 
     void Attributes(string prop, SyntaxList<AttributeListSyntax> lists)
@@ -440,6 +473,7 @@ internal sealed class CSharpLowering
                 w.Str("type", lf.ReturnType.ToString());
                 j.WritePropertyName("init");
                 w.Begin("lambda", line);
+                LambdaParams(lf.ParameterList.Parameters.Select(p => p.Identifier.ValueText));
                 j.WritePropertyName("body");
                 LambdaBody(lf.Body, lf.ExpressionBody?.Expression, lf);
                 w.End();
@@ -560,7 +594,25 @@ internal sealed class CSharpLowering
                 w.Lit(Negate(num.Token.Value), "number", line);
                 break;
 
-            case IdentifierNameSyntax id: w.Name(id.Identifier.ValueText, line); break;
+            case PrefixUnaryExpressionSyntax un when UnaryOp(un.Kind()) is { } op:
+                w.Begin("unary", line);
+                w.Str("op", op);
+                ExprProp("e", un.Operand);
+                w.End();
+                break;
+            case PostfixUnaryExpressionSyntax un when UnaryOp(un.Kind()) is { } op:
+                w.Begin("unary", line);
+                w.Str("op", op);
+                ExprProp("e", un.Operand);
+                w.End();
+                break;
+
+            case IdentifierNameSyntax id:
+                w.Begin("name", line);
+                w.Str("id", id.Identifier.ValueText);
+                w.OptStr("sym", sem?.NameSym(id));
+                w.End();
+                break;
             case GenericNameSyntax g: w.Name(g.Identifier.ValueText, line); break;
             case PredefinedTypeSyntax pt: w.Name(pt.Keyword.ValueText, line); break;
             case ThisExpressionSyntax: w.Name("this", line); break;
@@ -581,7 +633,7 @@ internal sealed class CSharpLowering
                 WithReceiver(recv => Member(recv, mb.Name.Identifier.ValueText, line, mb));
                 break;
             case ElementBindingExpressionSyntax eb when receivers.Count > 0:
-                WithReceiver(recv => Index(recv, eb.ArgumentList.Arguments, line));
+                WithReceiver(recv => Index(recv, eb.ArgumentList.Arguments, line, eb));
                 break;
 
             case InvocationExpressionSyntax inv:
@@ -592,7 +644,7 @@ internal sealed class CSharpLowering
                 w.End();
                 break;
             case ElementAccessExpressionSyntax ea:
-                Index(ea.Expression, ea.ArgumentList.Arguments, line);
+                Index(ea.Expression, ea.ArgumentList.Arguments, line, ea);
                 break;
 
             case ObjectCreationExpressionSyntax oc:
@@ -660,6 +712,14 @@ internal sealed class CSharpLowering
 
             case AnonymousFunctionExpressionSyntax fn:
                 w.Begin("lambda", line);
+                LambdaParams(fn switch
+                {
+                    SimpleLambdaExpressionSyntax sl => new[] { sl.Parameter.Identifier.ValueText },
+                    ParenthesizedLambdaExpressionSyntax pl => pl.ParameterList.Parameters.Select(p => p.Identifier.ValueText),
+                    AnonymousMethodExpressionSyntax am when am.ParameterList is not null =>
+                        am.ParameterList.Parameters.Select(p => p.Identifier.ValueText),
+                    _ => [],
+                });
                 j.WritePropertyName("body");
                 LambdaBody(fn.Block, fn.ExpressionBody, fn);
                 w.End();
@@ -691,13 +751,24 @@ internal sealed class CSharpLowering
         w.End();
     }
 
-    void Index(ExpressionSyntax obj, SeparatedSyntaxList<ArgumentSyntax> args, int line)
+    static string? UnaryOp(SyntaxKind k) => k switch
+    {
+        SyntaxKind.LogicalNotExpression => "!",
+        SyntaxKind.UnaryMinusExpression => "-",
+        SyntaxKind.BitwiseNotExpression => "~",
+        SyntaxKind.PreIncrementExpression or SyntaxKind.PostIncrementExpression => "++",
+        SyntaxKind.PreDecrementExpression or SyntaxKind.PostDecrementExpression => "--",
+        _ => null,
+    };
+
+    void Index(ExpressionSyntax obj, SeparatedSyntaxList<ArgumentSyntax> args, int line, ExpressionSyntax symNode)
     {
         w.Begin("index", line);
         ExprProp("obj", obj);
         w.J.WriteStartArray("args");
         foreach (var a in args) Expr(a.Expression);
         w.J.WriteEndArray();
+        w.OptStr("sym", sem?.IndexSym(symNode));
         w.End();
     }
 
@@ -770,6 +841,13 @@ internal sealed class CSharpLowering
     };
 
     /// <summary>Lambda body: Stmt list for a block (or an assignment expression), else a single Expr.</summary>
+    /// <summary>Optional `params` key of a lambda: its parameter names, omitted when it has none.</summary>
+    void LambdaParams(IEnumerable<string> names)
+    {
+        var list = names.ToList();
+        if (list.Count > 0) w.StrArray("params", list);
+    }
+
     void LambdaBody(BlockSyntax? block, ExpressionSyntax? expr, SyntaxNode fallback)
     {
         if (block is null && expr is not null && expr is not AssignmentExpressionSyntax)

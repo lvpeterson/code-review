@@ -68,6 +68,107 @@ enumerated, else to the first code analyzer that runs, else to config.
   are exempt: they keep their severity and say the transform overrides the
   value while the base Web.config still holds it.
 
+## Taint analysis
+
+`checks/dnl/taint.py` (per-method flow), `taint_solver.py` (cross-method
+summaries) and `taint_tables.py` (data tables: adding a source, sink or
+sanitizer is a one-line change there) follow untrusted data through the code.
+
+- **Sources** -- action parameters other than plain numbers, bools, chars, enums, dates /
+  `DateTimeOffset` / `TimeSpan`, GUIDs and `CancellationToken`, `Request.QueryString` / `Form` / `Params` / `Cookies` / `Headers` and
+  similar request collections, `Request.Path` / `PathInfo` / `UserAgent` /
+  `ContentType` / `FilePath` (not `HttpMethod`), `RouteData.Values`, and WebForms control
+  values (`TextBox.Text`, `HiddenField.Value`, list selections, ...). Values
+  put into `ViewBag` / `ViewData` from these carry their taint into the view:
+  `ViewBag` per key, `ViewData` per dictionary (any tainted `ViewData` write
+  taints every `ViewData` read).
+- **Sinks** -- ADO.NET command text and adapters, EF `SqlQuery` /
+  `ExecuteSqlCommand` (sql); Dynamic LINQ expressions (linq); process start
+  (cmd); LDAP filters and paths (ldap); XPath queries (xpath); response
+  headers and cookie values (header); HTML output from code (xss); file paths (path); redirect
+  targets (redirect); outbound request URLs (ssrf); log messages (log).
+- **Sanitizers** cleanse only the sink kinds they are valid for: numeric
+  `Parse` / `Convert.ToX` / `Val` and safe-type casts (every kind),
+  `HtmlEncode` / `JavaScriptEncode` (xss), `Path.GetFileName` (path), LDAP
+  escape helpers (ldap; a project method merely named like one must contain a
+  `Replace` call to count). CR/LF removal cleanses header and log only once
+  both CR and LF have been removed by constant `Replace` calls (a constant
+  replacement without CR/LF); removing just one, or the CRLF pair, does nothing. `UrlEncode` does not
+  stop an off-site redirect and is deliberately not a sanitizer.
+  Parameterized queries (constant `CommandText` + `Parameters.Add*`) never
+  fire, and a constant-only value never produces a finding.
+- **Guards** -- an `if` that proves a value safe inside its branch (or after
+  an early return on the negated test): `Url.IsLocalUrl` (redirect),
+  whitelist `Contains` (only on a non-string, untainted collection
+  receiver; `text.Contains(x)` searches inside text and whitelists nothing) /
+  `Array.IndexOf` (all kinds), and `Path.GetFullPath` + `StartsWith`
+  (path). `Regex.IsMatch` is deliberately not a guard: wildcard-equivalent patterns and `$` / `\Z` (which admit a trailing newline) make a regex check unreliable.
+
+Each project method gets a summary of which sinks its parameters reach, what
+flows to its return value and which fields it stores. Summaries are
+recomputed until nothing changes, so a value passed controller -> service ->
+repository is followed across files, through interface / abstract dispatch
+(interface -> implementations) and through recursion.
+
+- **Proven** finding: a request source reaches the sink. It takes the rule's
+  severity, names the source and the call path, and carries the route of the
+  entry point when one reaches it.
+- **REVIEW** finding: the sink is fed only by its own method's parameters and
+  no caller passing untrusted data was found (dead code, reflection, a caller
+  outside the solution). It is one severity level lower, marked
+  `confidence: REVIEW`, has no route and asks you to verify how it is called.
+- Findings are deduplicated per rule, sink file and line.
+- When several routes reach the same sink, the finding names the route that is
+  the minimum of (handler name, path, file, line) and its description ends
+  with "; also reached from N more route(s)".
+- **Depth cap**: the solver stops after 24 rounds. Whether it converged and
+  how many rounds it took are recorded on the model; when it did not
+  converge, the scan carries a note saying some deep flows may be missing.
+  Methods whose expressions nest too deeply to evaluate fully, and methods
+  whose analysis raised an internal error, are counted in scan notes too
+  (the scan continues without them).
+- **IDOR gating** (DNL-AUTHZ-005): fires only when an id-like action
+  parameter selects a record (EF `Find` / `FirstOrDefault` / `Where` on a
+  `DbSet`, a sql sink, or a project method that does either) and nothing ties
+  the access to the signed-in user. It is independent of `[Authorize]` and
+  always REVIEW. A user reference suppresses it only inside the data-access
+  call itself (an argument, a lambda, an earlier `Where` in the chain), or in
+  an `if` / ternary that compares the user with the accessed record (the
+  fetched entity, its members, or the id) and rejects the request or holds
+  the access. An unrelated reference does not suppress: a log line that
+  mentions the user, a null / sign-in check, or a comparison against a
+  different record.
+- **Over-posting** (DNL-AUTHZ-006): an entity bound with no `[Bind]`. An
+  Exclude-only `[Bind(Exclude=...)]` leaves every other field bindable, so
+  that case is marked REVIEW.
+
+Known limits, not modelled:
+
+- Reflection and `dynamic` calls are not followed.
+- DI container wiring beyond interface -> implementations (named
+  registrations, factories, decorators) is not resolved.
+- Stored-then-read data (a value written to a database or file in one request
+  and used in another) is not tracked.
+- Calls across solutions (an assembly referenced only as a binary) are not
+  followed.
+- Lambda bodies are evaluated on a copy of the environment: sinks inside are
+  reported, assignments inside are discarded, and the first parameter takes
+  the receiver's taint only for LINQ-style calls (`Select`, `Where`,
+  `ForEach`, `Any`, `First*`, ...). A delegate stored and invoked later is
+  not followed.
+- Syntax the IR could not lower (`unknown` / `other` nodes, e.g. a switch
+  expression or VB `Request.QueryString!q`) is scanned conservatively: a
+  request access in its text is a source, otherwise it carries the taint of
+  the variables it mentions. It is never a sink.
+- An external call that no helper table covers propagates only the
+  receiver's taint, not its arguments.
+- Fluent receivers (`GetSvc().Find(x)`) are not resolved to a project
+  method.
+- `ViewData` / `ViewBag` taint is tracked per dictionary, not per key.
+- The AUTHZ-005/006/007 heuristics work from names written in source:
+  AUTHZ-005 is always REVIEW (and `low`, since a name heuristic is weak evidence), AUTHZ-006 is REVIEW only when the `[Bind]` is
+  Exclude-only, and AUTHZ-007 is a plain `low` finding with no REVIEW mark.
+
 ## Detection
 
 `detector.py` walks the target once (skipping `bin`, `obj`, `packages`,
@@ -119,6 +220,22 @@ DNL-INV-001, which always carries it.
 | DNL-SEC-002 | medium | Secret-named `appSettings` key with a literal value (keys with a word naming a setting, such as `PasswordResetUrl`, `Password_Format`, `PasswordRegex`, `TokenExpiration`, are skipped; matched on camelCase / `_` words, so `InformationApiKey` still fires) | A07:2025 | A07:2021 | API2:2023 |
 | DNL-INV-001 | low/medium | `elmah.axd` / `trace.axd` handler registered (low when anonymous access is denied) | A02:2025 | A05:2021 | API9:2023 |
 | DNL-RES-001 | low | `maxRequestLength` / `maxAllowedContentLength` over 100 MB | A06:2025 | A04:2021 | API4:2023 |
+| DNL-INJ-001 | high | SQL injection (tainted input reaches a query sink) | A05:2025 | A03:2021 | API8:2023 |
+| DNL-INJ-002 | high | Command injection | A05:2025 | A03:2021 | API8:2023 |
+| DNL-INJ-003 | high | LDAP injection | A05:2025 | A03:2021 | API8:2023 |
+| DNL-INJ-004 | medium | XPath injection | A05:2025 | A03:2021 | API8:2023 |
+| DNL-INJ-005 | medium | HTTP header injection | A05:2025 | A03:2021 | API8:2023 |
+| DNL-INJ-006 | high | Dynamic LINQ injection | A05:2025 | A03:2021 | API8:2023 |
+| DNL-XSS-001 | high | XSS via a code sink | A05:2025 | A03:2021 | -- |
+| DNL-XSS-003 | high/low | XSS via Razor/ASPX output: raw `Html.Raw` / `<%= %>` / `<%# %>` fed by the request, ViewBag or view model (high); other non-literal raw output for review (low); a single `Url.Content` / `Html.Partial` / `Scripts.Render`-style helper call with constant arguments is ignored | A05:2025 | A03:2021 | -- |
+| DNL-XSS-004 | medium | Request validation bypassed in code: `[AllowHtml]` on a bound model property, `[ValidateInput(false)]`, `Request.Unvalidated` | A05:2025 | A03:2021 | -- |
+| DNL-PATH-001 | high | Path traversal | A01:2025 | A01:2021 | -- |
+| DNL-REDIR-001 | medium | Open redirect | A01:2025 | A01:2021 | -- |
+| DNL-SSRF-001 | high | Server-side request forgery | A01:2025 | A10:2021 | API7:2023 |
+| DNL-LOG-001 | low | Log injection | A09:2025 | A09:2021 | -- |
+| DNL-AUTHZ-005 | low | Object-level authorization gap (IDOR), always REVIEW | A01:2025 | A01:2021 | API1:2023 |
+| DNL-AUTHZ-006 | medium | Over-posting (entity bound from request); REVIEW when only an Exclude-only `[Bind]` is present | A06:2025 | A04:2021 | API3:2023 |
+| DNL-AUTHZ-007 | low | Entity returned from an API (over-exposure) | A06:2025 | A04:2021 | API3:2023 |
 
 `tests/test_dnl_end_to_end.py` fails if a rule in `core/owasp_web.RULES` is
 missing here or its tags drift.

@@ -36,3 +36,13 @@ def test_rule_table_spot_checks():
     assert RULES["DNL-SESS-005"][:2] == ("A04", "A02")
     assert RULES["DNL-INV-001"][3] == "always"
     assert "DNL-AUTHZ-004" in RULES and "DNL-CSRF-001" in RULES
+
+
+def test_taint_rule_ids_tagged():
+    assert owasp_for("DNL-SSRF-001", api_surface=True) == {
+        "2025": "A01:2025 Broken Access Control",
+        "2021": "A10:2021 Server-Side Request Forgery",
+        "api2023": "API7:2023 Server Side Request Forgery"}
+    assert owasp_for("DNL-AUTHZ-005", api_surface=True)["api2023"].startswith("API1:2023")
+    assert "api2023" not in owasp_for("DNL-INJ-001")
+    assert "api2023" not in owasp_for("DNL-PATH-001", api_surface=True)

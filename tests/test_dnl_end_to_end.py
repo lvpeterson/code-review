@@ -168,3 +168,22 @@ def test_project_less_site_end_to_end(tmp_path, roslyn_helper):
     assert [r.path for r in wf.routes] == ["/Default.aspx"]
     assert any(f.check_id == "DNL-AUTHZ-001" for f in wf.findings)
     assert any(f.check_id == "DNL-XSS-002" for f in cfg.findings)
+
+
+def test_end_to_end_taint_app(tmp_path, monkeypatch, roslyn_helper):
+    out = tmp_path / "r.json"
+    monkeypatch.setattr(sys, "argv", ["main.py", str(FX / "taint_app"), "--json", str(out)])
+    assert main.main() == 0
+    inj = [f for r in json.loads(out.read_text()) for f in r["findings"] if f["check_id"] == "DNL-INJ-001"]
+    assert inj and all(f["owasp"]["2025"].startswith("A05:2025") for f in inj)
+
+
+def test_taint_solver_performance_guard(roslyn_helper):
+    """Bounded work rather than wall time: the fixpoint must settle within the round cap."""
+    from checks.dnl import taint_solver
+    model = project.prepare(FX / "taint_app", False)
+    taint_solver.solve(model)
+    state = model.cache["taint"]
+    assert state["converged"] is True
+    # Observed 11 rounds; the cap is 24, so there is margin and converged carries the check.
+    assert state["rounds"] <= 24

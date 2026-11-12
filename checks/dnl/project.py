@@ -34,6 +34,8 @@ class Project:
     # VB prepends it implicitly to every type name (see routes._page_type).
     root_namespace: str | None = None
     references: set[str] = field(default_factory=set)
+    # VB project-level <Import> namespaces (implicit file imports).
+    imports: list[str] = field(default_factory=list)
     project_refs: list[Path] = field(default_factory=list)
     compile_files: list[Path] = field(default_factory=list)
     content_files: list[Path] = field(default_factory=list)
@@ -131,6 +133,8 @@ def _load_project(path: Path, notes: list[str]) -> Project:
             proj.root_namespace = el.text.strip()
         elif tag == "Reference" and inc:
             proj.references.add(inc.split(",")[0].strip().lower())
+        elif tag == "Import" and inc and proj.language == "vb":
+            proj.imports.append(inc.strip())
         elif tag in ("ProjectReference", "Compile", "Content") and inc:
             target = resolve_ci(proj.dir, _MSBUILD_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), inc))
             if target is None:
@@ -183,8 +187,11 @@ def _request(projects: list[Project]) -> list[dict]:
                 sent.add(f.resolve())
                 files.append(str(f))
         if files:
-            out.append({"name": p.name, "language": p.language, "files": files,
-                        "references": sorted(p.references)})
+            req = {"name": p.name, "language": p.language, "files": files,
+                   "references": sorted(p.references)}
+            if p.language == "vb":
+                req["imports"] = list(p.imports)
+            out.append(req)
     return out
 
 

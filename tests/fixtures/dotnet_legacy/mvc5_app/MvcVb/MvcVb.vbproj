@@ -7,6 +7,9 @@
     <Reference Include="System.Web.Mvc, Version=5.2.7.0" />
   </ItemGroup>
   <ItemGroup>
+    <Import Include="System.Data.SqlClient" />
+  </ItemGroup>
+  <ItemGroup>
     <Compile Include="Controllers\ordersController.vb" />
     <Compile Include="RouteConfig.vb" />
   </ItemGroup>

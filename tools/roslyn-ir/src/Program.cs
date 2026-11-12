@@ -98,6 +98,12 @@ internal static class Program
             // "references" (project-to-project) is accepted but ignored: the
             // compilation sees only this project's files plus refs/net48.
 
+            // Optional extra VB global imports, added to the template defaults.
+            var imports = new List<string>();
+            if (project.TryGetProperty("imports", out var imps) && imps.ValueKind == JsonValueKind.Array)
+                foreach (var i in imps.EnumerateArray())
+                    if (i.GetString() is { Length: > 0 } ns) imports.Add(ns);
+
             // Pass 1: read and parse every file; a failure costs only that file.
             var files = new List<(string Rel, SyntaxTree? Tree, string? Error)>();
             foreach (var f in project.GetProperty("files").EnumerateArray())
@@ -118,7 +124,7 @@ internal static class Program
 
             // One compilation per project, one SemanticModel per tree.
             var trees = files.Where(x => x.Tree is not null).Select(x => x.Tree!).ToList();
-            var compilation = trees.Count > 0 ? Semantics.Compile(language, name, trees) : null;
+            var compilation = trees.Count > 0 ? Semantics.Compile(language, name, trees, imports) : null;
 
             // Pass 2: lower in request order.
             foreach (var (rel, tree, error) in files)

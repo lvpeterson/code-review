@@ -70,7 +70,8 @@ internal sealed class Semantics
     ];
 
     /// <summary>One compilation for a project's parsed trees; null if it cannot be built.</summary>
-    public static Compilation? Compile(string language, string project, IReadOnlyList<SyntaxTree> trees)
+    public static Compilation? Compile(string language, string project, IReadOnlyList<SyntaxTree> trees,
+        IReadOnlyList<string>? extraImports = null)
     {
         try
         {
@@ -81,7 +82,7 @@ internal sealed class Semantics
                     new CS.CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, allowUnsafe: true)),
                 "vb" => VB.VisualBasicCompilation.Create(name, trees.Cast<VB.VisualBasicSyntaxTree>(), Refs.Value,
                     new VB.VisualBasicCompilationOptions(OutputKind.DynamicallyLinkedLibrary,
-                        globalImports: VbDefaultImports.Select(VB.GlobalImport.Parse),
+                        globalImports: VbDefaultImports.Concat(extraImports ?? []).Distinct().Select(ParseImport).OfType<VB.GlobalImport>(),
                         optionStrict: VB.OptionStrict.Off, optionInfer: true)),
                 _ => null,
             };
@@ -91,6 +92,13 @@ internal sealed class Semantics
             Console.Error.WriteLine($"roslyn-ir: {project}: compilation failed, emitting syntax only: {ex.Message}");
             return null;
         }
+    }
+
+    /// <summary>A malformed caller-supplied import is skipped, not fatal.</summary>
+    static VB.GlobalImport? ParseImport(string ns)
+    {
+        try { return VB.GlobalImport.Parse(ns); }
+        catch (Exception) { return null; }
     }
 
     // -- queries --------------------------------------------------------------
@@ -112,6 +120,33 @@ internal sealed class Semantics
                 agreed = n;
             }
             return agreed;
+        }
+        catch (Exception) { return null; }
+    }
+
+    /// <summary>"ContainingType.member" for an identifier that binds to a field or
+    /// property; locals, parameters, types and namespaces yield null.</summary>
+    public string? NameSym(SyntaxNode node)
+    {
+        try
+        {
+            var sym = model.GetSymbolInfo(node).Symbol;
+            if (sym is not (IFieldSymbol or IPropertySymbol)) return null;
+            return MemberName(sym);
+        }
+        catch (Exception) { return null; }
+    }
+
+    /// <summary>"ContainingType.Item" when an element access binds to an indexer.</summary>
+    public string? IndexSym(SyntaxNode node)
+    {
+        try
+        {
+            var info = model.GetSymbolInfo(node);
+            var sym = info.Symbol ?? (info.CandidateSymbols.Length == 1 ? info.CandidateSymbols[0] : null);
+            if (sym is not IPropertySymbol { IsIndexer: true } prop) return null;
+            var owner = TypeName(prop.ContainingType);
+            return owner is null ? null : owner + ".Item";
         }
         catch (Exception) { return null; }
     }
