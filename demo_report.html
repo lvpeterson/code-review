@@ -508,7 +508,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
           
     <div class="code-header">
       <span class="code-path">app.py:13</span>
-      <a class="ide-link" href="vscode://file/C:/Users/lvpet/OneDrive/Documents/GitHub/Scripts/code-review/demo/sample-app/app.py:13">open in editor &rarr;</a>
+      <a class="ide-link" href="vscode://file//path/to/code-review/demo/sample-app/app.py:13">open in editor &rarr;</a>
     </div><div class="code-block"><div class="highlight"><pre><span></span><span class="hll"><span class="linenos">13</span><span class="nd">@app</span><span class="o">.</span><span class="n">route</span><span class="p">(</span><span class="s2">"/invoices/&lt;int:invoice_id&gt;"</span><span class="p">,</span> <span class="n">methods</span><span class="o">=</span><span class="p">[</span><span class="s2">"DELETE"</span><span class="p">])</span>
 </span><span class="linenos">14</span><span class="k">def</span><span class="w"> </span><span class="nf">delete_invoice</span><span class="p">(</span><span class="n param-highlight" title="path parameter -- user-controlled input">invoice_id</span><span class="p">):</span>
 <span class="linenos">15</span>    <span class="n">db</span><span class="o">.</span><span class="n">query</span><span class="p">(</span><span class="n">Invoice</span><span class="p">)</span><span class="o">.</span><span class="n">filter_by</span><span class="p">(</span><span class="nb">id</span><span class="o">=</span><span class="n param-highlight" title="path parameter -- user-controlled input">invoice_id</span><span class="p">)</span><span class="o">.</span><span class="n">delete</span><span class="p">()</span>
@@ -545,7 +545,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
           
     <div class="code-header">
       <span class="code-path">app.py:6</span>
-      <a class="ide-link" href="vscode://file/C:/Users/lvpet/OneDrive/Documents/GitHub/Scripts/code-review/demo/sample-app/app.py:6">open in editor &rarr;</a>
+      <a class="ide-link" href="vscode://file//path/to/code-review/demo/sample-app/app.py:6">open in editor &rarr;</a>
     </div><div class="code-block"><div class="highlight"><pre><span></span><span class="hll"><span class="linenos"> 6</span><span class="nd">@app</span><span class="o">.</span><span class="n">route</span><span class="p">(</span><span class="s2">"/invoices/&lt;int:invoice_id&gt;"</span><span class="p">,</span> <span class="n">methods</span><span class="o">=</span><span class="p">[</span><span class="s2">"GET"</span><span class="p">])</span>
 </span><span class="linenos"> 7</span><span class="k">def</span><span class="w"> </span><span class="nf">get_invoice</span><span class="p">(</span><span class="n param-highlight" title="path parameter -- user-controlled input">invoice_id</span><span class="p">):</span>
 <span class="linenos"> 8</span>    <span class="c1"># No ownership check -- any authenticated user can pull any invoice_id.</span>
@@ -576,7 +576,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
           
     <div class="code-header">
       <span class="code-path">app.py:35</span>
-      <a class="ide-link" href="vscode://file/C:/Users/lvpet/OneDrive/Documents/GitHub/Scripts/code-review/demo/sample-app/app.py:35">open in editor &rarr;</a>
+      <a class="ide-link" href="vscode://file//path/to/code-review/demo/sample-app/app.py:35">open in editor &rarr;</a>
     </div><div class="code-block"><div class="highlight"><pre><span></span><span class="hll"><span class="linenos">35</span><span class="nd">@app</span><span class="o">.</span><span class="n">route</span><span class="p">(</span><span class="s2">"/healthz"</span><span class="p">)</span>
 </span><span class="linenos">36</span><span class="k">def</span><span class="w"> </span><span class="nf">health_check</span><span class="p">():</span>
 <span class="linenos">37</span>    <span class="k">return</span> <span class="s2">"ok"</span>
@@ -599,7 +599,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
           
     <div class="code-header">
       <span class="code-path">app.py:20</span>
-      <a class="ide-link" href="vscode://file/C:/Users/lvpet/OneDrive/Documents/GitHub/Scripts/code-review/demo/sample-app/app.py:20">open in editor &rarr;</a>
+      <a class="ide-link" href="vscode://file//path/to/code-review/demo/sample-app/app.py:20">open in editor &rarr;</a>
     </div><div class="code-block"><div class="highlight"><pre><span></span><span class="hll"><span class="linenos">20</span><span class="nd">@app</span><span class="o">.</span><span class="n">route</span><span class="p">(</span><span class="s2">"/account/profile"</span><span class="p">,</span> <span class="n">methods</span><span class="o">=</span><span class="p">[</span><span class="s2">"GET"</span><span class="p">])</span>
 </span><span class="linenos">21</span><span class="nd">@login_required</span>
 <span class="linenos">22</span><span class="k">def</span><span class="w"> </span><span class="nf">get_profile</span><span class="p">():</span>
@@ -623,7 +623,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
           
     <div class="code-header">
       <span class="code-path">app.py:26</span>
-      <a class="ide-link" href="vscode://file/C:/Users/lvpet/OneDrive/Documents/GitHub/Scripts/code-review/demo/sample-app/app.py:26">open in editor &rarr;</a>
+      <a class="ide-link" href="vscode://file//path/to/code-review/demo/sample-app/app.py:26">open in editor &rarr;</a>
     </div><div class="code-block"><div class="highlight"><pre><span></span><span class="hll"><span class="linenos">26</span><span class="nd">@app</span><span class="o">.</span><span class="n">route</span><span class="p">(</span><span class="s2">"/account/profile"</span><span class="p">,</span> <span class="n">methods</span><span class="o">=</span><span class="p">[</span><span class="s2">"POST"</span><span class="p">])</span>
 </span><span class="linenos">27</span><span class="nd">@login_required</span>
 <span class="linenos">28</span><span class="k">def</span><span class="w"> </span><span class="nf">update_profile</span><span class="p">():</span>
@@ -670,7 +670,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
           
     <div class="code-header">
       <span class="code-path">OrderController.java:10</span>
-      <a class="ide-link" href="vscode://file/C:/Users/lvpet/OneDrive/Documents/GitHub/Scripts/code-review/demo/sample-app/OrderController.java:10">open in editor &rarr;</a>
+      <a class="ide-link" href="vscode://file//path/to/code-review/demo/sample-app/OrderController.java:10">open in editor &rarr;</a>
     </div><div class="code-block"><div class="highlight"><pre><span></span><span class="linenos"> 9</span><span class="w">    </span><span class="nd">@GetMapping</span><span class="p">(</span><span class="s">"/{orderId}"</span><span class="p">)</span>
 <span class="hll"><span class="linenos">10</span><span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="n">Order</span><span class="w"> </span><span class="nf">getOrder</span><span class="p">(</span><span class="nd">@PathVariable</span><span class="w"> </span><span class="n">Long</span><span class="w"> </span><span class="n param-highlight" title="path parameter -- user-controlled input">orderId</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
 </span><span class="linenos">11</span><span class="w">        </span><span class="c1">// TODO: verify the requesting user actually owns this order.</span>
@@ -701,7 +701,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
           
     <div class="code-header">
       <span class="code-path">OrderController.java:23</span>
-      <a class="ide-link" href="vscode://file/C:/Users/lvpet/OneDrive/Documents/GitHub/Scripts/code-review/demo/sample-app/OrderController.java:23">open in editor &rarr;</a>
+      <a class="ide-link" href="vscode://file//path/to/code-review/demo/sample-app/OrderController.java:23">open in editor &rarr;</a>
     </div><div class="code-block"><div class="highlight"><pre><span></span><span class="linenos">22</span><span class="w">    </span><span class="nd">@GetMapping</span><span class="p">(</span><span class="s">"/status"</span><span class="p">)</span>
 <span class="hll"><span class="linenos">23</span><span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="nf">status</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
 </span><span class="linenos">24</span><span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="s">"ok"</span><span class="p">;</span>
@@ -731,7 +731,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
           
     <div class="code-header">
       <span class="code-path">OrderController.java:17</span>
-      <a class="ide-link" href="vscode://file/C:/Users/lvpet/OneDrive/Documents/GitHub/Scripts/code-review/demo/sample-app/OrderController.java:17">open in editor &rarr;</a>
+      <a class="ide-link" href="vscode://file//path/to/code-review/demo/sample-app/OrderController.java:17">open in editor &rarr;</a>
     </div><div class="code-block"><div class="highlight"><pre><span></span><span class="linenos">15</span><span class="w">    </span><span class="nd">@PreAuthorize</span><span class="p">(</span><span class="s">"hasRole('ADMIN')"</span><span class="p">)</span>
 <span class="linenos">16</span><span class="w">    </span><span class="nd">@PostMapping</span><span class="p">(</span><span class="s">"/{orderId}/refund"</span><span class="p">)</span>
 <span class="hll"><span class="linenos">17</span><span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">refundOrder</span><span class="p">(</span><span class="nd">@PathVariable</span><span class="w"> </span><span class="n">Long</span><span class="w"> </span><span class="n param-highlight" title="path parameter -- user-controlled input">orderId</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
@@ -777,7 +777,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
           
     <div class="code-header">
       <span class="code-path">server.js:5</span>
-      <a class="ide-link" href="vscode://file/C:/Users/lvpet/OneDrive/Documents/GitHub/Scripts/code-review/demo/sample-app/server.js:5">open in editor &rarr;</a>
+      <a class="ide-link" href="vscode://file//path/to/code-review/demo/sample-app/server.js:5">open in editor &rarr;</a>
     </div><div class="code-block"><div class="highlight"><pre><span></span><span class="hll"><span class="linenos">5</span><span class="nx">app</span><span class="p">.</span><span class="nx">get</span><span class="p">(</span><span class="s1">'/accounts/:accountId/balance'</span><span class="p">,</span><span class="w"> </span><span class="kd">function</span><span class="w"> </span><span class="p">(</span><span class="nx">req</span><span class="p">,</span><span class="w"> </span><span class="nx">res</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
 </span><span class="linenos">6</span><span class="w">  </span><span class="kd">const</span><span class="w"> </span><span class="nx">balance</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">ledger</span><span class="p">.</span><span class="nx">getBalance</span><span class="p">(</span><span class="nx">req</span><span class="p">.</span><span class="nx">params</span><span class="p">.</span><span class="nx param-highlight" title="path parameter -- user-controlled input">accountId</span><span class="p">);</span>
 <span class="linenos">7</span><span class="w">  </span><span class="nx">res</span><span class="p">.</span><span class="nx">json</span><span class="p">({</span><span class="w"> </span><span class="nx">balance</span><span class="w"> </span><span class="p">});</span>
@@ -807,7 +807,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
           
     <div class="code-header">
       <span class="code-path">server.js:12</span>
-      <a class="ide-link" href="vscode://file/C:/Users/lvpet/OneDrive/Documents/GitHub/Scripts/code-review/demo/sample-app/server.js:12">open in editor &rarr;</a>
+      <a class="ide-link" href="vscode://file//path/to/code-review/demo/sample-app/server.js:12">open in editor &rarr;</a>
     </div><div class="code-block"><div class="highlight"><pre><span></span><span class="hll"><span class="linenos">12</span><span class="nx">app</span><span class="p">.</span><span class="nx">get</span><span class="p">(</span><span class="s1">'/ping'</span><span class="p">,</span><span class="w"> </span><span class="kd">function</span><span class="w"> </span><span class="p">(</span><span class="nx">req</span><span class="p">,</span><span class="w"> </span><span class="nx">res</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
 </span><span class="linenos">13</span><span class="w">  </span><span class="nx">res</span><span class="p">.</span><span class="nx">send</span><span class="p">(</span><span class="s1">'pong'</span><span class="p">);</span>
 <span class="linenos">14</span><span class="p">});</span>
@@ -836,7 +836,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
           
     <div class="code-header">
       <span class="code-path">accounts.js:10</span>
-      <a class="ide-link" href="vscode://file/C:/Users/lvpet/OneDrive/Documents/GitHub/Scripts/code-review/demo/sample-app/accounts.js:10">open in editor &rarr;</a>
+      <a class="ide-link" href="vscode://file//path/to/code-review/demo/sample-app/accounts.js:10">open in editor &rarr;</a>
     </div><div class="code-block"><div class="highlight"><pre><span></span><span class="linenos">1</span><span class="kd">function</span><span class="w"> </span><span class="nx">transfer</span><span class="p">(</span><span class="nx">req</span><span class="p">,</span><span class="w"> </span><span class="nx">res</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
 <span class="linenos">2</span><span class="w">  </span><span class="kd">const</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">toAccountId</span><span class="p">,</span><span class="w"> </span><span class="nx">amount</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">body</span><span class="p">;</span>
 <span class="linenos">3</span><span class="w">  </span><span class="nx">ledger</span><span class="p">.</span><span class="nx">moveFunds</span><span class="p">(</span><span class="nx">req</span><span class="p">.</span><span class="nx">params</span><span class="p">.</span><span class="nx param-highlight" title="path parameter -- user-controlled input">accountId</span><span class="p">,</span><span class="w"> </span><span class="nx">toAccountId</span><span class="p">,</span><span class="w"> </span><span class="nx">amount</span><span class="p">);</span>

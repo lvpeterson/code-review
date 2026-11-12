@@ -12,6 +12,12 @@ from core.models import Finding, ScanResult
 _SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2, "info": 3}
 
 
+def _owasp_labels(finding: Finding) -> list[str]:
+    """"A01:2025", "A01:2021", "API5:2023" for whichever tags are present,
+    in that fixed order (the code:year prefix of each owasp value)."""
+    return [finding.owasp[k].split(" ", 1)[0] for k in ("2025", "2021", "api2023") if k in finding.owasp]
+
+
 def print_console(results: list[ScanResult]) -> None:
     if not results:
         print("No supported language/framework detected in target.")
@@ -20,6 +26,8 @@ def print_console(results: list[ScanResult]) -> None:
     for result in results:
         header = f"=== {result.language} / {result.framework} ==="
         print(f"\n{header}")
+        if result.degraded:
+            print(f"DEGRADED: {result.degraded}")
         print(f"routes found: {len(result.routes)}")
 
         for route in result.routes:
@@ -43,6 +51,8 @@ def print_console(results: list[ScanResult]) -> None:
                 print(f"  [{finding.severity.upper():6}] {finding.check_id}{badge}  {finding.title}")
                 if finding.category:
                     print(f"           OWASP {finding.category}")
+                if finding.owasp:
+                    print(f"           OWASP {' | '.join(_owasp_labels(finding))}")
                 print(f"           {finding.description}")
                 print(f"           {finding.file}:{finding.line}")
         else:
@@ -71,6 +81,7 @@ def _finding_to_dict(finding: Finding) -> dict:
         "line": finding.line,
         "confidence": finding.confidence,
         "category": finding.category,
+        "owasp": dict(finding.owasp),
     }
 
 
@@ -82,6 +93,7 @@ def _scan_result_to_dict(result: ScanResult) -> dict:
         "entry_points": [asdict(ep) for ep in result.entry_points],
         "findings": [_finding_to_dict(f) for f in result.findings],
         "notes": result.notes,
+        "degraded": result.degraded,
         "global_auth_source": list(result.global_auth_source) if result.global_auth_source else None,
     }
 

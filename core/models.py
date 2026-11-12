@@ -181,6 +181,12 @@ class Finding:
     # Insecure Use of Cryptography") -- set for infra/crypto/lambda checks
     # via core/owasp_isr.py; None for the application-route checks.
     category: Optional[str] = None
+    # OWASP Web/API tags keyed "2025" (Web Top 10 2025), "2021" (Web Top 10
+    # 2021) and "api2023" (API Top 10 2023), each a full label like "A05:2025
+    # Injection" -- set by checks/dnl via core/owasp_web.py; empty for
+    # findings that carry no web mapping. Separate from `category`, which
+    # stays the ISR label.
+    owasp: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -209,3 +215,7 @@ class ScanResult:
     framework_version: Optional[str] = None
     framework_version_label: Optional[str] = None
     framework_version_source: Optional[tuple[str, int, str]] = None  # (file, line, description)
+
+    # Reason text when this run was degraded (e.g. a parser or input was
+    # unavailable and results are partial). None for a normal, complete run.
+    degraded: Optional[str] = None

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "appsec-review"
 version = "0.1.0"
-description = "Baseline appsec code review scaffold -- framework-aware route/auth discovery for Flask, FastAPI, Django, Spring, Express, Next.js, Gin/net-http, ASP.NET Core, Rails/Sinatra, PL/SQL, AWS Lambda, plus IaC (Terraform, GitLab CI, IAM policy JSON, shell) and Java/PHP crypto review mapped to the OWASP Infrastructure Top 10"
+description = "Baseline appsec code review scaffold -- framework-aware route/auth discovery for Flask, FastAPI, Django, Spring, Express, Next.js, Gin/net-http, ASP.NET Core, .NET Framework (MVC 5, Web API 2, WebForms), Rails/Sinatra, PL/SQL, AWS Lambda, plus IaC (Terraform, GitLab CI, IAM policy JSON, shell) and Java/PHP crypto review mapped to the OWASP Infrastructure Top 10"
 requires-python = ">=3.10"
 dependencies = [
     "javalang==0.13.0",
@@ -36,6 +36,7 @@ packages = [
     "languages.go",
     "languages.ruby",
     "languages.dotnet",
+    "languages.dotnet_legacy",
     "languages.sql",
     "languages.infra",
     "languages.crypto",

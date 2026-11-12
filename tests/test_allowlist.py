@@ -45,3 +45,13 @@ def test_only_auth_findings_are_suppressed_not_idor():
 
     remaining_check_ids = {f.check_id for f in result.findings}
     assert remaining_check_ids == {"IDOR-001"}
+
+
+def test_dnl_routes_match_case_insensitively_on_every_platform():
+    # ASP.NET URLs are case-insensitive; fnmatch.fnmatch only folds case on Windows.
+    from checks.dnl.findings import dnl_finding
+    route = Route(path="/Admin/Users/Index", methods=["GET"], handler_name="UsersController.Index", file="u.cs", line=1)
+    f = dnl_finding("DNL-AUTHZ-001", "medium", "t", "d", "u.cs", 1, route=route)
+    result = ScanResult(language="dotnet_legacy", framework="mvc", routes=[route], findings=[f])
+    apply_allowlist([result], ["/admin/*"])
+    assert result.findings == []

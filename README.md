@@ -41,8 +41,17 @@ python main.py <target_path> --sarif report.sarif
 python main.py <target_path> --language python --framework flask   # skip detection
 python main.py <target_path> --allow-path "/health" --allow-path "/api/public/*"
 python main.py <target_path> --fail-on medium   # exit 1 if any medium+ finding exists (CI use)
+python main.py <target_path> --allow-degraded   # .NET Framework: continue without the Roslyn helper
 python main.py <target_path> --sca              # + known-vulnerable dependencies via osv-scanner (on PATH)
 ```
+
+Legacy .NET Framework targets need the Roslyn helper in `tools/roslyn-ir`. It
+is built automatically on first use if the .NET 8 SDK is installed (Windows:
+`winget install Microsoft.DotNet.SDK.8`; Linux: `apt install dotnet-sdk-8.0`,
+`dnf install dotnet-sdk-8.0` or `./dotnet-install.sh --channel 8.0`). Without
+the SDK, copy a prebuilt binary to `tools/roslyn-ir/bin/` or set
+`CODE_REVIEW_ROSLYN_IR`. If the helper is unavailable the scan exits 2 with
+install steps; `--allow-degraded` skips C#/VB code analysis instead.
 
 `--sca` runs osv-scanner over the target's lockfiles/manifests and adds an
 SCA-001 finding per vulnerable package. It queries api.osv.dev with package
@@ -195,6 +204,10 @@ Currently implemented (route extraction + baseline checks):
 - **javascript**: express, nextjs, hono
 - **go**: gin, net_http
 - **dotnet**: aspnet
+- **dotnet_legacy**: mvc, webapi, webforms, config (.NET Framework MVC 5,
+  Web API 2, WebForms and Web.config, C# and VB, via the Roslyn helper in
+  `tools/roslyn-ir`; OWASP 2025/2021/API tags) -- see
+  `languages/dotnet_legacy/README.md`.
 - **ruby**: rails, sinatra
 - **sql**: plsql (Oracle). No routes: every finding is project-wide and
   goes in the Findings tab. T-SQL/PL/pgSQL files are detected but have no

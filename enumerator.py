@@ -5,10 +5,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from checks.dnl import project
 import languages  # noqa: F401  (import triggers analyzer registration)
 from core.models import ScanResult
 from core.registry import get_analyzer
-from languages import crypto, dotnet, go, infra, java, javascript, python, ruby, sql
+from languages import crypto, dotnet, dotnet_legacy, go, infra, java, javascript, python, ruby, sql
 
 # Maps a language name to its package (which exposes .detector).
 # Add an entry here whenever you add a new languages/<name>/ package.
@@ -19,6 +20,7 @@ LANGUAGE_MODULES = {
     "go": go,
     "ruby": ruby,
     "dotnet": dotnet,
+    "dotnet_legacy": dotnet_legacy,
     "sql": sql,
     "infra": infra,
     "crypto": crypto,
@@ -29,6 +31,7 @@ def enumerate_target(
     target_path: Path,
     force_language: str | None = None,
     force_framework: str | None = None,
+    allow_degraded: bool = False,
 ) -> list[ScanResult]:
     """Detect language(s)/framework(s) present in target_path and run the
     matching deep-dive analyzer for each. A codebase can trip more than one
@@ -43,22 +46,27 @@ def enumerate_target(
         if module is None:
             raise ValueError(f"Unknown --language '{force_language}'. Known: {', '.join(LANGUAGE_MODULES)}")
         frameworks = [force_framework] if force_framework else module.detector.detect_frameworks(target_path)
-        _run_frameworks(target_path, force_language, frameworks, results)
+        _run_frameworks(target_path, force_language, frameworks, results, allow_degraded)
         return results
 
     for language_name, module in LANGUAGE_MODULES.items():
         if not module.detector.detect_language(target_path):
             continue
         frameworks = module.detector.detect_frameworks(target_path)
-        _run_frameworks(target_path, language_name, frameworks, results)
+        _run_frameworks(target_path, language_name, frameworks, results, allow_degraded)
 
     return results
 
 
-def _run_frameworks(target_path: Path, language_name: str, frameworks: list[str], results: list[ScanResult]) -> None:
+def _run_frameworks(target_path: Path, language_name: str, frameworks: list[str], results: list[ScanResult],
+                    allow_degraded: bool = False) -> None:
     if not frameworks:
         print(f"[{language_name}] language detected but no known framework matched -- skipping deep-dive")
         return
+
+    if language_name == "dotnet_legacy":
+        # Fail fast (PreflightError -> CLI exit 2) before any analyzer runs.
+        project.prepare(target_path, allow_degraded)
 
     for framework in frameworks:
         analyzer_cls = get_analyzer(language_name, framework)

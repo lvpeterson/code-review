@@ -60,7 +60,17 @@ def _rule(check_id: str, sample: Finding) -> dict:
     if sample.category:
         # SARIF viewers (and GitHub Code Scanning) filter on rule tags.
         rule["properties"] = {"tags": ["owasp-infrastructure-top-10", sample.category.split(":", 1)[0], sample.category]}
+    tags = owasp_tags(sample)
+    if tags:
+        # Merged with any ISR tags above.
+        rule.setdefault("properties", {}).setdefault("tags", []).extend(tags)
     return rule
+
+
+def owasp_tags(finding: Finding) -> list[str]:
+    """owasp-2025:A01 / owasp-2021:A01 / owasp-api-2023:API5 for each present key."""
+    prefixes = (("2025", "owasp-2025"), ("2021", "owasp-2021"), ("api2023", "owasp-api-2023"))
+    return [f"{prefix}:{finding.owasp[key].split(':', 1)[0]}" for key, prefix in prefixes if key in finding.owasp]
 
 
 def _result(finding: Finding) -> dict:
@@ -82,6 +92,8 @@ def _result(finding: Finding) -> dict:
         properties["confidence"] = finding.confidence
     if finding.category:
         properties["owaspInfrastructureRisk"] = finding.category
+    if finding.owasp:
+        properties["owasp"] = dict(finding.owasp)
     if properties:
         result["properties"] = properties
     return result
@@ -102,7 +114,8 @@ def build_sarif(results: list[ScanResult], route_none_only: bool = False, exclud
     for finding in all_findings:
         rules.setdefault(finding.check_id, _rule(finding.check_id, finding))
 
-    return {
+    degraded = next((r.degraded for r in results if r.degraded), None)
+    sarif = {
         "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
         "version": "2.1.0",
         "runs": [
@@ -118,6 +131,9 @@ def build_sarif(results: list[ScanResult], route_none_only: bool = False, exclud
             }
         ],
     }
+    if degraded:
+        sarif["runs"][0]["properties"] = {"degraded": degraded}
+    return sarif
 
 
 def write_sarif(results: list[ScanResult], out_path: Path) -> None:

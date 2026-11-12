@@ -22,7 +22,9 @@ from pygments.lexers import get_lexer_by_name, get_lexer_for_filename
 from pygments.util import ClassNotFound
 
 from core.models import EntryPoint, Finding, Route, ScanResult
+from core.allowlist import MISSING_AUTH_IDS
 from core.owasp_isr import ISR_TITLES, isr_code
+from core.owasp_web import TITLES as OWASP_TITLES
 from core.paths import extract_path_param_names
 from core.sarif_report import build_sarif
 
@@ -67,7 +69,8 @@ def _worst_severity(findings: list[Finding]) -> str:
 
 
 def _is_auth_finding(finding: Finding) -> bool:
-    return finding.check_id.startswith("AUTH-")
+    # DNL-AUTHZ-* are the legacy .NET equivalents of AUTH-* (missing / weak auth on a route).
+    return finding.check_id.startswith(("AUTH-", "DNL-AUTHZ-"))
 
 
 def _non_auth_findings_for_route(route: Route, findings: list[Finding]) -> list[Finding]:
@@ -422,6 +425,14 @@ def _render_finding_snippet(finding: Finding, target_path: Path, language: str) 
     return f'<div class="code-block finding-snippet">{highlighted}</div>'
 
 
+_OWASP_KEYS = ("2025", "2021", "api2023")
+
+
+def _owasp_keys(finding: Finding) -> str:
+    """Space-separated filter keys, e.g. "2025:A01 2021:A01 api2023:API5"."""
+    return " ".join(f"{k}:{finding.owasp[k].split(':', 1)[0]}" for k in _OWASP_KEYS if k in finding.owasp)
+
+
 def _render_standalone_finding(finding: Finding, target_path: Path, item_id: str, language: str = "") -> str:
     """A project-wide finding (route=None) -- these have nowhere to attach
     in the route-card view, so unlike `_render_finding` this includes its
@@ -441,13 +452,18 @@ def _render_standalone_finding(finding: Finding, target_path: Path, item_id: str
         f'<span class="finding-isr" title="OWASP Top 10 Infrastructure Security Risks: {_esc(finding.category)}">{_esc(isr)}</span>'
         if isr else ""
     )
+    owasp_badges = "".join(
+        f'<span class="finding-owasp" title="{_esc(label)}">{_esc(label.split(" ", 1)[0])}</span>'
+        for label in (finding.owasp.get(k) for k in _OWASP_KEYS) if label
+    )
     return f"""
-    <div class="finding sev-{_esc(finding.severity)}" data-isr="{_esc(isr or '')}">
+    <div class="finding sev-{_esc(finding.severity)}" data-isr="{_esc(isr or '')}" data-owasp="{_esc(_owasp_keys(finding))}">
       <div class="finding-head">
         <input type="checkbox" class="review-toggle" data-item-id="{_esc(item_id)}" title="Mark reviewed" aria-label="Mark this finding reviewed">
         <span class="finding-tag">{_esc(finding.check_id)}</span>
         <span class="finding-sev">{_esc(_SEVERITY_LABEL.get(finding.severity, finding.severity))}</span>
         {isr_badge}
+        {owasp_badges}
         {review_badge}
         <a class="ide-link finding-loc" href="{_esc(ide_link)}">{_esc(finding.file)}:{finding.line} &rarr;</a>
       </div>
@@ -523,7 +539,7 @@ def _render_auth_tab(results: list[ScanResult], target_path: Path, item_ids: ite
         for route in result.routes:
             total_routes += 1
             auth_finding = next(
-                (f for f in result.findings if f.check_id == "AUTH-001" and f.route is route), None
+                (f for f in result.findings if f.check_id in MISSING_AUTH_IDS and f.route is route), None
             )
             rows_html += _render_auth_route_row(route, auth_finding, target_path)
 
@@ -670,6 +686,73 @@ def _render_infra_tab(results: list[ScanResult], target_path: Path, item_ids: it
     if not sections:
         sections = '<p class="no-findings">No infrastructure-as-code or crypto artifacts detected in target.</p>'
     return _render_isr_coverage(results) + sections + _ISR_FILTER_JS
+
+
+# Same click/Enter row-filter pattern as _ISR_FILTER_JS, scoped to the OWASP
+# panel. Rows and findings both carry keys like "2025:A01".
+_OWASP_FILTER_JS = """
+<script>
+(function () {
+  const panel = document.getElementById('tab-panel-owasp');
+  if (!panel) return;
+  let active = null;
+  function apply() {
+    panel.querySelectorAll('.owasp-row').forEach(r => r.classList.toggle('owasp-active', r.dataset.owasp === active));
+    panel.querySelectorAll('.owasp-section .finding').forEach(f => {
+      const keys = (f.dataset.owasp || '').split(' ');
+      f.classList.toggle('owasp-hidden', active !== null && !keys.includes(active));
+    });
+  }
+  panel.querySelectorAll('.owasp-row').forEach(row => {
+    const toggle = () => { active = active === row.dataset.owasp ? null : row.dataset.owasp; apply(); };
+    row.addEventListener('click', toggle);
+    row.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } });
+  });
+})();
+</script>"""
+
+_OWASP_GROUP_TITLES = {"2025": "OWASP Top 10 2025", "2021": "OWASP Top 10 2021", "api2023": "OWASP API Security Top 10 2023"}
+
+
+def _render_owasp_coverage(findings: list[Finding]) -> str:
+    """Coverage tables for Web 2025, Web 2021 and API 2023: every category
+    listed, with severity counts; zero-hit rows say "manual" (not a pass),
+    mirroring _render_isr_coverage."""
+    out = ""
+    for key in _OWASP_KEYS:
+        rows = ""
+        for code, title in OWASP_TITLES[key].items():
+            hits = [f for f in findings if f"{key}:{code}" in _owasp_keys(f).split(" ")]
+            counts = {sev: sum(1 for f in hits if f.severity == sev) for sev in _SEVERITY_RANK}
+            cells = "".join(f'<td class="isr-count sev-{sev}">{counts[sev] or ""}</td>' for sev in _SEVERITY_RANK)
+            status = (f'<td class="isr-total">{len(hits)}</td>' if hits
+                      else '<td class="isr-total isr-none" title="No automated hits -- review this area manually">manual</td>')
+            rows += (f'<tr class="owasp-row{" isr-empty" if not hits else ""}" data-owasp="{key}:{code}" tabindex="0">'
+                     f'<td class="isr-code">{code}</td><td>{_esc(title)}</td>{cells}{status}</tr>')
+        out += f"""
+    <section class="auth-section owasp-coverage">
+      <h2 class="section-title">{_OWASP_GROUP_TITLES[key]}<span class="count">click a row to filter</span></h2>
+      <table class="auth-table isr-table">
+        <thead><tr><th>ID</th><th>Category</th><th>High</th><th>Med</th><th>Low</th><th>Info</th><th>Total</th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+    </section>"""
+    return out
+
+
+def _render_owasp_tab(results: list[ScanResult], target_path: Path, item_ids: itertools.count) -> str:
+    """Every finding with OWASP tags (any language), preceded by the
+    three coverage tables."""
+    pairs = sorted(
+        ((f, r.language) for r in results for f in r.findings if f.owasp),
+        key=lambda p: (_SEVERITY_RANK.get(p[0].severity, 9), p[0].file, p[0].line),
+    )
+    body = "".join(_render_standalone_finding(f, target_path, f"finding-{next(item_ids)}", lang) for f, lang in pairs)
+    return f"""{_render_owasp_coverage([f for f, _ in pairs])}
+    <section class="auth-section owasp-section">
+      <h2 class="section-title">OWASP-tagged findings<span class="count">{len(pairs)} finding{"s" if len(pairs) != 1 else ""}</span><span class="section-reviewed">0 / {len(pairs)} reviewed</span></h2>
+      {body or '<p class="no-findings">No OWASP-tagged findings.</p>'}
+    </section>{_OWASP_FILTER_JS}"""
 
 
 _ENTRY_POINT_LABELS = {
@@ -846,6 +929,16 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
     auth_tab_html = _render_auth_tab(results, target_path, item_ids)
     findings_tab_html = _render_findings_tab(results, target_path, item_ids)
     infra_tab_html = _render_infra_tab(results, target_path, item_ids)
+    owasp_tab_html = _render_owasp_tab(results, target_path, item_ids)
+    owasp_findings = [f for f in all_findings if f.owasp]
+    owasp_attention_count = sum(1 for f in owasp_findings if f.severity in ("high", "medium"))
+    degraded_reasons = list(dict.fromkeys(r.degraded for r in results if r.degraded))
+    # Inline-styled (no CSS class rule) so the stylesheet never mentions the banner.
+    degraded_banner = (
+        '<div class="degraded-banner" role="alert" style="background:#b3261e;color:#fff;padding:10px 16px;'
+        'font-weight:600;">Degraded scan: ' + _esc("; ".join(degraded_reasons)) + "</div>"
+        if degraded_reasons else ""
+    )
 
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
     # Namespaces this report's "reviewed" checklist in localStorage so two
@@ -876,6 +969,7 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
 </style>
 </head>
 <body>
+{degraded_banner}
 <div class="page">
   <header class="topbar">
     <div class="brand">
@@ -916,6 +1010,9 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
     </button>
     <button class="tab-button" id="tab-btn-infra" data-tab="infra" type="button" title="{infra_attention_count} needing attention (high/medium) of {len(infra_findings)} infrastructure/crypto finding{"s" if len(infra_findings) != 1 else ""}">
       Infrastructure <span class="tab-count{" tab-count-warn" if infra_attention_count else ""}">{infra_attention_count}</span>
+    </button>
+    <button class="tab-button" id="tab-btn-owasp" data-tab="owasp" type="button" title="{owasp_attention_count} needing attention (high/medium) of {len(owasp_findings)} OWASP-tagged finding{"s" if len(owasp_findings) != 1 else ""}">
+      OWASP <span class="tab-count{" tab-count-warn" if owasp_attention_count else ""}">{owasp_attention_count}</span>
     </button>
   </nav>
 
@@ -974,6 +1071,12 @@ def render_html(results: list[ScanResult], target_path: Path) -> str:
   <div class="tab-panel" id="tab-panel-infra" data-tab="infra" hidden>
     <main class="content auth-content">
       {infra_tab_html}
+    </main>
+  </div>
+
+  <div class="tab-panel" id="tab-panel-owasp" data-tab="owasp" hidden>
+    <main class="content auth-content">
+      {owasp_tab_html}
     </main>
   </div>
 </div>
@@ -1314,6 +1417,16 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
   font-family: var(--mono); font-size: 10px; letter-spacing: 0.04em;
   color: var(--accent); border: 1px solid var(--accent); border-radius: 3px; padding: 0 5px;
 }
+.finding-owasp {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.04em;
+  color: var(--sev-medium); border: 1px solid var(--sev-medium); border-radius: 3px; padding: 0 5px;
+}
+.owasp-row { cursor: pointer; }
+.owasp-row:hover td, .owasp-row:focus-visible td { background: rgba(94, 200, 216, 0.08); }
+.owasp-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.owasp-row.owasp-active td { background: rgba(94, 200, 216, 0.16); }
+.owasp-row.isr-empty td { color: var(--text-muted); }
+.finding.owasp-hidden { display: none; }
 .isr-table td, .isr-table th { text-align: left; }
 .isr-row { cursor: pointer; }
 .isr-row:hover td, .isr-row:focus-visible td { background: rgba(94, 200, 216, 0.08); }

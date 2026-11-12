@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>roslyn-ir</AssemblyName>
+    <RootNamespace>RoslynIr</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- Framework-dependent publish: the host needs the .NET 8 runtime. -->
+    <SelfContained>false</SelfContained>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Both Roslyn front ends pinned to the same exact version (keep in lockstep). -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.11.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.VisualBasic" Version="4.11.0" />
+    <!-- .NET Framework 4.8 reference assemblies for the semantic model. Used
+         only as data: ExcludeAssets keeps the package's build targets out of
+         this net8.0 build; GeneratePathProperty exposes its folder below. -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net48" Version="1.0.3"
+                      GeneratePathProperty="true" ExcludeAssets="all" PrivateAssets="all" />
+    <!-- CodePagesEncodingProvider (cp1252 fallback) ships in the net8.0 shared
+         framework as System.Text.Encoding.CodePages, so no package is needed. -->
+  </ItemGroup>
+
+  <!-- Copy the net48 reference assemblies (plus Facades, flat) to
+       refs/net48/ next to the binary, for both build and publish output.
+       The helper locates them relative to AppContext.BaseDirectory, so no
+       Windows reference-assembly path or GAC is ever consulted. -->
+  <PropertyGroup>
+    <Net48RefDir>$(PkgMicrosoft_NETFramework_ReferenceAssemblies_net48)/build/.NETFramework/v4.8</Net48RefDir>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(PkgMicrosoft_NETFramework_ReferenceAssemblies_net48)' != ''">
+    <None Include="$(Net48RefDir)/*.dll;$(Net48RefDir)/Facades/*.dll"
+          Link="refs/net48/%(Filename)%(Extension)"
+          CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest"
+          Visible="false" />
+  </ItemGroup>
+
+</Project>

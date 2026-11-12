@@ -8,6 +8,7 @@ Usage:
     python main.py <target_path> --language python --framework flask
     python main.py <target_path> --allow-path "/health" --allow-path "/api/public/*"
     python main.py <target_path> --fail-on medium   # exit 1 if any medium+ finding exists (CI use)
+    python main.py <target_path> --allow-degraded   # .NET Framework: continue without the Roslyn helper
     python main.py <target_path> --sca              # + osv-scanner dependency CVEs (needs osv-scanner on PATH)
 """
 from __future__ import annotations
@@ -16,6 +17,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from checks.dnl.helper import PreflightError
 from core.allowlist import apply_allowlist
 from core.html_report import write_html
 from core.report import meets_or_exceeds, print_console, worst_severity, write_json
@@ -56,6 +58,11 @@ def main() -> int:
     )
     parser.add_argument("--sca-offline", action="store_true",
                         help="With --sca: download the OSV databases and match locally")
+    parser.add_argument(
+        "--allow-degraded", action="store_true",
+        help="Proceed without the Roslyn helper for .NET Framework targets (C#/VB code analysis is skipped); "
+        "without this flag a missing helper exits 2 with install steps",
+    )
     args = parser.parse_args()
 
     if not args.target.exists():
@@ -63,11 +70,16 @@ def main() -> int:
         return 1
 
     target_path = args.target.resolve()
-    results = enumerate_target(
-        target_path,
-        force_language=args.language,
-        force_framework=args.framework,
-    )
+    try:
+        results = enumerate_target(
+            target_path,
+            force_language=args.language,
+            force_framework=args.framework,
+            allow_degraded=args.allow_degraded,
+        )
+    except PreflightError as ex:
+        print(ex, file=sys.stderr)
+        return 2
 
     if args.sca or args.sca_offline:
         from checks import sca
@@ -89,6 +101,11 @@ def main() -> int:
     if args.sarif:
         write_sarif(results, args.sarif)
         print(f"\nwrote SARIF report to {args.sarif}")
+
+    # A degraded run can look clean on the console; repeat the reason last so it is not missed.
+    degraded = list(dict.fromkeys(r.degraded for r in results if r.degraded))
+    for reason in degraded:
+        print(f"DEGRADED: {reason}", file=sys.stderr)
 
     if args.fail_on:
         worst = worst_severity(results)
