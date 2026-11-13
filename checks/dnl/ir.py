@@ -47,6 +47,8 @@ class PropertyIR:
     set: list[dict] | None = None
     # VB setter value parameter name (C# setters always use `value`).
     set_param: str | None = None
+    # Initializer Expr of `{ get; set; } = expr` / VB `Property X As T = expr`; None when absent.
+    init: dict | None = None
 
 
 @dataclass
@@ -57,6 +59,8 @@ class MethodIR:
     params: list[ParamIR] = field(default_factory=list)
     attributes: list[Attr] = field(default_factory=list)
     handles: list = field(default_factory=list)
+    # Interface members the method implements explicitly: VB `Implements IFoo.Bar`, C# `T IFoo.Bar()`.
+    implements: list = field(default_factory=list)
     body: list = field(default_factory=list)
     line: int = 0
     end_line: int = 0
@@ -105,7 +109,7 @@ def _method(d: dict) -> MethodIR:
     return MethodIR(
         name=d.get("name", ""), modifiers=d.get("modifiers") or [], return_type=d.get("return_type"),
         params=[ParamIR(p.get("name", ""), p.get("type"), _attrs(p.get("attributes")), p.get("modifiers") or []) for p in d.get("params") or []],
-        attributes=_attrs(d.get("attributes")), handles=d.get("handles") or [],
+        attributes=_attrs(d.get("attributes")), handles=d.get("handles") or [], implements=d.get("implements") or [],
         body=d.get("body") or [], line=d.get("line", 0), end_line=d.get("end_line", 0),
     )
 
@@ -117,7 +121,7 @@ def _type(d: dict, path: str) -> TypeIR:
         fields=[FieldIR(f.get("name", ""), f.get("type"), f.get("line", 0), f.get("init"), bool(f.get("is_const")))
                 for f in d.get("fields") or []],
         properties=[PropertyIR(p.get("name", ""), p.get("type"), _attrs(p.get("attributes")), p.get("line", 0),
-                    p.get("get"), p.get("set"), p.get("set_param"))
+                    p.get("get"), p.get("set"), p.get("set_param"), p.get("init"))
                     for p in d.get("properties") or []],
         methods=[_method(m) for m in d.get("methods") or []],
         line=d.get("line", 0), end_line=d.get("end_line", 0), file=path,

@@ -1,7 +1,7 @@
 """Analyzer registrations for the legacy .NET Framework package.
 
-Four analyzers share one ProjectModel (prepared once by the enumerator, so the
-Roslyn helper runs once per scan): mvc, webapi and webforms split the routes
+Five analyzers share one ProjectModel (prepared once by the enumerator, so the
+Roslyn helper runs once per scan): mvc, webapi, webforms and wcf split the routes
 and auth findings by route kind, config runs the web.config rules. Route
 discovery and auth resolution happen once per model and are cached on
 `model.cache`. In degraded mode (no helper) the code-driven analyzers return
@@ -12,7 +12,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from checks.dnl import auth, project, routes, rules_auth, rules_config, rules_object, rules_taint, rules_xss
+from checks.dnl import auth, project, routes, rules_auth, rules_config, rules_crypto, rules_deser_xml, rules_integrity, rules_object, rules_session, rules_taint, rules_wcf_config, rules_xss
 from checks.dnl.files import iter_dnl_files
 from checks.dnl.project import ProjectModel
 from checks.dnl.webconfig import load_configs
@@ -23,6 +23,7 @@ from languages.dotnet_legacy import detector
 
 _MVC_REF = "system.web.mvc"
 _API_REF = "system.web.http"
+_WCF_REF = "system.servicemodel"
 
 
 def _real_projects(model: ProjectModel) -> list[project.Project]:
@@ -40,38 +41,59 @@ def _enumerated(model: ProjectModel) -> list[str]:
 
 def _owner_kind(model: ProjectModel, f: Finding) -> str:
     """Which analyzer reports a route-less finding (AUTHZ-003 on an auth filter type):
-    mvc when the type's project references System.Web.Mvc, else webapi when any
-    project references System.Web.Http, else mvc / webforms by what the solution has.
+    mvc when the type's project references System.Web.Mvc, wcf when it references
+    System.ServiceModel, else webapi when any project references System.Web.Http,
+    else mvc / webforms by what the solution has.
     The owner must actually be enumerated; otherwise the first code analyzer that
     runs takes it, and with none, the config analyzer."""
     proj = model.project_of(f.file)
-    refs = set().union(*(p.references for p in model.projects)) if model.projects else set()
-    if proj is not None and _MVC_REF in proj.references:
+    if proj is None:
+        # Markup (views, layouts) is not a compile item: use the deepest project dir holding it.
+        abs_f = (model.root / f.file).resolve()
+        # Resolved project dirs and the references union are computed once per model.
+        pdirs = model.cache.get("owner_dirs")
+        if pdirs is None:
+            pdirs = model.cache["owner_dirs"] = [(p, p.dir.resolve()) for p in _real_projects(model)]
+        dirs = [(p, d) for p, d in pdirs if abs_f.is_relative_to(d)]
+        proj = max(dirs, key=lambda pd: len(pd[1].parts), default=(None, None))[0]
+    refs = model.cache.get("refs_union")
+    if refs is None:
+        refs = model.cache["refs_union"] = (set().union(*(p.references for p in model.projects))
+                                            if model.projects else set())
+    running = [k for k in _enumerated(model) if k != "config"]
+    if f.file.lower().endswith((".aspx", ".ascx", ".master")):
+        want = "webforms"
+    elif proj is not None and _MVC_REF in proj.references:
         want = "mvc"
+    elif proj is not None and _WCF_REF in proj.references and "wcf" in running:
+        want = "wcf"
     elif _API_REF in refs:
         want = "webapi"
     else:
         want = "mvc" if _MVC_REF in refs else "webforms"
-    running = [k for k in _enumerated(model) if k != "config"]
     if not running:
         return "config"
     return want if want in running else running[0]
 
 
 def _code_results(model: ProjectModel) -> dict[str, tuple[list[Route], list[Finding]]]:
-    """{kind: (routes, findings)} for mvc / webapi / webforms, computed once per model."""
+    """{kind: (routes, findings)} for mvc / webapi / webforms / wcf, computed once per model."""
     cached = model.cache.get("code_results")
     if cached is not None:
         return cached
-    out: dict[str, tuple[list[Route], list[Finding]]] = {k: ([], []) for k in ("mvc", "webapi", "webforms", "config")}
+    out: dict[str, tuple[list[Route], list[Finding]]] = {k: ([], []) for k in ("mvc", "webapi", "webforms", "wcf", "config")}
     if not model.degraded:
         # Deeply nested expressions recurse through the evaluator; give it headroom.
         sys.setrecursionlimit(max(sys.getrecursionlimit(), 4000))
-        refs = routes.discover_mvc_webapi(model) + routes.discover_webforms(model)
+        refs = routes.discover_mvc_webapi(model) + routes.discover_webforms(model) + routes.discover_wcf(model)
         findings = rules_auth.check_routes(model, refs, auth.global_filters(model), auth.chain_for_model(model))
         findings += rules_taint.check(model, refs)
         findings += rules_xss.check(model, refs)
         findings += rules_object.check(model, refs)
+        findings += rules_crypto.check(model, refs)
+        findings += rules_deser_xml.check(model, refs)
+        findings += rules_integrity.check(model, refs)
+        findings += rules_session.check(model, refs)
         for ref in refs:
             out[ref.route.meta["kind"]][0].append(ref.route)
         for f in findings:
@@ -126,6 +148,11 @@ class WebFormsAnalyzer(_DnlAnalyzer):
     framework = "webforms"
 
 
+@register("dotnet_legacy", "wcf")
+class WcfAnalyzer(_DnlAnalyzer):
+    framework = "wcf"
+
+
 @register("dotnet_legacy", "config")
 class ConfigAnalyzer(_DnlAnalyzer):
     """web.config rules; needs no IR, so it also runs in degraded mode."""
@@ -140,7 +167,14 @@ class ConfigAnalyzer(_DnlAnalyzer):
         api_dirs = {p.dir for p in projects if _API_REF in p.references}
         aspx_dirs = {p.dir for p in projects if next(iter_dnl_files(p.dir, (".aspx",)), None) is not None}
         aspx_dirs |= routes.webforms_site_dirs(model)
+        configs = load_configs(model.root)
         findings, self._notes = rules_config.check_configs(
-            load_configs(model.root), api_dirs, aspx_dirs, project_dirs={p.dir for p in projects})
+            configs, api_dirs, aspx_dirs, project_dirs={p.dir for p in projects})
+        wcf_findings, wcf_notes = rules_wcf_config.check_configs(configs, rules_wcf_config.hosted_services(model))
+        findings += wcf_findings
+        self._notes += wcf_notes + rules_wcf_config.non_web_config_notes(model.root)
+        if model.degraded:
+            # Markup rules need no IR; in degraded mode they run here, without page routes.
+            findings += rules_integrity.check(model)
         # Route-less findings whose owning code analyzer is not enumerated land here.
         return findings + list(_code_results(model)["config"][1])

@@ -147,6 +147,8 @@ internal sealed class CSharpLowering
             w.Str("type", p.Type.ToString());
             Attributes("attributes", p.AttributeLists);
             Accessors(p);
+            // `{ get; set; } = expr` initializer (auto-properties only).
+            if (p.Initializer?.Value is { } pinit) ExprProp("init", pinit);
             j.WriteNumber("line", DeclLine(p, p.AttributeLists));
             j.WriteEndObject();
         }
@@ -160,7 +162,9 @@ internal sealed class CSharpLowering
                 case MethodDeclarationSyntax md:
                     Method(md, md.Identifier.ValueText, md.Modifiers, md.ReturnType.ToString(),
                         md.ParameterList, md.AttributeLists, md.Body, md.ExpressionBody, null,
-                        returnsValue: !(md.ReturnType is PredefinedTypeSyntax pt && pt.Keyword.IsKind(SyntaxKind.VoidKeyword)));
+                        returnsValue: !(md.ReturnType is PredefinedTypeSyntax pt && pt.Keyword.IsKind(SyntaxKind.VoidKeyword)),
+                        implements: md.ExplicitInterfaceSpecifier is { } eis
+                            ? [$"{eis.Name}.{md.Identifier.ValueText}"] : []);
                     break;
                 case ConstructorDeclarationSyntax cd:
                     Method(cd, ".ctor", cd.Modifiers, null, cd.ParameterList, cd.AttributeLists,
@@ -177,7 +181,8 @@ internal sealed class CSharpLowering
 
     void Method(SyntaxNode node, string name, SyntaxTokenList modifiers, string? returnType,
         ParameterListSyntax parameters, SyntaxList<AttributeListSyntax> attrs, BlockSyntax? body,
-        ArrowExpressionClauseSyntax? arrow, ConstructorInitializerSyntax? ctorInit, bool returnsValue)
+        ArrowExpressionClauseSyntax? arrow, ConstructorInitializerSyntax? ctorInit, bool returnsValue,
+        IEnumerable<string>? implements = null)
     {
         var j = w.J;
         j.WriteStartObject();
@@ -199,6 +204,7 @@ internal sealed class CSharpLowering
 
         Attributes("attributes", attrs);
         w.StrArray("handles", []);
+        w.StrArray("implements", implements ?? []);
 
         j.WriteStartArray("body");
         if (ctorInit is not null)

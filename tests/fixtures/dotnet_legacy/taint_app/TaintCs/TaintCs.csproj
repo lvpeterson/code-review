@@ -64,6 +64,21 @@
     <Compile Include="OrderLookup.cs" />
     <Compile Include="ObjectsController.cs" />
     <Compile Include="ObjectsApiController.cs" />
+    <Compile Include="Crypto\Hashing.cs" />
+    <Compile Include="Crypto\Alias.cs" />
+    <Compile Include="Crypto\Ciphers.cs" />
+    <Compile Include="Crypto\Tokens.cs" />
+    <Compile Include="Crypto\Tls.cs" />
+    <Compile Include="Crypto\Kdf.cs" />
+    <Compile Include="Crypto\Secrets.cs" />
+    <Compile Include="Crypto\CryptoController.cs" />
+    <Compile Include="DeserXml\FormatterController.cs" />
+    <Compile Include="DeserXml\JsonCfg.cs" />
+    <Compile Include="DeserXml\JsSerializers.cs" />
+    <Compile Include="DeserXml\XmlController.cs" />
+    <Compile Include="DeserXml\Escapes.cs" />
     <Content Include="Views\Home\Show.cshtml" />
+    <Content Include="Views\Shared\_Layout.cshtml" />
+    <Compile Include="Account\AccountController.cs" />
   </ItemGroup>
 </Project>

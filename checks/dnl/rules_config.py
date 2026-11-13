@@ -216,6 +216,46 @@ def _app_roots(configs: list[WebConfig], project_dirs: set[Path] | None) -> set[
     return out
 
 
+def merge_variants(cfg: WebConfig, variants: list[tuple[str, ET.Element]],
+                   per: dict[str, dict[tuple, Hit]], api: bool,
+                   committed: frozenset[str] | set[str] = _COMMITTED_SECRETS) -> list[Finding]:
+    """Transform-aware merge shared by every config rule module. `per` maps a variant name
+    (`base`, `Release`...) to its hits keyed by (rule, origin file, line); a hit the base
+    config has keeps its severity unless every release transform removes it (then info),
+    and a hit only a transform introduces says so. Rules in `committed` keep their severity
+    when removed (the base file still holds the value)."""
+    findings: list[Finding] = []
+    # R3: a Debug transform is local-only, so it never counts as removing
+    # or keeping a setting for the release decision.
+    released = [n for n, _ in variants[1:] if n.lower() != "debug"]
+    emitted: dict[tuple, tuple[Hit, list[str]]] = {}
+    for key, h in per["base"].items():
+        emitted[key] = (h, [])
+    for name, _ in variants[1:]:
+        for key, h in per[name].items():
+            if key not in per["base"]:
+                emitted.setdefault(key, (h, []))[1].append(name)
+    for key, (h, intro) in emitted.items():
+        cid, sev, title, desc, el = h
+        if intro:
+            desc += " Introduced by " + ", ".join(f"Web.{n}.config" for n in intro) + "."
+        elif released:
+            gone = [n for n in released if key not in per[n]]
+            if len(gone) == len(released) and cid in committed:
+                # A transform does not un-commit a secret: the base file still holds it.
+                desc += (" Overridden by the Web." + ", ".join(gone) +
+                         ".config transform(s), but the value is still committed in the base Web.config.")
+            elif len(gone) == len(released):
+                sev = "info"
+                desc += (" Removed by the Web." + ", ".join(gone) +
+                         ".config transform(s); still present in the base Web.config used by local/debug builds.")
+            elif gone:
+                desc += " Still present in: " + ", ".join(n for n in released if key in per[n]) + "."
+        findings.append(dnl_finding(cid, sev, title, desc, el.get(ORIGIN, cfg.rel),
+                                    int(el.get(LINE) or 0), api_surface=api))
+    return findings
+
+
 def check_configs(configs: list[WebConfig], api_surface_dirs: set[Path],
                   has_aspx_dirs: set[Path], *,
                   project_dirs: set[Path] | None = None) -> tuple[list[Finding], list[str]]:
@@ -244,32 +284,5 @@ def check_configs(configs: list[WebConfig], api_surface_dirs: set[Path],
                     continue
                 d.setdefault((h[0], h[4].get(ORIGIN), h[4].get(LINE)), h)
             per[name] = d
-        # R3: a Debug transform is local-only, so it never counts as removing
-        # or keeping a setting for the release decision.
-        released = [n for n, _ in variants[1:] if n.lower() != "debug"]
-        emitted: dict[tuple, tuple[Hit, list[str]]] = {}
-        for key, h in per["base"].items():
-            emitted[key] = (h, [])
-        for name, _ in variants[1:]:
-            for key, h in per[name].items():
-                if key not in per["base"]:
-                    emitted.setdefault(key, (h, []))[1].append(name)
-        for key, (h, intro) in emitted.items():
-            cid, sev, title, desc, el = h
-            if intro:
-                desc += " Introduced by " + ", ".join(f"Web.{n}.config" for n in intro) + "."
-            elif released:
-                gone = [n for n in released if key not in per[n]]
-                if len(gone) == len(released) and cid in _COMMITTED_SECRETS:
-                    # A transform does not un-commit a secret: the base file still holds it.
-                    desc += (" Overridden by the Web." + ", ".join(gone) +
-                             ".config transform(s), but the value is still committed in the base Web.config.")
-                elif len(gone) == len(released):
-                    sev = "info"
-                    desc += (" Removed by the Web." + ", ".join(gone) +
-                             ".config transform(s); still present in the base Web.config used by local/debug builds.")
-                elif gone:
-                    desc += " Still present in: " + ", ".join(n for n in released if key in per[n]) + "."
-            findings.append(dnl_finding(cid, sev, title, desc, el.get(ORIGIN, cfg.rel),
-                                        int(el.get(LINE) or 0), api_surface=api))
+        findings += merge_variants(cfg, variants, per, api)
     return findings, notes

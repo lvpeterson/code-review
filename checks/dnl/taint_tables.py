@@ -27,7 +27,7 @@ _REQ = r"System\.Web\.(HttpRequest|HttpRequestBase|HttpRequestWrapper)"
 # followed by one request collection. Used as a call/index receiver or as a member.
 REQUEST_TEXT = (r"(?i)^((this|me)\.)?((httpcontext\.current|context|page)\.)?request"
                 r"(\.(querystring|form|params|cookies|headers|servervariables|rawurl|url|files|unvalidated|path|pathinfo|"
-                r"useragent|contenttype|apprelativecurrentexecutionfilepath|currentexecutionfilepath|filepath))?$")
+                r"useragent|contenttype|apprelativecurrentexecutionfilepath|currentexecutionfilepath|filepath|inputstream))?$")
 
 SOURCES: tuple[Source, ...] = (
     Source("Request", rf"^{_REQ}\.(QueryString|Form|Params|Cookies|Headers|ServerVariables|RawUrl|Url|"
@@ -91,6 +91,12 @@ _FILE = "System.IO.File"
 _LOG = ("log4net.ILog",)
 _WEBCLIENT = ("System.Net.WebClient",)
 _HTTPCLIENT = ("System.Net.Http.HttpClient",)
+# Formatters that rebuild arbitrary object graphs from their input. Json.NET TypeNameHandling is a
+# configuration finding (rules_deser_xml), not a taint sink.
+_FORMATTERS = ("System.Runtime.Serialization.Formatters.Binary.BinaryFormatter",
+               "System.Runtime.Serialization.Formatters.Soap.SoapFormatter",
+               "System.Runtime.Serialization.NetDataContractSerializer",
+               "System.Web.UI.LosFormatter", "System.Web.UI.ObjectStateFormatter")
 
 
 def _each(kind: str, name: str, types, members: str, **kw) -> list[Sink]:
@@ -163,6 +169,17 @@ SINKS: tuple[Sink, ...] = tuple(
     + _each("ssrf", "RestClient", ("RestSharp.RestClient",), ".ctor", args=(0,))
     + _each("ssrf", "RestRequest", ("RestSharp.RestRequest",), ".ctor", args=(0,))
     + _each("ssrf", "RestClient", ("RestSharp.RestClient",), "BaseUrl", assign=True)
+    # deser (dangerous formatters only)
+    + _each("deser", "Formatter", _FORMATTERS, "Deserialize|ReadObject", args=(0,))
+    # xxe: every XML entry point that takes content / a path / a stream. Whether the parser is
+    # actually configured to resolve entities is decided in rules_deser_xml (a hit on a line it
+    # does not list as insecure is dropped by rules_taint).
+    + _each("xxe", "XmlDocument", ("System.Xml.XmlDocument",), "Load|LoadXml", args=(0,))
+    + _each("xxe", "XmlTextReader", ("System.Xml.XmlTextReader",), ".ctor", args=(0,))
+    + _each("xxe", "XmlReader", ("System.Xml.XmlReader",), "Create", args=(0,))
+    + _each("xxe", "XPathDocument", ("System.Xml.XPath.XPathDocument",), ".ctor", args=(0,))
+    + _each("xxe", "DataSet", ("System.Data.DataSet",), "ReadXml", args=(0,))
+    + _each("xxe", "XDocument", ("System.Xml.Linq.XDocument", "System.Xml.Linq.XElement"), "Load", args=(0,))
     # log
     + _each("log", "ILog", _LOG, "Debug|Info|Warn|Error|Fatal", args=(0,))
     + _each("log", "ILog", _LOG, "DebugFormat|InfoFormat|WarnFormat|ErrorFormat|FatalFormat", all_args=True)

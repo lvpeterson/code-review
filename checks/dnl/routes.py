@@ -14,6 +14,7 @@ from pathlib import Path
 from checks.dnl.files import iter_dnl_files, read_source, resolve_ci
 from checks.dnl.ir import MethodIR, TypeIR, attr_key, call_name, const_str, has_attr, literal_str, receiver_text, walk
 from checks.dnl.project import Project, ProjectModel
+from checks.dnl.webconfig import load_configs
 
 SITE = "(site)"
 from core.models import Route
@@ -213,12 +214,12 @@ def discover_mvc_webapi(model: ProjectModel) -> list[RouteRef]:
 # -- WebForms -------------------------------------------------------------
 
 # `<%@ Page Language="VB" Inherits='X' ... %>`: the directive may span lines and quote with ' or ".
-_DIRECTIVE = re.compile(r"<%@\s*(page|webservice)\b(.*?)%>", re.IGNORECASE | re.DOTALL)
+_DIRECTIVE = re.compile(r"<%@\s*(page|webservice|servicehost)\b(.*?)%>", re.IGNORECASE | re.DOTALL)
 _DIRECTIVE_ATTR = re.compile(r"""([\w:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
 
 
 def _directive_attrs(text: str) -> dict[str, str]:
-    """Lowercased attribute map of the first Page/WebService directive (empty when none)."""
+    """Lowercased attribute map of the first Page/WebService/ServiceHost directive (empty when none)."""
     m = _DIRECTIVE.search(text)
     if not m:
         return {}
@@ -270,19 +271,19 @@ def _site_dir(root: Path, page: Path) -> Path:
         cur = cur.parent
 
 
-def _webform_pages(model: ProjectModel) -> list[tuple[Path, Project]]:
-    """(page file, owning project) for every .aspx/.asmx. A WebForms Web Site has
+def _webform_pages(model: ProjectModel, exts: tuple[str, ...] = (".aspx", ".asmx")) -> list[tuple[Path, Project]]:
+    """(page file, owning project) for every file with one of `exts`. A WebForms Web Site has
     no .csproj/.vbproj, so pages no project owns get a pathless "(site)" project
     rooted at their app dir (see _site_dir)."""
     projects = [p for p in model.projects if p.path is not None]
     project_dirs = [(p, p.dir.resolve()) for p in projects]
     pages: list[tuple[Path, Project]] = []
     for proj in projects:
-        for f in iter_dnl_files(proj.dir, (".aspx", ".asmx")):
+        for f in iter_dnl_files(proj.dir, exts):
             if _owner(project_dirs, f) is proj:
                 pages.append((f, proj))
     sites: dict[Path, Project] = {}
-    for f in iter_dnl_files(model.root, (".aspx", ".asmx")):
+    for f in iter_dnl_files(model.root, exts):
         if _owner(project_dirs, f) is None:
             d = _site_dir(model.root, f)
             pages.append((f, sites.setdefault(d, Project(name=SITE, path=None, language="cs", dir=d))))
@@ -329,4 +330,172 @@ def discover_webforms(model: ProjectModel) -> list[RouteRef]:
             meta={"kind": "webforms", "api_surface": f.suffix.lower() == ".asmx", "codebehind": cb_rel},
         )
         refs.append(RouteRef(route, t, None, proj))
+    return refs
+
+
+# -- WCF ------------------------------------------------------------------
+
+def _wcf_contracts(model: ProjectModel, t: TypeIR) -> list[TypeIR]:
+    """Types carrying [ServiceContract] that the service type implements: the type
+    itself, its project base types and every project interface along the base chain."""
+    cands = [t] + [bt for b in model.base_chain(t) for bt in model.find_types(b)]
+    out: list[TypeIR] = []
+    for c in cands:
+        if has_attr(c.attributes, "ServiceContract") and all(c is not o for o in out):
+            out.append(c)
+    return out
+
+
+def _simple_type(tn: str | None) -> str:
+    return (tn or "").replace(" ", "").split(".")[-1].lower()
+
+
+def _wcf_impl(model: ProjectModel, t: TypeIR, contract: TypeIR, op: MethodIR) -> tuple[str, TypeIR | None, MethodIR | None]:
+    """The method implementing contract operation `op` on service type `t`, as
+    (status, declaring type, method); status is ok / none / ambiguous. An explicit
+    `Implements IFoo.Bar` / `T IFoo.Bar()` naming this contract wins; otherwise same name,
+    arity and parameter type names, nearest type in the base chain first. Overloads are never
+    guessed between: an ambiguous match yields no method."""
+    chain = [t] + [bt for b in model.base_chain(t) for bt in model.find_types(b) if bt.kind != "interface"]
+    op_sig = [_simple_type(p.type) for p in op.params]
+    cname, oname = contract.name.split(".")[-1].lower(), op.name.lower()
+
+    def explicit(m: MethodIR) -> bool:
+        for target in m.implements:
+            qual, _, member = target.rpartition(".")
+            if member.lower() == oname and qual.split(".")[-1].split("<")[0].lower() == cname:
+                return True
+        return False
+
+    for c in chain:
+        hit = [m for m in c.methods if explicit(m)]
+        if hit:
+            return ("ok", c, hit[0]) if len(hit) == 1 else ("ambiguous", None, None)
+    for c in chain:
+        hit = [m for m in c.methods if m.name.lower() == oname and not m.implements
+               and [_simple_type(p.type) for p in m.params] == op_sig]
+        if hit:
+            return ("ok", c, hit[0]) if len(hit) == 1 else ("ambiguous", None, None)
+    return "none", None, None
+
+
+def _op_name(op: MethodIR) -> str:
+    """OperationContract(Name = "X") wins over the method name."""
+    a = has_attr(op.attributes, "OperationContract")
+    for k, v in ((a.named if a else None) or {}).items():
+        if k.lower() == "name" and literal_str(v):
+            return literal_str(v)
+    return op.name
+
+
+def _wcf_services(model: ProjectModel) -> list[tuple[str, str, str | None, str, Project]]:
+    """(svc path relative to its project, Service value, Factory value, source rel, project)
+    for every .svc file and every <serviceActivations><add> entry."""
+    out: list[tuple[str, str, str | None, str, Project]] = []
+    for f, proj in _webform_pages(model, (".svc",)):
+        attrs = _directive_attrs(read_source(f))
+        out.append((f.resolve().relative_to(proj.dir.resolve()).as_posix(), attrs.get("service", ""),
+                    attrs.get("factory"), model.rel(f), proj))
+    projects = [p for p in model.projects if p.path is not None]
+    project_dirs = [(p, p.dir.resolve()) for p in projects]
+    sites: dict[Path, Project] = {}
+    for cfg in load_configs(model.root):
+        if cfg.root is None or cfg.is_views:
+            continue
+        proj = _owner(project_dirs, cfg.path)
+        if proj is None:
+            d = _site_dir(model.root, cfg.path)
+            proj = sites.setdefault(d, Project(name=SITE, path=None, language="cs", dir=d))
+        for sa in cfg.root.iter("serviceActivations"):
+            for add in sa.findall("add"):
+                addr = add.get("relativeAddress")
+                if not addr or not add.get("service"):
+                    continue
+                rel = addr.replace("\\", "/")
+                while rel.startswith(("~/", "./")):
+                    rel = rel[2:]
+                out.append((rel.lstrip("/"), add.get("service"), None, cfg.rel, proj))
+    return out
+
+
+def _note(model: ProjectModel, text: str) -> None:
+    # The set shadows the list so the dedupe stays O(1) however many notes a scan collects.
+    seen = model.cache.setdefault("wcf_note_set", set())
+    if text not in seen:
+        seen.add(text)
+        model.notes.append(text)
+
+
+def _op_list_note(src: str, cname: str, ops: list[str], one: str, many: str) -> str:
+    """One note for several operations of a contract: a single operation keeps its own wording, 2-3 are
+    listed, more show the first three."""
+    if len(ops) == 1:
+        return f"{src}: operation {ops[0]} {one}"
+    shown = ", ".join(ops[:3])
+    return f"{src}: {len(ops)} operations of {cname} {many} ({shown if len(ops) <= 3 else 'first: ' + shown})"
+
+
+# Framework / BCL interfaces a service may implement without carrying operations: no missing-contract note.
+_FRAMEWORK_IFACES = {"idisposable", "iextensibleobject", "icommunicationobject", "ierrorhandler",
+                     "iservicebehavior", "iendpointbehavior", "icontractbehavior", "ioperationbehavior",
+                     "idispatchmessageinspector", "iclientmessageinspector", "iparameterinspector",
+                     "iequatable", "icomparable", "iserializable"}
+
+
+def discover_wcf(model: ProjectModel) -> list[RouteRef]:
+    """One route per [OperationContract] of every WCF service hosted by a .svc file or a
+    <serviceActivations> entry. Anything the model cannot resolve (service type, contract,
+    implementation, overload) is noted on the model, never silently dropped."""
+    refs: list[RouteRef] = []
+    seen: set[tuple[str, str, str]] = set()
+    for svc, service, factory, src, proj in _wcf_services(model):
+        t = _page_type(model, proj, service) if service else None
+        if t is None or t.kind != "class":
+            why = f"Factory={factory}" if factory else f"Service={service}"
+            _note(model, f"{src}: WCF service type not resolved ({why})")
+            continue
+        simple = t.name.split(".")[-1]
+        contracts = _wcf_contracts(model, t)
+        # Every interface of the service the model cannot resolve may carry operations: note each one.
+        missing = [b for b in model.base_chain(t) if not model.find_types(b)
+                   and re.match(r"I[A-Z]", b.split(".")[-1]) and b.split(".")[-1].lower() not in _FRAMEWORK_IFACES]
+        for b in missing:
+            _note(model, f"{src}: contract {b} not found in the scanned sources")
+        if not contracts and not missing:
+            _note(model, f"{src}: no [ServiceContract] contract found for {simple}")
+        local: set[tuple[str, str]] = set()
+        # (contract simple name, status) -> operations, flushed as one note per contract and kind.
+        failed: dict[tuple[str, str], list[str]] = {}
+        for contract in contracts:
+            for op in contract.methods:
+                if not has_attr(op.attributes, "OperationContract"):
+                    continue
+                name = _op_name(op)
+                key = (svc, contract.full_name.lower(), name.lower())
+                if (key[1], key[2]) in local:
+                    _note(model, f"{src}: operation {contract.name.split('.')[-1]}.{op.name} repeats the "
+                                 f"operation name {name}; the duplicate is not routed")
+                    continue
+                local.add((key[1], key[2]))
+                if key in seen:
+                    continue
+                seen.add(key)
+                status, decl, m = _wcf_impl(model, t, contract, op)
+                if status != "ok":
+                    cn = contract.name.split(".")[-1]
+                    failed.setdefault((cn, status), []).append(f"{cn}.{op.name}")
+                    continue
+                route = Route(
+                    path=f"/{svc}/{name}", methods=["POST"], handler_name=f"{simple}.{m.name}",
+                    file=decl.file, line=m.line, source_start_line=m.line, source_end_line=m.end_line,
+                    meta={"kind": "wcf", "api_surface": True, "contract": contract.full_name, "svc": svc},
+                )
+                refs.append(RouteRef(route, t, m, proj))
+        for (cn, status), ops in failed.items():
+            if status == "none":
+                _note(model, _op_list_note(src, cn, ops, "has no implementation in the scanned sources",
+                                           "have no implementation in the scanned sources"))
+            else:
+                _note(model, _op_list_note(src, cn, ops, f"is ambiguous between overloads of {simple}; not routed",
+                                           f"are ambiguous between overloads of {simple}; not routed"))
     return refs

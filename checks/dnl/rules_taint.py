@@ -18,17 +18,20 @@ RULE_FOR_KIND = {
     "sql": "DNL-INJ-001", "linq": "DNL-INJ-006", "cmd": "DNL-INJ-002", "ldap": "DNL-INJ-003",
     "xpath": "DNL-INJ-004", "header": "DNL-INJ-005", "xss": "DNL-XSS-001", "path": "DNL-PATH-001",
     "redirect": "DNL-REDIR-001", "ssrf": "DNL-SSRF-001", "log": "DNL-LOG-001",
+    "deser": "DNL-DESER-001", "xxe": "DNL-XXE-001",
 }
 _SEVERITY = {
     "DNL-INJ-001": "high", "DNL-INJ-006": "high", "DNL-INJ-002": "high", "DNL-INJ-003": "high",
     "DNL-INJ-004": "medium", "DNL-INJ-005": "medium", "DNL-XSS-001": "high", "DNL-PATH-001": "high",
     "DNL-REDIR-001": "medium", "DNL-SSRF-001": "high", "DNL-LOG-001": "low",
+    "DNL-DESER-001": "high", "DNL-XXE-001": "high",
 }
 _LABEL = {
     "sql": "SQL injection", "linq": "Dynamic LINQ injection", "cmd": "Command injection",
     "ldap": "LDAP injection", "xpath": "XPath injection", "header": "HTTP header injection",
     "xss": "Cross-site scripting", "path": "Path traversal", "redirect": "Open redirect",
     "ssrf": "Server-side request forgery", "log": "Log injection",
+    "deser": "Insecure deserialization", "xxe": "XML external entity (XXE)",
 }
 _LOWER = {"high": "medium", "medium": "low", "low": "info", "info": "info"}
 
@@ -74,8 +77,23 @@ def _route_key(r) -> tuple:
     return (rt.handler_name, rt.path, rt.file, rt.line)
 
 
+def rows_for(model, refs: list) -> list:
+    """Taint rows of the kinds reported here, computed once per model. An `xxe` row counts only
+    when rules_deser_xml lists its line as an insecure parse (the sink table matches every XML
+    entry point; a parser with the resolver off or DTDs prohibited is not a finding)."""
+    ckey = ("taint_rows", tuple(id(r) for r in refs))
+    cached = model.cache.get(ckey)
+    if cached is None:
+        from checks.dnl import rules_deser_xml
+        insecure = rules_deser_xml.insecure_xxe_lines(model, refs)
+        cached = model.cache[ckey] = [
+            r for r in taint_solver.entry_hits(model, refs)
+            if r.hit.kind in RULE_FOR_KIND and (r.hit.kind != "xxe" or (r.hit.file, r.hit.line) in insecure)]
+    return cached
+
+
 def check(model, refs: list) -> list[Finding]:
-    rows = [r for r in taint_solver.entry_hits(model, refs) if r.hit.kind in RULE_FOR_KIND]
+    rows = rows_for(model, refs)
     state = model.cache.get("taint", {})
     if state.get("converged") is False:
         note = (f"taint analysis stopped after {state.get('rounds')} rounds without converging; "

@@ -204,6 +204,9 @@ internal sealed class VbLowering
                 if (key == "set")
                     w.Str("set_param", acc.AccessorStatement.ParameterList?.Parameters.FirstOrDefault()?.Identifier.Identifier.ValueText ?? "Value");
             }
+            // `Property X As String = "..."` / `As New T(...)` initializer.
+            if ((p.Initializer?.Value ?? (p.AsClause as AsNewClauseSyntax)?.NewExpression) is { } pinit)
+                ExprProp("init", pinit);
             j.WriteNumber("line", DeclLine(p, p.AttributeLists));
             j.WriteEndObject();
         }
@@ -238,12 +241,15 @@ internal sealed class VbLowering
         string name;
         string? returnType;
         IEnumerable<string> handles = [];
+        IEnumerable<string> implements = [];
         if (sig is MethodStatementSyntax ms)
         {
             name = ms.Identifier.ValueText;
             returnType = ms.IsKind(SyntaxKind.SubStatement) ? "void" : ms.AsClause?.Type.ToString() ?? "Object";
             if (ms.HandlesClause is not null)
                 handles = ms.HandlesClause.Events.Select(e => e.ToString());
+            if (ms.ImplementsClause is not null)
+                implements = ms.ImplementsClause.InterfaceMembers.Select(m => m.ToString());
         }
         else
         {
@@ -270,6 +276,7 @@ internal sealed class VbLowering
 
         Attributes("attributes", sig.AttributeLists);
         w.StrArray("handles", handles);
+        w.StrArray("implements", implements);
 
         j.WriteStartArray("body");
         if (body is { } stmts) Seq(stmts);
@@ -732,6 +739,11 @@ internal sealed class VbLowering
                 LambdaParams(ml.SubOrFunctionHeader.ParameterList);
                 Body("body", ml.Statements, ml);
                 w.End();
+                break;
+
+            case UnaryExpressionSyntax ao when ao.IsKind(SyntaxKind.AddressOfExpression):
+                // `AddressOf Handler` is a method-group reference: lowered as the operand name / member.
+                ExprCore(ao.Operand);
                 break;
 
             default:

@@ -425,3 +425,37 @@ def test_param_modifiers_and_vb_set_param(roslyn_helper, tmp_path):
     f = vb["types"][0]["methods"][0]
     assert f["params"][0]["modifiers"] == ["paramarray"] and f["params"][1]["modifiers"] == ["optional"]
     assert vb["types"][0]["properties"][0]["set_param"] == "v"
+
+
+def test_implements_clause_ir(helper, tmp_path):
+    vb = tmp_path / "S.vb"
+    vb.write_text("Public Class S\n    Implements IFoo\n"
+                  "    Public Function Lookup(a As String) As String Implements IFoo.Find, IBar.Find\n"
+                  "        Return a\n    End Function\n    Public Sub Plain()\n    End Sub\nEnd Class\n")
+    cs = tmp_path / "S.cs"
+    cs.write_text("class S : IFoo { string IFoo.Find(string a) { return a; } public void Plain() {} }")
+    for path, lang in ((vb, "vb"), (cs, "cs")):
+        ir = parse_file(helper, tmp_path, path, lang)
+        ms = {m["name"]: m for m in ir["types"][0]["methods"]}
+        assert ms["Plain"]["implements"] == []
+        got = ms["Lookup" if lang == "vb" else "Find"]["implements"]
+        assert got == (["IFoo.Find", "IBar.Find"] if lang == "vb" else ["IFoo.Find"])
+
+
+def test_property_initializer_ir(helper, tmp_path):
+    cs = parse_one(helper, tmp_path, "P.cs", "cs",
+        'public class P {\n  public string A { get; set; } = "x";\n  public int B { get; } = 3;\n  public int C { get; set; }\n}\n')
+    props = {p["name"]: p for p in cs["types"][0]["properties"]}
+    assert props["A"]["init"]["v"] == "x" and props["B"]["init"]["v"] == 3 and "init" not in props["C"]
+    vb = parse_one(helper, tmp_path, "P.vb", "vb",
+        'Public Class P\n  Public Property A As String = "x"\n  Public Property B As New System.Text.StringBuilder()\n'
+        '  Public Property C As Integer\nEnd Class\n')
+    props = {p["name"]: p for p in vb["types"][0]["properties"]}
+    assert props["A"]["init"]["v"] == "x" and props["B"]["init"]["k"] == "new" and "init" not in props["C"]
+
+
+def test_vb_addressof_lowers_to_the_operand(helper, tmp_path):
+    vb = parse_one(helper, tmp_path, "A.vb", "vb",
+        'Public Class A\n  Sub M()\n    Dim h As System.EventHandler = AddressOf Go\n  End Sub\n  Sub Go(s As Object, e As System.EventArgs)\n  End Sub\nEnd Class\n')
+    init = vb["types"][0]["methods"][0]["body"][0]["init"]
+    assert init["k"] == "name" and init["id"] == "Go"

@@ -81,6 +81,21 @@ _add(["DNL-SSRF-001"], "A01", "A10", "API7")
 _add(["DNL-LOG-001"], "A09", "A09", None)
 _add(["DNL-AUTHZ-005"], "A01", "A01", "API1")
 _add(["DNL-AUTHZ-006", "DNL-AUTHZ-007"], "A06", "A04", "API3")
+# WCF configuration rules (Plan 3).
+_add(["DNL-WCF-001", "DNL-WCF-002"], "A02", "A05", "API8")
+_add(["DNL-WCF-003"], "A02", "A05", "API9", "always")
+_add(["DNL-WCF-004"], "A06", "A04", "API4")
+# Crypto and hardcoded secrets in code (Plan 3).
+_add(["DNL-CRY-001", "DNL-CRY-002", "DNL-CRY-003", "DNL-CRY-004", "DNL-CRY-005", "DNL-CRY-007", "DNL-CRY-008"],
+     "A04", "A02", None)
+_add(["DNL-CRY-006"], "A08", "A08", "API10", "always")
+_add(["DNL-SEC-003"], "A07", "A07", "API2")
+# Insecure deserialization and XXE (Plan 3).
+_add(["DNL-DESER-001", "DNL-DESER-002", "DNL-DESER-003"], "A08", "A08", None)
+_add(["DNL-XXE-001", "DNL-XXE-002"], "A02", "A05", "API8")
+# Integrity markup and session/auth code rules (Plan 3).
+_add(["DNL-INT-003", "DNL-INT-004"], "A08", "A08", None)
+_add(["DNL-SESS-006", "DNL-SESS-007", "DNL-SESS-008"], "A07", "A07", "API2")
 
 _PREFIX: list[tuple[str, tuple[str, str, Optional[str], str]]] = []
 

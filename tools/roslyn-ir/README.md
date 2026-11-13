@@ -76,12 +76,15 @@ failure), 2 usage.
   `name value` and the VB setter parameter keeps its declared name (`init`
   accessors count as `set`). VB properties with a `Set` block also carry
   `set_param`, the setter's value parameter name (default `Value`).
+  A property with an initializer (C# `{ get; set; } = expr`, VB `Property X As T = expr` or
+  `As New T(..)`) also carries `init` (Expr), like a field.
 - Method: `name` (`.ctor` for constructors), `modifiers`, `return_type`
   (`void` for C# void and VB Sub, null for constructors), `params` (each
   `{name, type, attributes}` plus an optional lowercased `modifiers` list when
   the parameter has any: C# `this`, `params`, `ref`, `out`, `in`; VB `byref`,
   `byval`, `paramarray`, `optional`),
-  `attributes`, `handles` (VB `Handles`), `body`, `line`, `end_line`.
+  `attributes`, `handles` (VB `Handles`), `implements` (VB method-level `Implements` targets, or the C# explicit interface
+  implementation, as `IFoo.Bar`), `body`, `line`, `end_line`.
 - Stmt `k`: `local`, `assign` (`op` is `=`, `+=`, `-=` or `concat=`; other
   compound ops lower to `=` with a `bin` value), `expr`, `return`, `throw`,
   `if`, `loop`, `try`, `using`, `with`, `other {text}`.
@@ -119,6 +122,7 @@ Sources decode as UTF-8 (BOM stripped), falling back to Windows-1252.
 
 Lowering notes worth knowing when consuming the IR:
 
+- VB `AddressOf Handler` lowers to the operand itself (a `name` / `member` reference), like a C# method group.
 - `this`/`Me`/`MyClass` -> `name this`; `base`/`MyBase` -> `name base`.
 - VB `&` is `bin` op `concat`; other VB binary ops keep their source spelling
   (`=`, `<>`, `AndAlso`, ...), C# ops keep theirs (`==`, `&&`, ...).

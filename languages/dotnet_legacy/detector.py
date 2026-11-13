@@ -1,12 +1,13 @@
 """Language + framework detection for legacy .NET Framework targets
-(MVC 5, Web API 2, WebForms, Web.config-only apps)."""
+(MVC 5, Web API 2, WebForms, WCF, Web.config-only apps)."""
 from __future__ import annotations
 
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from checks.dnl.files import is_legacy_project, iter_dnl_files, read_source
 
-_FRAMEWORK_ORDER = ["mvc", "webapi", "webforms", "config"]
+_FRAMEWORK_ORDER = ["mvc", "webapi", "webforms", "wcf", "config"]
 
 
 def _safe_read(path: Path) -> str:
@@ -24,6 +25,21 @@ def _is_main_config(path: Path) -> bool:
     return "<system.web" in text or "<system.webserver" in text
 
 
+def _hosts_wcf(text: str) -> bool:
+    """A real <system.serviceModel> element holding <services> or <serviceActivations>
+    (parsed, so comments and client-only configs do not count)."""
+    if "system.servicemodel" not in text.lower():
+        return False
+    try:
+        root = ET.fromstring(text.encode("utf-8", "replace"))
+    except ET.ParseError:
+        # Malformed config: the old textual check, so the services are still scanned.
+        low = text.lower()
+        return "<system.servicemodel" in low and ("<services" in low or "<serviceactivations" in low)
+    return any(sm.find(".//services") is not None or sm.find(".//serviceActivations") is not None
+               for sm in root.iter("system.serviceModel"))
+
+
 def _scan(target: Path) -> tuple[bool, set[str]]:
     """Walk once; return (language_detected, frameworks_found)."""
     lang = False
@@ -32,6 +48,10 @@ def _scan(target: Path) -> tuple[bool, set[str]]:
     for path in iter_dnl_files(target, exts):
         suffix = path.suffix.lower()
         name = path.name.lower()
+        if suffix == ".config" and name != "packages.config" and _hosts_wcf(_safe_read(path)):
+            # WCF described in config alone (services / serviceActivations, no .svc file).
+            lang = True
+            fw.add("wcf")
         if suffix in (".csproj", ".vbproj"):
             text = _safe_read(path)
             if is_legacy_project(text):
@@ -54,7 +74,10 @@ def _scan(target: Path) -> tuple[bool, set[str]]:
         elif suffix == ".aspx":
             lang = True
             fw.add("webforms")
-        elif suffix in (".ascx", ".svc", ".asmx"):
+        elif suffix == ".svc":
+            lang = True
+            fw.add("wcf")
+        elif suffix in (".ascx", ".asmx"):
             lang = True
     return lang, fw
 

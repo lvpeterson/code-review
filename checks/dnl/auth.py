@@ -405,3 +405,196 @@ def resolve(model: ProjectModel, ref: RouteRef, filters: list[GlobalFilter],
                             detail=f"a hand-rolled check in {ct.name.split('.')[-1]}.{hm.name}")
 
     return AuthInfo(False, "none")
+
+
+# -- WCF ----------------------------------------------------------------------
+
+_SECURITY_CTX = {"servicesecuritycontext", "primaryidentity", "windowsidentity"}
+# Bindings whose transport/message credential defaults to None when the config names none.
+_ANON_BINDINGS = {"basichttpbinding", "basichttpsbinding", "webhttpbinding", "basichttpcontextbinding"}
+
+
+def _principal_permission(attrs: list[Attr], file: str) -> AuthInfo | None:
+    """[PrincipalPermission(SecurityAction.Demand, Role/Name = ..., Authenticated = true)]:
+    only a Demand with a Role, a Name or Authenticated=true actually gates the caller."""
+    for a in attrs:
+        if attr_key(a.name) != "principalpermission":
+            continue
+        demand = any(n.get("k") == "member" and (n.get("name") or "").lower() == "demand"
+                     for arg in a.args[:1] for n in walk(arg))
+        named = {k.lower(): v for k, v in (a.named or {}).items()}
+        roles, users = _split_named(a, "role"), _split_named(a, "name")
+        authed = _is_true(named.get("authenticated"))
+        if demand and (roles or users or authed):
+            return AuthInfo(True, "attribute:PrincipalPermission", roles, users, file=file, line=a.line)
+    return None
+
+
+def _wcf_body_check(body: list) -> bool:
+    """An in-body gate: PrincipalPermission(...).Demand(), an IsInRole / IsAuthenticated test
+    whose branch rejects, or a rejecting test on ServiceSecurityContext.Current."""
+    nodes = list(walk(body))
+
+    def is_pp(e) -> bool:
+        return isinstance(e, dict) and e.get("k") == "new" and "principalpermission" in (e.get("type") or "").lower()
+
+    # Variables holding a PrincipalPermission: `Demand` only gates the caller on one of those (or on a
+    # chained `new PrincipalPermission(...)`), never on an unrelated permission object.
+    pp_vars = {(n.get("name") or "").lower() for n in nodes if n.get("k") == "local" and is_pp(n.get("init"))}
+    pp_vars |= {(n["target"].get("id") or n["target"].get("name") or "").lower() for n in nodes
+                if n.get("k") == "assign" and isinstance(n.get("target"), dict) and is_pp(n.get("value"))}
+    pp_vars.discard("")
+    for n in nodes:
+        if n.get("k") == "call" and (call_name(n) or "").lower() == "demand":
+            obj = (n.get("fn") or {}).get("obj")
+            if is_pp(obj) or (isinstance(obj, dict) and obj.get("k") == "name"
+                              and (obj.get("id") or "").lower() in pp_vars):
+                return True
+        if n.get("k") == "if" and _cond_tokens(n.get("cond")) & _SECURITY_CTX \
+                and any(_rejects(b) for b in (n.get("then"), n.get("else"))):
+            return True
+    return _body_checks_auth(body)
+
+
+def _sm(root: ET.Element, path: str) -> list[ET.Element]:
+    return root.findall(f"system.serviceModel/{path}")
+
+
+# Binding -> (default security mode, credential default for Transport, for Message). Anything not
+# listed (customBinding, third-party, blank) is treated as carrying no credentials.
+_BINDING_DEFAULTS = {
+    "basichttpbinding": ("none", "none", "windows"), "webhttpbinding": ("none", "none", "windows"),
+    "basichttpsbinding": ("transport", "none", "windows"), "basichttpcontextbinding": ("none", "none", "windows"),
+    "wshttpbinding": ("message", "none", "windows"), "ws2007httpbinding": ("message", "none", "windows"),
+    "wsdualhttpbinding": ("message", "none", "windows"), "wsfederationhttpbinding": ("message", "none", "windows"),
+    "ws2007federationhttpbinding": ("message", "none", "windows"),
+    "nettcpbinding": ("transport", "windows", "windows"), "netnamedpipebinding": ("transport", "windows", "windows"),
+    "netmsmqbinding": ("transport", "windows", "windows"),
+}
+
+
+def _binding_element(chain: list[ET.Element], binding: str, cfg_name: str | None) -> ET.Element | None:
+    for root in reversed(chain):
+        for tag in _sm(root, "bindings/*"):
+            if tag.tag.lower() != binding.lower():
+                continue
+            for b in tag.findall("binding"):
+                if (b.get("name") or None) == cfg_name:
+                    return b
+    return None
+
+
+def _binding_security(chain: list[ET.Element], ep: ET.Element
+                      ) -> tuple[str | None, str, ET.Element | None, ET.Element | None]:
+    """(security mode lowered, clientCredentialType lowered, binding element, security element)
+    of an endpoint. The mode is None when it cannot be determined (standard `kind=` endpoints,
+    blank / unknown / custom bindings); the credential is `none` whenever it cannot be shown
+    to demand one. The credential element read is the one matching the security mode."""
+    binding = (ep.get("binding") or "").lower()
+    if ep.get("kind") or not binding:
+        return None, "none", None, None
+    cfg = _binding_element(chain, binding, ep.get("bindingConfiguration") or None)
+    sec = cfg.find("security") if cfg is not None else None
+    if binding == "custombinding":
+        mode = ((sec.get("authenticationMode") or "") if sec is not None else "").lower()
+        return None, ("none" if mode in ("", "none") or mode.startswith("anonymous") else mode), cfg, sec
+    if binding not in _BINDING_DEFAULTS:
+        return None, "none", cfg, sec
+    dmode, dtransport, dmessage = _BINDING_DEFAULTS[binding]
+    mode = ((sec.get("mode") if sec is not None else None) or dmode).lower()
+    if mode == "none":
+        return mode, "none", cfg, sec
+    # Message-level credential for Message / Both / TransportWithMessageCredential, else the transport one.
+    use_message = mode in ("message", "both", "transportwithmessagecredential")
+    el = sec.find("message" if use_message else "transport") if sec is not None else None
+    cred = (el.get("clientCredentialType") if el is not None else None) or (dmessage if use_message else dtransport)
+    return mode, cred.lower(), cfg, sec
+
+
+def _binding_credential(chain: list[ET.Element], ep: ET.Element) -> str:
+    """Effective clientCredentialType (lowered) of an endpoint, `none` whenever it cannot be shown
+    to demand one (see `_binding_security`)."""
+    return _binding_security(chain, ep)[1]
+
+
+def _wcf_behavior_auth(ref: RouteRef, chain: list[ET.Element]) -> AuthInfo | None:
+    """serviceAuthorization (manager type or role mode) on the service's behavior, with every
+    non-mex endpoint on a binding that demands credentials."""
+    full = ref.type.full_name.lower()
+    for root in reversed(chain):
+        for svc in _sm(root, "services/service"):
+            if (svc.get("name") or "").lower() != full:
+                continue
+            beh = svc.get("behaviorConfiguration") or None
+            el = None
+            for r2 in reversed(chain):
+                for b in _sm(r2, "behaviors/serviceBehaviors/behavior"):
+                    if (b.get("name") or None) == beh and b.find("serviceAuthorization") is not None:
+                        el = b.find("serviceAuthorization")
+                        break
+                if el is not None:
+                    break
+            if el is None:
+                return None
+            mode = (el.get("principalPermissionMode") or "").lower()
+            if not (el.get("serviceAuthorizationManagerType") or mode in ("useaspnetroles", "usewindowsgroups")):
+                return None
+            eps = [e for e in svc.findall("endpoint")
+                   if (e.get("contract") or "").lower() != "imetadataexchange"
+                   and (e.get("kind") or "").lower() != "mexendpoint"
+                   and not (e.get("binding") or "").lower().startswith("mex")]
+            if not eps or any(_binding_credential(chain, e) == "none" for e in eps):
+                return None
+            what = ("serviceAuthorization manager" if el.get("serviceAuthorizationManagerType")
+                    else f"serviceAuthorization {el.get('principalPermissionMode')}")
+            return AuthInfo(True, "wcf binding/behavior", review=True, file=el.get(ORIGIN),
+                            line=int(el.get(LINE) or 0), detail=f"{what} on behavior '{beh or ''}' (callers must authenticate via the binding; "
+                                   "no per-operation authorization found)")
+    return None
+
+
+def resolve_wcf(model: ProjectModel, ref: RouteRef, configs: list) -> AuthInfo:
+    """Auth for a WCF operation: [PrincipalPermission] on the method or service class, an
+    in-body gate (inferred, review=True), a serviceAuthorization behavior plus credentialed
+    bindings (inferred, review=True), then web.config <authorization> when ASP.NET
+    compatibility is on; otherwise unprotected."""
+    t, m, route, proj = ref.type, ref.method, ref.route, ref.project
+    for attrs, file in ((m.attributes if m else [], route.file), (t.attributes, t.file)):
+        info = _principal_permission(attrs, file)
+        if info is not None:
+            return info
+    if m is not None and _wcf_body_check(m.body):
+        where = f"{t.name.split('.')[-1]}.{m.name}"
+        return AuthInfo(True, "operation body check", review=True, file=route.file, line=m.line,
+                        detail=f"a hand-rolled check in {where}")
+    if proj is None:
+        return AuthInfo(False, "none")
+    # Chain, behavior auth and the per-hosting-dir chain depend only on the project / service / hosting
+    # dir, so they are computed once per model however many operations the service has.
+    # The entry keeps the `configs` list it was built from (identity check), so a reload starts clean.
+    held = model.cache.get("wcf_auth")
+    if held is None or held[0] is not configs:
+        held = model.cache["wcf_auth"] = (configs, {})
+    cache = held[1]
+    chain = cache.get(("chain", proj.dir))
+    if chain is None:
+        chain = cache[("chain", proj.dir)] = config_chain(configs, proj.dir, proj.dir)
+    bkey = ("behavior", t.full_name.lower(), proj.dir)
+    if bkey not in cache:
+        cache[bkey] = _wcf_behavior_auth(ref, chain)
+    info = cache[bkey]
+    if info is not None:
+        return info
+    compat = any((e.get("aspNetCompatibilityEnabled") or "").lower() == "true"
+                 for root in chain for e in _sm(root, "serviceHostingEnvironment"))
+    if compat:
+        svc_path = "/" + route.meta["svc"]
+        hdir = (proj.dir / route.meta["svc"]).parent
+        hkey = ("hosting", hdir)
+        if hkey not in cache:
+            cache[hkey] = config_chain(configs, proj.dir, hdir)
+        denied, el = anonymous_denied(cache[hkey], svc_path)
+        if denied:
+            return AuthInfo(True, "web.config", file=el.get(ORIGIN) if el is not None else None,
+                            line=int(el.get(LINE) or 0) if el is not None else None)
+    return AuthInfo(False, "none")

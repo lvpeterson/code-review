@@ -19,6 +19,8 @@ _SENSITIVE_CONTROLLER = re.compile(r"(?i)admin|manage|role|permission|setting|co
 _SENSITIVE_ACTION = re.compile(r"(?i)^(delete|remove|purge|approve|grant|revoke|reset)")
 _ANTIFORGERY = {"ValidateAntiForgeryToken", "ValidateAntiForgeryTokenAttribute"}
 _UNPROTECTED_PAGE = "No web.config authorization rule or code-behind check covers this page."
+_UNPROTECTED_WCF = ("No [PrincipalPermission], in-operation check, serviceAuthorization behavior with "
+                    "credentialed bindings or web.config rule covers this operation.")
 _UNPROTECTED = "No [Authorize], global filter, base controller or web.config rule covers this action."
 
 
@@ -68,10 +70,11 @@ def check_routes(model: ProjectModel, refs: list[RouteRef], filters: list[auth.G
     for ref in refs:
         r = ref.route
         webforms = r.meta.get("kind") == "webforms"
-        if webforms:
+        wcf = r.meta.get("kind") == "wcf"
+        if webforms or wcf:
             if configs is None:
                 configs = load_configs(model.root)
-            info = auth.resolve_webforms(model, ref, configs)
+            info = (auth.resolve_webforms if webforms else auth.resolve_wcf)(model, ref, configs)
         else:
             info = auth.resolve(model, ref, filters, chain_for)
         r.auth_decorators = [info.source] if info.protected else []
@@ -92,7 +95,7 @@ def check_routes(model: ProjectModel, refs: list[RouteRef], filters: list[auth.G
                     "authentication ([AllowAnonymous]). Confirm anonymous callers may change state here.",
                     r.file, r.line, confidence="REVIEW", **kw))
         elif not info.protected:
-            why = _UNPROTECTED_PAGE if webforms else _UNPROTECTED
+            why = _UNPROTECTED_PAGE if webforms else _UNPROTECTED_WCF if wcf else _UNPROTECTED
             if info.source != "none":
                 why += f" The only candidate ({info.source}) never denies a request."
             out.append(dnl_finding(

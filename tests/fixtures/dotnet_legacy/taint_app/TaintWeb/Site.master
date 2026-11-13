@@ -1,0 +1,10 @@
+<%@ Master Language="C#" EnableViewStateMac="true" %>
+<%-- <link rel="stylesheet" href="https://commented.example/x.css" /> --%>
+<html>
+<head runat="server">
+    <link rel="stylesheet" href="https://cdn.example.net/site.css" />
+    <link rel="stylesheet" href="<%: ResolveUrl("~/Content/site.css") %>" />
+    <script src="https://cdn.example.net/ok.js" integrity="sha256-xyz"></script>
+</head>
+<body><asp:ContentPlaceHolder ID="Main" runat="server" /></body>
+</html>

@@ -204,10 +204,12 @@ Currently implemented (route extraction + baseline checks):
 - **javascript**: express, nextjs, hono
 - **go**: gin, net_http
 - **dotnet**: aspnet
-- **dotnet_legacy**: mvc, webapi, webforms, config (.NET Framework MVC 5,
-  Web API 2, WebForms and Web.config, C# and VB, via the Roslyn helper in
-  `tools/roslyn-ir`; cross-file taint analysis for injection / XSS / path /
-  redirect / SSRF, object-level authz; OWASP 2025/2021/API tags) -- see
+- **dotnet_legacy**: mvc, webapi, webforms, wcf, config (.NET Framework MVC 5,
+  Web API 2, WebForms, WCF services and Web.config, C# and VB, via the Roslyn
+  helper in `tools/roslyn-ir`; cross-file taint analysis for injection / XSS /
+  path / redirect / SSRF / deserialization / XXE, object-level authz, WCF
+  binding and behavior rules, crypto and hardcoded-secret rules, SRI and
+  ViewState integrity, session heuristics; OWASP 2025/2021/API tags) -- see
   `languages/dotnet_legacy/README.md`.
 - **ruby**: rails, sinatra
 - **sql**: plsql (Oracle). No routes: every finding is project-wide and

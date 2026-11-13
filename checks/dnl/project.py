@@ -124,6 +124,7 @@ def _load_project(path: Path, notes: list[str]) -> Project:
     except ET.ParseError as ex:
         notes.append(f"{path.name}: project file is not valid XML ({ex}); treated as empty")
         return proj
+    missing: dict[str, list[str]] = {}
     for el in tree.iter():
         tag = _local(el.tag)
         inc = el.get("Include")
@@ -138,13 +139,19 @@ def _load_project(path: Path, notes: list[str]) -> Project:
         elif tag in ("ProjectReference", "Compile", "Content") and inc:
             target = resolve_ci(proj.dir, _MSBUILD_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), inc))
             if target is None:
-                notes.append(f"{path.name}: {tag} include not found: {inc}")
+                missing.setdefault(tag, []).append(inc)
             elif tag == "ProjectReference":
                 proj.project_refs.append(target)
             elif tag == "Compile":
                 proj.compile_files.append(target)
             else:
                 proj.content_files.append(target)
+    # One note per project and item kind: a stale project file can list hundreds of dead includes.
+    for tag, incs in missing.items():
+        if len(incs) == 1:
+            notes.append(f"{path.name}: {tag} include not found: {incs[0]}")
+        else:
+            notes.append(f"{path.name}: {len(incs)} {tag} includes not found (first: {', '.join(incs[:3])})")
     return proj
 
 

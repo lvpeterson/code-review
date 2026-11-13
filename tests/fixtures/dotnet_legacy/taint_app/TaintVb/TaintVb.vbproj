@@ -13,6 +13,7 @@
   <ItemGroup>
     <Compile Include="Search.vb" />
     <Compile Include="Gaps.vb" />
+    <Compile Include="Crypto.vb" />
     <Compile Include="Search.designer.vb" />
     <Compile Include="Pages\Search.aspx.vb" />
     <Compile Include="Pages\Search.aspx.designer.vb" />

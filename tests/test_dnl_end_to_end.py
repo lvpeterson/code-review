@@ -187,3 +187,17 @@ def test_taint_solver_performance_guard(roslyn_helper):
     assert state["converged"] is True
     # Observed 11 rounds; the cap is 24, so there is margin and converged carries the check.
     assert state["rounds"] <= 24
+
+
+def test_end_to_end_wcf_app(tmp_path, monkeypatch, roslyn_helper):
+    """wcf_app through the CLI: a wcf result with routes, WCF config rules, and SQLi on a WCF route."""
+    out = tmp_path / "r.json"
+    monkeypatch.setattr(sys, "argv", ["main.py", str(FX / "wcf_app"), "--json", str(out)])
+    assert main.main() == 0
+    data = [r for r in json.loads(out.read_text()) if r["language"] == "dotnet_legacy"]
+    wcf = [r for r in data if r["framework"] == "wcf"]
+    assert len(wcf) == 1 and wcf[0]["routes"]
+    ids = {f["check_id"] for r in data for f in r["findings"]}
+    assert any(i.startswith("DNL-WCF-") for i in ids)
+    inj = [f for f in wcf[0]["findings"] if f["check_id"] == "DNL-INJ-001"]
+    assert inj and all(f["owasp"]["2025"].startswith("A05:2025") for f in inj)

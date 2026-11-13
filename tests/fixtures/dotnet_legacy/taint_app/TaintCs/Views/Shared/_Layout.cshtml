@@ -1,0 +1,18 @@
+@* <script src="https://commented.example/never.js"></script> *@
+<!DOCTYPE html>
+<html>
+<head>
+    <link rel="stylesheet" href="@Url.Content("~/Content/site.css")" />
+    <link rel="stylesheet" href="//fonts.example.net/css?family=Sans">
+    <link rel="icon" href="https://img.example.net/favicon.ico">
+</head>
+<body>
+    <script src="https://cdn.example.net/lib.js"></script>
+    <script src="https://cdn.example.net/safe.js" integrity="sha384-abc" crossorigin="anonymous"></script>
+    <script src="~/Scripts/app.js"></script>
+    <script src="/Scripts/local.js"></script>
+    <script src='@Url.Content("~/Scripts/more.js")'></script>
+    <SCRIPT SRC=http://cdn.example.net/unquoted.js></SCRIPT>
+    @RenderBody()
+</body>
+</html>
