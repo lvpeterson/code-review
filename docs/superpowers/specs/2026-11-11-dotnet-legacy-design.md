@@ -1,7 +1,7 @@
 # dotnet_legacy: .NET Framework appsec analyzer with combined OWASP mapping
 
 Date: 2026-11-11
-Status: draft, awaiting approval
+Status: implemented; see languages/dotnet_legacy/README.md for limits
 
 ## Intent
 

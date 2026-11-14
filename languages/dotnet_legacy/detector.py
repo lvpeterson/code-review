@@ -7,7 +7,9 @@ from pathlib import Path
 
 from checks.dnl.files import is_legacy_project, iter_dnl_files, read_source
 
-_FRAMEWORK_ORDER = ["mvc", "webapi", "webforms", "wcf", "config"]
+_FRAMEWORK_ORDER = ["mvc", "webapi", "webforms", "wcf", "config", "deps"]
+# Bundled-JS directories the SCA banner scan looks in (rules_sca._BUNDLE_DIRS).
+_JS_DIRS = {"scripts", "content", "lib", "libs"}
 
 
 def _safe_read(path: Path) -> str:
@@ -44,10 +46,21 @@ def _scan(target: Path) -> tuple[bool, set[str]]:
     """Walk once; return (language_detected, frameworks_found)."""
     lang = False
     fw: set[str] = set()
-    exts = (".csproj", ".vbproj", ".config", ".aspx", ".ascx", ".svc", ".asmx")
+    exts = (".csproj", ".vbproj", ".config", ".aspx", ".ascx", ".svc", ".asmx", ".js")
+    deps = False
     for path in iter_dnl_files(target, exts):
         suffix = path.suffix.lower()
         name = path.name.lower()
+        if suffix == ".js":
+            # Bundled JS alone does not make a .NET target; it only feeds the deps analyzer.
+            try:
+                rel_dirs = path.relative_to(target).parts[:-1]
+            except ValueError:
+                rel_dirs = ()
+            deps = deps or any(p.lower() in _JS_DIRS for p in rel_dirs)
+            continue
+        if name == "nuget.config":
+            deps = True
         if suffix == ".config" and name != "packages.config" and _hosts_wcf(_safe_read(path)):
             # WCF described in config alone (services / serviceActivations, no .svc file).
             lang = True
@@ -56,12 +69,15 @@ def _scan(target: Path) -> tuple[bool, set[str]]:
             text = _safe_read(path)
             if is_legacy_project(text):
                 lang = True
+                if "<HintPath>" in text or "<TargetFrameworkVersion>" in text:
+                    deps = True
                 if "System.Web.Mvc" in text:
                     fw.add("mvc")
                 if "System.Web.Http" in text:
                     fw.add("webapi")
         elif name == "packages.config":
             lang = True
+            deps = True
             text = _safe_read(path)
             if "Microsoft.AspNet.Mvc" in text:
                 fw.add("mvc")
@@ -79,6 +95,8 @@ def _scan(target: Path) -> tuple[bool, set[str]]:
             fw.add("wcf")
         elif suffix in (".ascx", ".asmx"):
             lang = True
+    if lang and deps:
+        fw.add("deps")
     return lang, fw
 
 

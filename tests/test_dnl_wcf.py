@@ -92,7 +92,7 @@ def test_unresolved_factory_is_noted(wcf_model):
 
 
 def test_detector_finds_wcf():
-    assert detector.detect_frameworks(FX / "wcf_app") == ["wcf", "config"]
+    assert detector.detect_frameworks(FX / "wcf_app") == ["wcf", "config", "deps"]
 
 
 def _app(tmp_path, files, cfg=""):

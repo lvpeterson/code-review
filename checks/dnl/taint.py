@@ -33,7 +33,9 @@ from checks.dnl.ir import MethodIR, TypeIR, literal_str, receiver_text
 
 @dataclass(frozen=True)
 class Origin:
-    kind: str       # "source" | "param" | "field"
+    # "source" (request input) | "param" | "field" | "external" (an outbound response body; read only by
+    # DNL-CONSUME-002 -- every request-source rule keys on "source" and ignores it)
+    kind: str
     detail: str     # source name, param index (as a string) or field name
     file: str
     line: int
@@ -100,6 +102,9 @@ _COMPARE_OPS = frozenset({
 _SOURCE_RES = [(s, re.compile(s.sym), re.compile(s.text) if s.text else None) for s in T.SOURCES]
 _REQUEST_RE = re.compile(T.REQUEST_TEXT)
 _FIELD_SRC_RE = re.compile(T.FIELD_SOURCE_TYPES)
+_EXT_SYM_RE = re.compile(T.EXTERNAL_SYM)
+_INCOMING_RE = re.compile(T.INCOMING_REQUEST_TEXT)
+_EXT_SYM_ONLY_RE = re.compile(T.EXTERNAL_SYM_ONLY_RE)
 _SAN_RES = [(s, re.compile(s.member)) for s in T.SANITIZERS]
 _GUARD = {g.shape: g for g in T.GUARDS}
 _REQUEST_PROP_RE = re.compile(r"(?i)^((this|me)\.)?((httpcontext\.current|context|page)\.)?request$")
@@ -662,6 +667,9 @@ class _Analysis:
         san = self._sanitize(e, fn, name, recv, args, vals, rv)
         if san is not False:
             return san
+        ext = self._external_call(e, low, recv, vals + nvals, rv)
+        if ext is not False:
+            return ext
         # collection accessors on a tainted receiver
         if low in T.ACCESSOR_METHODS and rv is not None:
             return rv
@@ -700,6 +708,44 @@ class _Analysis:
         if isinstance(a, dict) and a.get("k") == "lambda":
             return self._ev_lambda(a, bind, sync)
         return self.ev(a)
+
+    def _external_call(self, e: dict, low: str, recv: Any, vals: list, rv: Taint | None):
+        """Outbound-response taint (origin kind "external"): a call that reads a response body is a
+        source, and a deserializer / parser turns an external value into a value that keeps only
+        the external origin. False when the call is neither, so the normal rules go on. A receiver
+        that already carries request taint keeps it (the result adds the external origin to it)."""
+        sym = e.get("sym")
+        line = e.get("line", 0)
+        is_src = False
+        if _INCOMING_RE.match(self._text(recv) or ""):
+            if low in T.INCOMING_BODY_READS:
+                # `Request.Content.ReadAsStringAsync()`: the client's body is request input.
+                src = self._origin(f"Request.Content.{e.get('fn', {}).get('name') or low}", line)
+                return Taint(src.origins | rv.origins, src.cleansed & rv.cleansed) if rv is not None else src
+            is_src = False
+        elif low in T.EXTERNAL_NAMES:
+            is_src = not sym or bool(_EXT_SYM_RE.match(sym))
+        elif low in T.EXTERNAL_SYM_ONLY:
+            is_src = bool(sym and _EXT_SYM_ONLY_RE.match(sym))
+        if is_src:
+            origin = Origin("external", f"response of {e.get('fn', {}).get('name') or low}", self.t.file, line)
+            if rv is not None:
+                return Taint(rv.origins | {origin}, rv.cleansed)
+            return Taint(frozenset({origin}), frozenset())
+        parse = low == "parse" and recv is not None and _simple(self.type_of(recv) or "").lower() in T.PARSER_TYPES
+        parse = parse or (low == "parse" and recv is not None
+                          and (self._text(recv) or "").split(".")[-1].lower() in T.PARSER_TYPES)
+        if low in T.DESERIALIZERS or parse:
+            merged = None
+            for v in vals:
+                merged = merge(merged, v)
+            ext = frozenset(o for o in (merged.origins if merged else ()) if o.kind == "external")
+            if ext:
+                if rv is not None:
+                    return Taint(rv.origins | ext, rv.cleansed)
+                return Taint(ext, merged.cleansed)
+            return False
+        return False
 
     def _request_default(self, fn: dict) -> Taint | None:
         """`Request("q")`: the call's own and the member's syms name HttpRequest.Item / Page.Request,

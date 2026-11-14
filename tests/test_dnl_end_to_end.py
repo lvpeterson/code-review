@@ -31,7 +31,7 @@ def test_end_to_end_cli(tmp_path, monkeypatch, roslyn_helper):
     assert main.main() == 0
     data = json.loads(out.read_text())
     fw = {r["framework"] for r in data if r["language"] == "dotnet_legacy"}
-    assert fw == {"mvc", "webapi", "config"}
+    assert fw == {"mvc", "webapi", "config", "deps"}
     ids = {f["check_id"] for r in data for f in r["findings"]}
     assert {"DNL-AUTHZ-001", "DNL-AUTHZ-003", "DNL-CFG-001"} <= ids
     assert all(f["owasp"] for r in data if r["language"] == "dotnet_legacy" for f in r["findings"])
@@ -99,7 +99,8 @@ def test_degraded_analyzers(monkeypatch):
     monkeypatch.setattr(helper, "sdk_available", lambda: False)
     project.prepare(FX / "mvc5_app", True)
     mvc, cfg = _run("mvc", FX / "mvc5_app"), _run("config", FX / "mvc5_app")
-    assert mvc.routes == [] and mvc.findings == [] and mvc.degraded == helper.DEGRADED_REASON
+    # C# is lowered by tree-sitter, so the code analyzers still find routes (see test_dnl_degraded).
+    assert mvc.routes and mvc.degraded == helper.DEGRADED_REASON
     assert cfg.degraded == helper.DEGRADED_REASON
     assert any(f.check_id == "DNL-CFG-001" for f in cfg.findings)
 
@@ -201,3 +202,63 @@ def test_end_to_end_wcf_app(tmp_path, monkeypatch, roslyn_helper):
     assert any(i.startswith("DNL-WCF-") for i in ids)
     inj = [f for f in wcf[0]["findings"] if f["check_id"] == "DNL-INJ-001"]
     assert inj and all(f["owasp"]["2025"].startswith("A05:2025") for f in inj)
+
+
+def test_end_to_end_deps_app(tmp_path, monkeypatch, roslyn_helper):
+    """deps_app through the real CLI path: a deps result carrying SCA findings with OWASP tags."""
+    out = tmp_path / "r.json"
+    monkeypatch.setattr(sys, "argv", ["main.py", str(FX / "deps_app"), "--json", str(out)])
+    assert main.main() == 0
+    data = [r for r in json.loads(out.read_text()) if r["language"] == "dotnet_legacy"]
+    deps = [r for r in data if r["framework"] == "deps"]
+    assert len(deps) == 1
+    sca = [f for f in deps[0]["findings"] if f["check_id"].startswith("DNL-SCA-")]
+    assert sca
+    assert all(f["owasp"]["2025"].startswith("A03:2025") for f in sca)
+
+
+def test_detector_registers_every_framework_across_fixtures():
+    """Across the fixtures the detector reports all six frameworks."""
+    from languages.dotnet_legacy import detector
+    seen: set[str] = set()
+    for d in sorted(p for p in FX.iterdir() if p.is_dir()):
+        seen |= set(detector.detect_frameworks(d))
+    assert seen == {"mvc", "webapi", "webforms", "wcf", "config", "deps"}
+
+
+def test_tfv_only_project_registers_deps_and_sca_003(tmp_path):
+    from languages.dotnet_legacy import detector
+    (tmp_path / "W.csproj").write_text(
+        '<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">'
+        '<PropertyGroup><TargetFrameworkVersion>v4.5</TargetFrameworkVersion></PropertyGroup>'
+        '<ItemGroup><Reference Include="System.Web"/></ItemGroup></Project>')
+    (tmp_path / "Default.aspx").write_text('<%@ Page Language="C#" CodeBehind="Default.aspx.cs" %>')
+    (tmp_path / "Default.aspx.cs").write_text("public partial class Default : System.Web.UI.Page {}")
+    assert "deps" in detector.detect_frameworks(tmp_path)
+    project.prepare(tmp_path, True)
+    res = _run("deps", tmp_path)
+    assert any(f.check_id == "DNL-SCA-003" for f in res.findings)
+
+
+def test_failing_rule_module_is_noted_and_others_still_run(monkeypatch):
+    from checks.dnl import rules_xss
+    baseline = {f.check_id for f in _run("mvc", FX / "mvc5_app").findings}
+    project._CACHE.clear()
+
+    def boom(*a, **k):
+        raise ValueError("kaboom")
+    monkeypatch.setattr(rules_xss, "check", boom)
+    project.prepare(FX / "mvc5_app", False)
+    res = _run("mvc", FX / "mvc5_app")
+    assert {f.check_id for f in res.findings} >= {c for c in baseline if not c.startswith("DNL-XSS")}
+    assert any("rules_xss failed (ValueError: kaboom); its findings are missing" in n for n in res.notes)
+
+
+def test_failing_sca_is_noted(monkeypatch):
+    from checks.dnl import rules_sca
+    def boom(*a, **k):
+        raise RuntimeError("bad")
+    monkeypatch.setattr(rules_sca, "check", boom)
+    project.prepare(FX / "deps_app", False)
+    res = _run("deps", FX / "deps_app")
+    assert any("rules_sca failed (RuntimeError: bad); its findings are missing" in n for n in res.notes)

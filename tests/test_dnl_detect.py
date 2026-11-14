@@ -35,5 +35,5 @@ def test_legacy_vs_sdk_projects():
     assert not is_legacy_project((FX / "core_app/App.csproj").read_text())
 
 def test_detector():
-    assert detector.detect_frameworks(FX / "mvc5_app") == ["mvc", "webapi", "config"]
+    assert detector.detect_frameworks(FX / "mvc5_app") == ["mvc", "webapi", "config", "deps"]
     assert not detector.detect_language(FX / "core_app")

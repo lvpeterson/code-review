@@ -25,7 +25,7 @@ class Source:
 _REQ = r"System\.Web\.(HttpRequest|HttpRequestBase|HttpRequestWrapper)"
 # `Request`, `this.Request`, `Page.Request`, `HttpContext.Current.Request`, optionally
 # followed by one request collection. Used as a call/index receiver or as a member.
-REQUEST_TEXT = (r"(?i)^((this|me)\.)?((httpcontext\.current|context|page)\.)?request"
+REQUEST_TEXT = (r"(?i)^((this|me)\.)?(((system\.web\.)?httpcontext\.current|context|page)\.)?request"
                 r"(\.(querystring|form|params|cookies|headers|servervariables|rawurl|url|files|unvalidated|path|pathinfo|"
                 r"useragent|contenttype|apprelativecurrentexecutionfilepath|currentexecutionfilepath|filepath|inputstream))?$")
 
@@ -295,3 +295,33 @@ GUARDS: tuple[Guard, ...] = (
     Guard("Array.IndexOf", "indexof", _ALL),
     Guard("Path.GetFullPath+StartsWith", "startswith-fullpath", frozenset({"path"})),
 )
+
+# -- external sources (outbound response bodies) -----------------------------
+# Data read back from a call the app itself made (HttpClient / WebClient / WebRequest / RestSharp). It
+# is NOT request input: it carries the origin kind "external", which only DNL-CONSUME-002 reads, so
+# the injection / XSS / path / redirect rules never report a flow that starts here.
+# Method names are distinctive enough to match without `sym`; when `sym` resolves it must be under
+# one of the client namespaces (a project method that happens to share the name is not a source).
+EXTERNAL_NAMES = frozenset({
+    "readasasync", "readasstringasync", "readasstreamasync", "readasbytearrayasync",
+    "downloadstring", "downloadstringasync", "downloadstringtaskasync", "downloaddata",
+    "downloaddatataskasync", "getstringasync", "getbytearrayasync", "getresponsestream",
+    "readasmultipartasync",
+})
+EXTERNAL_SYM = r"^(System\.Net\.|RestSharp\.|Flurl\.|Refit\.|System\.IO\.StreamReader\.)"
+# RestSharp's `Execute` family only counts with a resolved RestSharp symbol (`Execute` alone is too common).
+EXTERNAL_SYM_ONLY = frozenset({"execute", "executeasync", "executetaskasync", "get", "post"})
+EXTERNAL_SYM_ONLY_RE = r"^RestSharp\.(IRestClient|RestClient|RestClientExtensions)\."
+# Calls that turn an external body into a value: the result keeps the external origin (only).
+DESERIALIZERS = frozenset({"deserializeobject", "deserialize", "deserializeanonymoustype", "fromjson", "readobject",
+                           "deserializenode"})
+# `JObject.Parse(text)` style: receiver type names.
+PARSER_TYPES = frozenset({"jobject", "jarray", "jtoken", "xdocument", "xelement", "xmldocument"})
+
+# Receivers that are the INCOMING request, not an outbound response: `Request.Content.ReadAsStringAsync()` in a
+# Web API action reads what the client sent, so it is never an `external` source.
+INCOMING_REQUEST_TEXT = (r"(?i)^((this|base)\.)?((actioncontext|controllercontext)\.|httpcontext\.current\.)?"
+                         r"request(\.(content|inputstream))?$")
+# Reading the incoming Web API request body is request input (a taint source), not an outbound response.
+INCOMING_BODY_READS = frozenset({"readasstringasync", "readasasync", "readasformdataasync", "readasbytearrayasync",
+                                 "readasstreamasync", "readasmultipartasync"})

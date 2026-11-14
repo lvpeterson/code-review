@@ -1,9 +1,31 @@
-# dotnet_legacy: .NET Framework (MVC 5, Web API 2, WebForms, web.config)
+# dotnet_legacy: .NET Framework (MVC 5, Web API 2, WebForms, WCF, web.config)
 
-Appsec review for classic ASP.NET on the .NET Framework, C# and VB alike.
-ASP.NET Core (SDK-style projects) stays with `languages/dotnet`.
+## What it is
 
-Frameworks reported as separate results:
+An appsec review analyzer for classic ASP.NET on the .NET Framework, C# and VB
+alike: ASP.NET MVC 5, Web API 2, WebForms (`.aspx` / `.asmx`), WCF services,
+`Web.config` (with XDT transforms) and the dependencies those apps bundle.
+ASP.NET Core (SDK-style projects) stays with `languages/dotnet`. It runs
+automatically when `main.py` detects such a target, and every finding carries
+OWASP Web Top 10 2025 and 2021 tags plus an API Security Top 10 2023 tag where
+it applies (HTML report OWASP tab, JSON `owasp` field, SARIF rule tags).
+
+## Requirements
+
+- Python dependencies from the repo's `requirements.txt` (this includes
+  tree-sitter, used by degraded mode).
+- The **.NET 8 SDK** to build the Roslyn helper (`tools/roslyn-ir`) that parses
+  C# and VB. The helper is found via `CODE_REVIEW_ROSLYN_IR`, else
+  `tools/roslyn-ir/bin/` (rebuilt when older than its sources), else
+  `roslyn-ir` on PATH, and is built automatically (`dotnet publish`) when the
+  SDK is on PATH. If no helper can be found or built, the CLI prints install
+  steps and exits 2. See "Preflight and `--allow-degraded`" and "Linux
+  install" below.
+- `--allow-degraded` continues without the helper, with reduced coverage (see
+  "Preflight and `--allow-degraded`").
+
+## Frameworks reported as separate results
+
 
 - **mvc** -- controllers deriving (transitively) from `Controller` /
   `AsyncController`.
@@ -16,10 +38,66 @@ Frameworks reported as separate results:
 - **wcf** -- one route per service operation (see "WCF" below).
 - **config** -- `Web.config` rules, transform aware (`Web.Release.config`
   etc. via XDT).
+- **deps** -- offline software composition rules (DNL-SCA-*): NuGet
+  packages, bundled JavaScript, target framework, unmanaged binaries,
+  `nuget.config` sources (see "Advisory data" below).
 
-Every finding carries OWASP Web Top 10 2025 and 2021 tags, plus an API
-Security Top 10 2023 tag when it applies (see the table). They show in the
-HTML report's OWASP tab, the JSON `owasp` field and SARIF rule tags.
+## What is detected
+
+By area (rule ids; the full table with severities is under "Rules", the
+OWASP mapping under "OWASP coverage"):
+
+- **Injection and XSS** -- SQL, command, LDAP, XPath, header and Dynamic LINQ
+  injection (INJ-001..006), XSS from code, Razor / ASPX output and bypassed
+  request validation (XSS-001..004). Cross-file taint, see "Taint analysis".
+- **Authorization and authentication** -- routes with no effective auth, bad
+  `[AllowAnonymous]`, auth filters that never deny, admin-looking actions
+  without roles, IDOR, over-posting and entity over-exposure (AUTHZ-001..007);
+  open redirect, path traversal, SSRF (REDIR-001, PATH-001, SSRF-001).
+- **Session and CSRF** -- anti-forgery tokens (CSRF-001); cookie, timeout and
+  cookieless settings, membership password format (SESS-001..005); logout /
+  login / plaintext-compare heuristics (SESS-006..008).
+- **Crypto and secrets** -- weak hashes and ciphers, ECB, constant keys and
+  IVs, weak RNG, disabled certificate validation, old TLS flags, weak KDFs
+  (CRY-001..008); committed secrets in config and code (SEC-001..003).
+- **Deserialization and XXE** -- dangerous formatters, Json.NET
+  `TypeNameHandling`, `SimpleTypeResolver` (DESER-001..003); DTD / external
+  entity parsing (XXE-001..002).
+- **WCF** -- unsecured bindings, debug faults, exposed metadata, oversized
+  quotas and missing throttling (WCF-001..004), plus operation-level authz.
+- **Configuration** -- debug, custom errors, trace, ELMAH, version header,
+  security headers, CORS, request validation, ViewState MAC, machineKey
+  (CFG-001..007, INT-001..004), transform aware.
+- **Errors** -- fail-open catch around authorization, exception detail in
+  responses, swallowed exceptions (ERR-001..003).
+- **Logging** -- log injection, no logging framework, secrets in logs,
+  unlogged failed logins (LOG-001..004).
+- **Business flows** -- sensitive flows (login, reset, payment) without
+  throttling, lockout or CAPTCHA (DES-001).
+- **Resources** -- oversized request limits, unbounded list endpoints,
+  uploads saved without a size check (RES-001..003).
+- **Inventory** -- ELMAH / trace handlers, HelpPage, Swagger, test and debug
+  controllers (INV-001..002).
+- **API consumption** -- outbound `http://` URLs, outbound response bodies
+  reaching sinks (CONSUME-001..002).
+- **Components / SCA** -- vulnerable NuGet packages and bundled JavaScript
+  from the offline advisory set, end-of-support framework, unmanaged
+  binaries, `http://` NuGet sources (SCA-001..005).
+
+### Proven vs REVIEW
+
+A **proven** finding has evidence in the code (for taint rules, a request
+source reaches the sink) and takes the rule's severity. A **REVIEW** finding
+(`confidence: REVIEW`) is a heuristic or an inferred check: it is usually one
+severity level lower or `low`, and needs a human to confirm. Every finding
+from the VB pattern scan in degraded mode, and every inferred auth check, is
+REVIEW. See "Taint analysis" for the exact taint definition.
+
+### Degraded mode
+
+Without the Roslyn helper and with `--allow-degraded`, C# is parsed with
+tree-sitter and VB is pattern-scanned; every result is bannered `DEGRADED`.
+Details and gaps under "Preflight and `--allow-degraded`".
 
 ## How it works
 
@@ -29,7 +107,7 @@ C# and VB are parsed by a small .NET 8 console tool, `tools/roslyn-ir`
 legacy `.csproj` / `.vbproj` (references, `Compile` / `Content` items,
 `RootNamespace`), source files nobody claims as a `(loose)` project, and
 cross-file / cross-project type lookup by simple name. The helper runs
-**once per scan**: the enumerator prepares the model before the five
+**once per scan**: the enumerator prepares the model before the six
 analyzers run, and they share it (routes and auth are computed once and
 cached on `model.cache`). Model notes (unparsable project files, missing
 includes) appear once, on the first result that reports. A route-less
@@ -148,33 +226,6 @@ repository is followed across files, through interface / abstract dispatch
   Exclude-only `[Bind(Exclude=...)]` leaves every other field bindable, so
   that case is marked REVIEW.
 
-Known limits, not modelled:
-
-- Reflection and `dynamic` calls are not followed.
-- DI container wiring beyond interface -> implementations (named
-  registrations, factories, decorators) is not resolved.
-- Stored-then-read data (a value written to a database or file in one request
-  and used in another) is not tracked.
-- Calls across solutions (an assembly referenced only as a binary) are not
-  followed.
-- Lambda bodies are evaluated on a copy of the environment: sinks inside are
-  reported, assignments inside are discarded, and the first parameter takes
-  the receiver's taint only for LINQ-style calls (`Select`, `Where`,
-  `ForEach`, `Any`, `First*`, ...). A delegate stored and invoked later is
-  not followed.
-- Syntax the IR could not lower (`unknown` / `other` nodes, e.g. a switch
-  expression or VB `Request.QueryString!q`) is scanned conservatively: a
-  request access in its text is a source, otherwise it carries the taint of
-  the variables it mentions. It is never a sink.
-- An external call that no helper table covers propagates only the
-  receiver's taint, not its arguments.
-- Fluent receivers (`GetSvc().Find(x)`) are not resolved to a project
-  method.
-- `ViewData` / `ViewBag` taint is tracked per dictionary, not per key.
-- The AUTHZ-005/006/007 heuristics work from names written in source:
-  AUTHZ-005 is always REVIEW (and `low`, since a name heuristic is weak evidence), AUTHZ-006 is REVIEW only when the `[Bind]` is
-  Exclude-only, and AUTHZ-007 is a plain `low` finding with no REVIEW mark.
-
 ## Detection
 
 `detector.py` walks the target once (skipping `bin`, `obj`, `packages`,
@@ -190,6 +241,9 @@ are ordinary .NET folder names and are scanned):
 - a `.svc` file, or any `.config` whose `<system.serviceModel>` holds `<services>` or
   `<serviceActivations>` -> wcf
 - a non-Views `Web.config` with `<system.web>` / `<system.webServer>` -> config
+- `packages.config`, a legacy project with a `<HintPath>`, a `nuget.config`,
+  or a `.js` file under a `Scripts` / `Content` / `lib` / `libs` dir (on a
+  target already detected as legacy .NET) -> deps
 
 SDK-style projects are claimed whole (every source under their dir, even
 when they list some `Compile` items, so nothing is "loose") but never parsed
@@ -237,15 +291,6 @@ mex. Local endpoints (`net.pipe`, absolute `localhost` addresses) are exempt
 from WCF-001. A WCF-001 finding on a default endpoint (no `<endpoint>`, or no
 config at all) is REVIEW: it assumes the site is served over plain http, and an
 https-only site binds `basicHttpsBinding` with Transport security.
-
-Known limits:
-
-- Client `<endpoint>`s (under `<system.serviceModel><client>`) are not
-  evaluated.
-- Services hosted from a non-web `.config` (an `App.config` self-host) are
-  detected but not discovered as routes; a scan note names each such file.
-- An owning `web.config` that cannot be parsed yields a note only; the
-  service gets no WCF config findings.
 
 ## Crypto and secrets in code
 
@@ -310,6 +355,45 @@ finding with its route; otherwise the finding is medium REVIEW.
   type's same-named method does not suppress a finding. Password-named values that
   are policy settings (`format`, `length`, `policy`, `regex`, `expir`, `required`,
   `minimum`) are not compared as secrets.
+
+## OWASP coverage
+
+Every category of the three lists has at least one DNL rule (enforced by
+`tests/test_owasp_coverage.py`). API rows count rules tagged with that code in
+either mode.
+
+| List | Code | Category | Rules |
+|---|---|---|---|
+| 2025 | A01 | Broken Access Control | DNL-AUTHZ-001, DNL-AUTHZ-002, DNL-AUTHZ-003, DNL-AUTHZ-004, DNL-AUTHZ-005, DNL-CSRF-001, DNL-PATH-001, DNL-REDIR-001, DNL-SSRF-001 |
+| 2025 | A02 | Security Misconfiguration | DNL-CFG-001, DNL-CFG-002, DNL-CFG-003, DNL-CFG-004, DNL-CFG-005, DNL-CFG-006, DNL-CFG-007, DNL-INV-001, DNL-INV-002, DNL-WCF-001, DNL-WCF-002, DNL-WCF-003, DNL-XXE-001, DNL-XXE-002 |
+| 2025 | A03 | Software Supply Chain Failures | DNL-SCA-001, DNL-SCA-002, DNL-SCA-003, DNL-SCA-004, DNL-SCA-005 |
+| 2025 | A04 | Cryptographic Failures | DNL-CRY-001, DNL-CRY-002, DNL-CRY-003, DNL-CRY-004, DNL-CRY-005, DNL-CRY-007, DNL-CRY-008, DNL-SESS-005 |
+| 2025 | A05 | Injection | DNL-INJ-001, DNL-INJ-002, DNL-INJ-003, DNL-INJ-004, DNL-INJ-005, DNL-INJ-006, DNL-XSS-001, DNL-XSS-002, DNL-XSS-003, DNL-XSS-004 |
+| 2025 | A06 | Insecure Design | DNL-AUTHZ-006, DNL-AUTHZ-007, DNL-DES-001, DNL-RES-001, DNL-RES-002, DNL-RES-003, DNL-WCF-004 |
+| 2025 | A07 | Authentication Failures | DNL-SEC-001, DNL-SEC-002, DNL-SEC-003, DNL-SESS-001, DNL-SESS-002, DNL-SESS-003, DNL-SESS-004, DNL-SESS-006, DNL-SESS-007, DNL-SESS-008 |
+| 2025 | A08 | Software or Data Integrity Failures | DNL-CONSUME-001, DNL-CONSUME-002, DNL-CRY-006, DNL-DESER-001, DNL-DESER-002, DNL-DESER-003, DNL-INT-001, DNL-INT-002, DNL-INT-003, DNL-INT-004 |
+| 2025 | A09 | Security Logging and Alerting Failures | DNL-LOG-001, DNL-LOG-002, DNL-LOG-003, DNL-LOG-004 |
+| 2025 | A10 | Mishandling of Exceptional Conditions | DNL-ERR-001, DNL-ERR-002, DNL-ERR-003 |
+| 2021 | A01 | Broken Access Control | DNL-AUTHZ-001, DNL-AUTHZ-002, DNL-AUTHZ-003, DNL-AUTHZ-004, DNL-AUTHZ-005, DNL-CSRF-001, DNL-PATH-001, DNL-REDIR-001 |
+| 2021 | A02 | Cryptographic Failures | DNL-CRY-001, DNL-CRY-002, DNL-CRY-003, DNL-CRY-004, DNL-CRY-005, DNL-CRY-007, DNL-CRY-008, DNL-SESS-005 |
+| 2021 | A03 | Injection | DNL-INJ-001, DNL-INJ-002, DNL-INJ-003, DNL-INJ-004, DNL-INJ-005, DNL-INJ-006, DNL-XSS-001, DNL-XSS-002, DNL-XSS-003, DNL-XSS-004 |
+| 2021 | A04 | Insecure Design | DNL-AUTHZ-006, DNL-AUTHZ-007, DNL-DES-001, DNL-ERR-001, DNL-ERR-003, DNL-RES-001, DNL-RES-002, DNL-RES-003, DNL-WCF-004 |
+| 2021 | A05 | Security Misconfiguration | DNL-CFG-001, DNL-CFG-002, DNL-CFG-003, DNL-CFG-004, DNL-CFG-005, DNL-CFG-006, DNL-CFG-007, DNL-ERR-002, DNL-INV-001, DNL-INV-002, DNL-WCF-001, DNL-WCF-002, DNL-WCF-003, DNL-XXE-001, DNL-XXE-002 |
+| 2021 | A06 | Vulnerable and Outdated Components | DNL-SCA-001, DNL-SCA-002, DNL-SCA-003, DNL-SCA-004 |
+| 2021 | A07 | Identification and Authentication Failures | DNL-SEC-001, DNL-SEC-002, DNL-SEC-003, DNL-SESS-001, DNL-SESS-002, DNL-SESS-003, DNL-SESS-004, DNL-SESS-006, DNL-SESS-007, DNL-SESS-008 |
+| 2021 | A08 | Software and Data Integrity Failures | DNL-CONSUME-001, DNL-CONSUME-002, DNL-CRY-006, DNL-DESER-001, DNL-DESER-002, DNL-DESER-003, DNL-INT-001, DNL-INT-002, DNL-INT-003, DNL-INT-004, DNL-SCA-005 |
+| 2021 | A09 | Security Logging and Monitoring Failures | DNL-LOG-001, DNL-LOG-002, DNL-LOG-003, DNL-LOG-004 |
+| 2021 | A10 | Server-Side Request Forgery | DNL-SSRF-001 |
+| api2023 | API1 | Broken Object Level Authorization | DNL-AUTHZ-005 |
+| api2023 | API2 | Broken Authentication | DNL-SEC-001, DNL-SEC-002, DNL-SEC-003, DNL-SESS-001, DNL-SESS-002, DNL-SESS-003, DNL-SESS-004, DNL-SESS-005, DNL-SESS-006, DNL-SESS-007, DNL-SESS-008 |
+| api2023 | API3 | Broken Object Property Level Authorization | DNL-AUTHZ-006, DNL-AUTHZ-007 |
+| api2023 | API4 | Unrestricted Resource Consumption | DNL-RES-001, DNL-RES-002, DNL-RES-003, DNL-WCF-004 |
+| api2023 | API5 | Broken Function Level Authorization | DNL-AUTHZ-001, DNL-AUTHZ-002, DNL-AUTHZ-003, DNL-AUTHZ-004 |
+| api2023 | API6 | Unrestricted Access to Sensitive Business Flows | DNL-DES-001 |
+| api2023 | API7 | Server Side Request Forgery | DNL-SSRF-001 |
+| api2023 | API8 | Security Misconfiguration | DNL-CFG-001, DNL-CFG-002, DNL-CFG-003, DNL-CFG-004, DNL-CFG-005, DNL-CFG-006, DNL-CFG-007, DNL-ERR-002, DNL-INJ-001, DNL-INJ-002, DNL-INJ-003, DNL-INJ-004, DNL-INJ-005, DNL-INJ-006, DNL-WCF-001, DNL-WCF-002, DNL-XXE-001, DNL-XXE-002 |
+| api2023 | API9 | Improper Inventory Management | DNL-INV-001, DNL-INV-002, DNL-SCA-003, DNL-WCF-003 |
+| api2023 | API10 | Unsafe Consumption of APIs | DNL-CONSUME-001, DNL-CONSUME-002, DNL-CRY-006 |
 
 ## Rules
 
@@ -383,9 +467,55 @@ DNL-INV-001, which always carries it.
 | DNL-SESS-006 | low | (REVIEW) Logout action/handler (name matches logout, logoff, signout) that calls `FormsAuthentication.SignOut` / `AuthenticationManager.SignOut` but never `Session.Abandon` / `Session.Clear` (project callees up to 3 levels and direct callers count, followed only when the call resolves to a project method; see below) | A07:2025 | A07:2021 | API2:2023 |
 | DNL-SESS-007 | low | (REVIEW) Login flow (`FormsAuthentication.SetAuthCookie` / `RedirectFromLoginPage`, `AuthenticationManager.SignIn`) that never abandons the session or regenerates its id (`Session.Abandon`, `SessionIDManager.CreateSessionID` / `SaveSessionID`, clearing `ASP.NET_SessionId`) | A07:2025 | A07:2021 | API2:2023 |
 | DNL-SESS-008 | medium | (REVIEW) Plaintext password comparison (`==`, `!=`, `Equals`, `String.Compare`) where an operand is named like `password` / `pwd` and neither side goes through a hash or verify call (names with hash, salt, confirm, bypass and similar are skipped; comparisons to null or an empty string are ignored) | A07:2025 | A07:2021 | API2:2023 |
+| DNL-ERR-001 | medium | (REVIEW when the catch only falls through) Fail-open catch around an authorization decision: a `catch` inside a method named like one (`AuthorizeCore`, `OnAuthorization`, `IsAuthorized` ...), or around a body that checks `IsInRole` / `IsAuthenticated` / calls a project method that does, which returns literal `true`, or neither denies (throw, return of anything but true, `.Result =`, `HandleUnauthorizedRequest`) nor is followed by a deny-by-default tail. An empty catch there is ERR-001, never also ERR-003 | A10:2025 | A04:2021 | -- |
+| DNL-ERR-002 | medium | Exception detail returned to the client: the catch variable (`ex.Message`, `ex.ToString()`, `ex.StackTrace`, `ex.InnerException.Message`, or `ex` itself) followed through locals, string building (`+`, `&`, interpolation, `String.Format`, `StringBuilder`), object initializers and member assignments into `Content` / `Json` / `View` / `Ok` / `BadRequest` / `InternalServerError` / `CreateErrorResponse`, `Response.Write`, `ViewBag` / `ViewData` / `TempData`, a control `.Text`, `FaultException`, `HttpResponseException`, or a returned value of a routed method. `ex.GetType()` and plain logging are not reported; detail passed to a project helper that writes it later is not followed | A10:2025 | A05:2021 | API8:2023 (API surface) |
+| DNL-ERR-003 | low | Swallowed exception: an empty catch-all (`catch { }`, `catch (Exception) { }`, VB `Catch` / `Catch ex As Exception` with no statements) outside the ERR-001 authorization case. An empty catch on a narrow exception type is not reported | A10:2025 | A04:2021 | -- |
+| DNL-LOG-002 | low | (REVIEW) No logging framework anywhere in the scan: no log4net / NLog / Serilog / Enterprise Library / ELMAH / Common.Logging / TraceSource configuration, package, project reference or `using`. One finding per scan, anchored at the first legacy project file; also runs without the Roslyn helper | A09:2025 | A09:2021 | -- |
+| DNL-LOG-003 | medium | A value whose name matches the SEC key pattern (password, pwd, secret, apikey, token ..., minus setting names such as `PasswordMinLength`) passed to a log call (log4net / NLog / Serilog / `Trace` / `Debug` / EntLib, a field typed as a logger, or a `LogError(..)` helper), also through a local, string concatenation, interpolation or `String.Format`; reading only `.Length` / `.Count` is not logging the secret | A09:2025 | A09:2021 | -- |
+| DNL-LOG-004 | low | (REVIEW) A login action or handler (name says login / logon / sign in / authenticate, or a `*_LoginError` / `*_LoginFailed` handler) with a branch that rejects the credentials (`AddModelError`, `Unauthorized`, a failure message, `Authenticated = false`) and no log call on that branch itself; a log call before the check, under a nested condition, or in an unrelated method does not count, a project method that logs does | A09:2025 | A09:2021 | -- |
+| DNL-DES-001 | low | (REVIEW) Sensitive flow (login, password reset / change, register, payment / checkout / transfer by action name, POST-like verbs, one finding per action) with no protection that is certain to apply. Counted: a throttle / rate-limit / CAPTCHA / lockout attribute on the action, its controller or a base controller (a project attribute must be a filter with a real body and not `Enabled = false`); a call run on every request to `Membership.ValidateUser`, `PasswordSignIn(Async)` with a literal `shouldLockout: true`, `CheckPasswordSignInAsync(.., lockoutOnFailure: true)`, `AccessFailed(Async)`, a CAPTCHA or rate-limit call, directly or in project methods it calls (two levels); a throttle filter / message handler registered by startup (`Application_Start`, OWIN `Configuration`). Not counted: another action's attribute, a call under `if (debug)` / `if (false)` or any non-guard condition, `shouldLockout: false`, hand-rolled counters, IIS dynamic IP restrictions | A06:2025 | A04:2021 | API6:2023 |
+| DNL-RES-002 | low | Unbounded list endpoint: a Web API / MVC action returning a collection from a `DbSet` query (also through locals, `Ok` / `Json` / `View`, a repository method) with no `Take` / `ToPagedList` / `Paginate` applied to that query and no `[EnableQuery(PageSize = N)]` (action, controller, base controller or startup). `Skip` alone and an unused page-size parameter do not bound it | A06:2025 | A04:2021 | API4:2023 |
+| DNL-RES-003 | medium | File upload saved (`SaveAs`, `InputStream.CopyTo`, `File.WriteAllBytes` of the posted stream, `ReadAsMultipartAsync`, or a project method that does) without a `ContentLength` / `InputStream.Length` comparison against a limit that guards the save (the save is in the passing branch, or after an `if` whose failing branch returns, throws or continues). `ContentLength > 0` is not a limit; `maxRequestLength` in web.config is not counted; a validation helper method is not followed | A06:2025 | A04:2021 | API4:2023 |
+| DNL-INV-002 | low | Web API HelpPage area (its `HelpController`, or `HelpPageAreaRegistration`) reachable without auth (an authorize attribute, global authorize filter or web.config rule covers it otherwise); Swagger UI / document endpoints (`EnableSwagger`, `EnableSwaggerUi`, `UseSwagger*`) unless web.config denies anonymous users for `swagger` (a global authorize filter does not cover the Swagger handler); controllers named `*Test*Controller`, `Debug*Controller` or `Diagnostics*Controller` in non-test projects (project name not ending in test / tests, no test framework reference) | A02:2025 | A05:2021 | API9:2023 |
+| DNL-CONSUME-001 | low | (REVIEW) Outbound call to a hard-coded `http://` URL: `HttpClient` / `WebClient` / `RestClient` / `WebRequest.Create` URL or base address, `new Uri(..)`, resolved through locals, const / static readonly fields and properties, concatenation, interpolation and `String.Format`; plus `<system.serviceModel><client><endpoint address="http://...">` in web.config. `localhost`, `127.0.0.1` and `[::1]` are skipped as development endpoints | A08:2025 | A08:2021 | API10:2023 |
+| DNL-CONSUME-002 | low | (REVIEW) An outbound response body (`ReadAsAsync<T>`, `ReadAsStringAsync`, `WebClient.DownloadString`, `GetStringAsync`, RestSharp `Execute`), deserialized (`JsonConvert.DeserializeObject`, `JObject.Parse`) or used raw, reaching a SQL / dynamic LINQ / command / LDAP / XPath / path / redirect sink. Uses the taint source kind `external`, which the request-source rules (INJ, XSS, PATH, REDIR ...) never see | A08:2025 | A08:2021 | API10:2023 |
+| DNL-SCA-001 | high/medium/low | (Severity from the advisory.) NuGet package (`packages.config`, or a `packages\<Id>.<Version>\` HintPath with no `packages.config` entry) inside a known-vulnerable range from the offline advisory data | A03:2025 | A06:2021 | -- |
+| DNL-SCA-002 | high/medium/low | (Severity from the advisory.) Bundled JS library (`Scripts` / `Content` / `lib` banners: jQuery, jQuery UI, jQuery Validation, Bootstrap, Moment, Knockout, AngularJS, Handlebars, Lodash) inside a known-vulnerable range | A03:2025 | A06:2021 | -- |
+| DNL-SCA-003 | medium | Target framework before v4.6.2 (end of support) | A03:2025 | A06:2021 | API9:2023 |
+| DNL-SCA-004 | low | (REVIEW) DLL referenced from a `packages` or library folder with no matching `packages.config` entry and no version in the path (unmanaged binary dependency) | A03:2025 | A06:2021 | -- |
+| DNL-SCA-005 | medium | `nuget.config` package source over `http://` (loopback hosts exempt) | A03:2025 | A08:2021 | -- |
 
 `tests/test_dnl_end_to_end.py` fails if a rule in `core/owasp_web.RULES` is
 missing here or its tags drift.
+
+## Advisory data
+
+The DNL-SCA-001 / 002 rules read `checks/dnl/data/dnl_advisories.json` (shipped as package data), a small curated
+set (`nuget`: by package id, case-insensitive; `js`: by library name matched
+from the banner comment in the first 4 KB of the file). Every entry carries a
+GHSA / CVE id, the advisory URL, the affected range copied from the advisory,
+a severity (GitHub's rating; "critical" is recorded as `high`) and the
+advisory title. Ranges use space separated comparators (`>=5.0 <5.5.12`,
+ANDed) and `||` for alternatives; NuGet / SemVer ordering applies, including
+prerelease versions and 4-part versions.
+
+The set is offline and deliberately short: it covers common legacy web
+dependencies (Newtonsoft.Json, jQuery, jQuery UI, jQuery Validation, Bootstrap,
+RestSharp, log4net, Moment, Knockout, AngularJS, Handlebars, Lodash) and misses
+anything not listed. A missing finding is not a clean bill; the authoritative,
+online path is `--sca` (osv-scanner, `checks/sca.py`), which stays as is.
+
+To refresh or extend it: look the advisory up on `https://osv.dev` or
+`https://github.com/advisories`, copy the id, URL, package name and the
+introduced / fixed versions for the matching NuGet (or npm, for JS) package,
+and add an entry. Do not add an entry that cannot be verified against the
+advisory page. `tests/test_dnl_sca.py` checks the schema. If the file is
+missing or corrupt the scan continues and a note says SCA-001 / 002 were skipped.
+A bundled library is read from a comment line in the first 4 KB that starts
+with the library statement (`jQuery v1.12.4`, `Bootstrap v3.3.7`, ...), or,
+when the file name names the library, from any comment line; lines saying
+requires / depends on / compatible with / tested with never count.
+`x.js` and `x.min.js` are separate files and are reported separately.
 
 ## Preflight and `--allow-degraded`
 
@@ -398,12 +528,54 @@ automatically (`dotnet publish`) when the .NET 8 SDK is on PATH. If no
 helper can be found, built or probed, the CLI prints install steps and
 **exits 2**.
 
-`--allow-degraded` continues without it: mvc / webapi / webforms report no
-routes or findings, config still runs, and every result carries a degraded
-banner in the HTML report (and `degraded` in JSON / SARIF). A degraded run
-cannot pass for a clean one on the console either: preflight prints
-`DEGRADED: <reason>` to stderr, the console report prints the same line under
-each affected result header, and `main` repeats it on stderr at the very end.
+`--allow-degraded` continues without it, in degraded mode:
+
+- **What runs.** C# is parsed with tree-sitter (`checks/dnl/frontend_ts.py`) into
+  the same IR the helper emits, minus the semantic keys (`sym`, `type_full`), so
+  routes, auth, taint, XSS, crypto, deserialization, session, error and logging
+  rules run unchanged and keep their normal confidence. Config, markup and SCA
+  analyzers run as always. A `using Alias = Full.Type;` is expanded in place
+  (nothing else resolves it); a multiplication the grammar reads as a pointer
+  declaration (`Skip(page * size)`) is restored to `*`; syntax it cannot map
+  becomes an `other` / `unknown` node holding the source text, which the rules
+  treat conservatively.
+- **What does not.** Anything that needs a resolved symbol falls back to name
+  matching or stays silent: a call whose receiver type is only known through
+  another method's return type (`var d = Make(); d.LoadXml(..)`), overloads told
+  apart by argument type, extension methods on external types. The documented
+  gaps against the helper on the fixtures (kept exact in
+  `tests/test_dnl_degraded.py`): `DNL-XXE-001` behind a factory method's return
+  type (2 findings on the taint fixture). The other direction is noise, not a
+  miss: without `sym`, a static `Enumerable.Where(..)` reads as dynamic LINQ
+  (`DNL-INJ-006`). All routes and every `DNL-INJ-*` / `DNL-XSS-*` /
+  `DNL-AUTHZ-*` / `DNL-AUTH-*` finding on the C# fixtures match the helper run.
+- **Conditional compilation and syntax errors.** The helper compiles with the
+  project's defined symbols; tree-sitter does not know them, so every `#if` /
+  `#elif` / `#else` branch is lowered (over-lowering is the safe side). Code
+  compiled out of a project -- a `#if` for another build of a shared file --
+  therefore yields extra routes and findings that a helper run does not report.
+  A file with parse errors is re-parsed with the directives neutralised and the
+  variants merged; any remaining parse errors are reported as a note naming the
+  file ("code in the affected region may be missing").
+- **Forcing it.** Degraded mode runs only when no helper is found: a
+  `CODE_REVIEW_ROSLYN_IR` that points to a missing file is ignored with a
+  warning and the repo-local `tools/roslyn-ir/bin` build is still used.
+- **VB is pattern-scanned only** (`checks/dnl/vb_regex.py`), every finding
+  `confidence="REVIEW"` and titled `(VB pattern)`: SQL built by `&` / `+` /
+  `String.Format` or from a `Request` value reaching a command (`DNL-INJ-001`),
+  `Response.Write(Request(..))` without encoding (`DNL-XSS-001`), `BinaryFormatter`
+  / `LosFormatter` `.Deserialize` (`DNL-DESER-001`), MD5 / SHA1 (`DNL-CRY-001`) and
+  DES / 3DES / RC2 (`DNL-CRY-002`) creation, a `Password=` connection-string
+  literal (`DNL-SEC-003`), and `ServerCertificateValidationCallback` set to a
+  callback that returns `True` (`DNL-CRY-006`). Comment lines (`'`, `REM`) and
+  trailing comments never match; `_` continuations are joined; identifiers are
+  case-insensitive. There are no VB routes, no VB taint flow and no VB auth
+  findings in this mode, so a degraded report is a floor, not a clean bill.
+- **Banner.** Every result carries a degraded banner in the HTML report (and
+  `degraded` in JSON / SARIF). A degraded run cannot pass for a clean one on the
+  console either: preflight prints `DEGRADED: <reason>` to stderr, the console
+  report prints the same line under each affected result header, and `main`
+  repeats it on stderr at the very end.
 
 ## Linux install
 
@@ -423,6 +595,110 @@ elsewhere (`dotnet publish tools/roslyn-ir/src/RoslynIr.csproj -c Release
 its `refs/` folder) to `tools/roslyn-ir/bin/`, or point
 `CODE_REVIEW_ROSLYN_IR` at it.
 
+## Known limits
+
+Everything below is a deliberate limit. A report is a floor, not a clean bill.
+
+**General**
+
+- MVC auth only considers the app-root `web.config` (a physical
+  `Admin/Web.config` deny is ignored, which yields noise, never a false
+  "protected"); authorization comes from the base config, not the Release
+  transforms.
+- Auth decided outside what is modelled (see "What still needs a human") is
+  not seen.
+- Conventional routes are the first matching template; custom route handlers
+  and `MapPageRoute` URLs for WebForms are not expanded.
+- XDT verbs other than `Replace` / `Insert` / `InsertIfMissing` / `Remove` /
+  `RemoveAll` / `SetAttributes` / `RemoveAttributes` (e.g. `InsertBefore`,
+  `Merge`) are not applied; the scan notes each one.
+- `--allow-path` globs match DNL routes case-insensitively (ASP.NET URLs are);
+  other analyzers keep the platform's `fnmatch` behavior.
+
+**Taint**
+
+- Reflection and `dynamic` calls are not followed.
+- DI container wiring beyond interface -> implementations (named
+  registrations, factories, decorators) is not resolved.
+- Stored-then-read data (a value written to a database or file in one request
+  and used in another) is not tracked.
+- Calls across solutions (an assembly referenced only as a binary) are not
+  followed.
+- Lambda bodies are evaluated on a copy of the environment: sinks inside are
+  reported, assignments inside are discarded, and the first parameter takes
+  the receiver's taint only for LINQ-style calls (`Select`, `Where`,
+  `ForEach`, `Any`, `First*`, ...). A delegate stored and invoked later is
+  not followed.
+- Syntax the IR could not lower (`unknown` / `other` nodes, e.g. a switch
+  expression or VB `Request.QueryString!q`) is scanned conservatively: a
+  request access in its text is a source, otherwise it carries the taint of
+  the variables it mentions. It is never a sink.
+- An external call that no helper table covers propagates only the
+  receiver's taint, not its arguments.
+- Fluent receivers (`GetSvc().Find(x)`) are not resolved to a project
+  method.
+- `ViewData` / `ViewBag` taint is tracked per dictionary, not per key.
+- The AUTHZ-005/006/007 heuristics work from names written in source:
+  AUTHZ-005 is always REVIEW (and `low`, since a name heuristic is weak
+  evidence), AUTHZ-006 is REVIEW only when the `[Bind]` is Exclude-only, and
+  AUTHZ-007 is a plain `low` finding with no REVIEW mark.
+- The solver stops after 24 rounds; when it does not converge the scan carries
+  a note that some deep flows may be missing.
+
+**WCF**
+
+- Client `<endpoint>`s (under `<system.serviceModel><client>`) are not
+  evaluated.
+- Services hosted from a non-web `.config` (an `App.config` self-host) are
+  detected but not discovered as routes; a scan note names each such file.
+- An owning `web.config` that cannot be parsed yields a note only; the
+  service gets no WCF config findings.
+- Behavior-based protection is authentication, not authorization, hence
+  REVIEW.
+
+**Logging, flow, resource and consumption rules** (LOG-002..004, DES-001,
+RES-002/003, INV-002, CONSUME-001/002)
+
+LOG-002 counts the mere presence of a logging package, reference or config as
+"configured"; LOG-003 does not see a whole model serialized into a log call, and `Hash(password)` still counts
+as the secret (noise); a login handler is recognised by name or controller context (`Post` / `Index` /
+`Create` / `Token` on Login* / Auth* / Token* controllers, `Post` with credential parameters on Account*, OWIN
+`GrantResourceOwnerCredentials`), not by behaviour; DES-001 counts a CAPTCHA-named call only where it runs on
+every request, and a global filter only when startup reaches its registration unconditionally; the HelpPage
+check reuses that startup-reachable list, but AUTHZ rules still use `auth.global_filters` (any `Filters.Add`
+in the solution); RES-002 treats `Take(int.MaxValue)` as no bound and `Take(n)` with an unclamped parameter
+as REVIEW (use `Math.Min`); RES-003 ties the size check to the saved file (`Request.ContentLength` counts for
+any), follows bytes read from the upload (`ReadBytes`, `InputStream.Read`, `FileBytes`) and WebForms
+`FileUpload`, but not Azure `UploadFromStream` or validation helpers; the incoming Web API body
+(`Request.Content.ReadAs...`) is a request source (INJ / XSS / PATH / REDIR fire on it), never `external`;
+statements after an `if` whose branch ends the flow (return, throw, `Response.End`) are conditional, except
+after a plain validity guard (`ModelState.IsValid`, a null check); a CAPTCHA- or throttle-named call counts
+only when its result gates a rejection (a recording call does not): the check must sit in an `if` whose
+failing branch ends the flow (or adds a model error that a later `ModelState.IsValid` gate acts on) and
+that comes before the credential attempt; `Membership.ValidateUser` counts as lockout (the SQL provider
+locks out by default), so a provider configured with a very high `maxInvalidPasswordAttempts` is not
+detected; a size check covers only the file it reads (a write whose source file cannot be determined is
+guarded by a request-level length only) and stops covering `Files[i]` once `i` is reassigned; raw-body uploads
+(`Request.InputStream`, `Request.Content.ReadAsStreamAsync`) are RES-003 uploads guarded by a
+`Request.ContentLength` / `Content.Headers.ContentLength` check, and `Files["a"]` / `Files[0]` checks cover
+only that same index; `FileBytes.Length` checks, validation helpers and `new FilterConfig2().Reg(..)`
+registrations are not followed (noise only); CONSUME-001 does not follow URLs built with `StringBuilder` / `UriBuilder`.
+
+**Dependencies (SCA)**
+
+- The advisory set is offline and deliberately short; a missing finding is not
+  a clean bill (see "Advisory data"). `--sca` (osv-scanner) is the
+  authoritative online path.
+- Advisory ranges are copied exactly from the GHSA pages (for example the
+  jQuery CVE-2020-11022 entry is `>=1.12.0 <3.5.0`, as GHSA-gxr4-xjj5-5px2
+  states). A version outside the recorded range is not reported even if another
+  source lists it as affected; `--sca` (osv-scanner) remains authoritative.
+
+**Degraded mode**
+
+- No VB routes, taint flow or auth findings, a short VB pattern set, and no
+  symbol resolution for C# (see "Preflight and `--allow-degraded`").
+
 ## What still needs a human
 
 - `REVIEW` findings: hand-rolled auth checks (inferred from code),
@@ -432,24 +708,4 @@ its `refs/` folder) to `tools/roslyn-ir/bin/`, or point
 - Auth decided outside what is modelled: OWIN middleware, `Global.asax`
   `Application_AuthenticateRequest`, IIS / reverse-proxy rules, custom
   `HttpModule`s, `RouteTable` constraints.
-- Conventional routes are the first matching template; custom route
-  handlers and `MapPageRoute` URLs for WebForms are not expanded.
-- XDT verbs other than `Replace` / `Insert` / `InsertIfMissing` / `Remove`
-  / `RemoveAll` / `SetAttributes` / `RemoveAttributes` (e.g. `InsertBefore`,
-  `Merge`) are not applied; the scan notes each one.
 - Whether a flagged secret is real and still valid.
-- `--allow-path` globs match DNL routes case-insensitively (ASP.NET URLs
-  are); other analyzers keep the platform's `fnmatch` behavior.
-- Known limits, not modelled: MVC auth only considers the app-root
-  `web.config` (a physical `Admin/Web.config` deny is ignored, which yields
-  noise, never a false "protected"); authorization comes from the base
-  config, not the Release transforms.
-
-## Coverage gaps (later plans)
-
-Plans 1-3 are done (routes / config, taint and template rules, WCF / crypto /
-secrets / deserialization / XXE / integrity / session). Not covered yet:
-
-- Plan 4: NuGet and bundled-JS SCA, ERR / LOG / DES / RES / INV / CONSUME
-  code rules, a tree-sitter C# + regex VB degraded mode, and the "every
-  OWASP category has a rule" coverage test.

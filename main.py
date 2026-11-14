@@ -60,7 +60,8 @@ def main() -> int:
                         help="With --sca: download the OSV databases and match locally")
     parser.add_argument(
         "--allow-degraded", action="store_true",
-        help="Proceed without the Roslyn helper for .NET Framework targets (C#/VB code analysis is skipped); "
+        help="Proceed without the Roslyn helper for .NET Framework targets: C# is parsed with tree-sitter "
+        "(no semantic symbols) and VB is scanned with patterns (REVIEW), so findings may be incomplete; "
         "without this flag a missing helper exits 2 with install steps",
     )
     args = parser.parse_args()

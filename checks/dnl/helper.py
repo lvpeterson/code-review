@@ -23,8 +23,8 @@ SCHEMA_VERSION = 1
 HELPER_ENV = "CODE_REVIEW_ROSLYN_IR"
 
 DEGRADED_REASON = (
-    "Roslyn helper not available (--allow-degraded): C#/VB code analysis was "
-    "skipped; only project and web.config checks ran."
+    "Roslyn helper not available (--allow-degraded): C# parsed with tree-sitter "
+    "(no semantic symbols), VB scanned with patterns (REVIEW); findings may be incomplete."
 )
 
 

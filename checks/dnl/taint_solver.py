@@ -529,6 +529,20 @@ def _components(edges: dict, nodes: list) -> dict:
     return comp
 
 
+def external_hits(model) -> list[SinkHit]:
+    """Sink hits (one per kind / file / line) whose taint carries an outbound-response origin and no request-source origin, over
+    every project method. Only DNL-CONSUME-002 reads these; `entry_hits` never returns them."""
+    solve(model)
+    out: dict[tuple, SinkHit] = {}
+    for _key_, (_t, _m, _acc, r) in sorted(model.cache["taint"]["results"].items(), key=lambda kv: str(kv[0])):
+        for h in r.hits:
+            kinds = {o.kind for o in h.taint.origins}
+            # Flows that also carry request input are already INJ / PATH / REDIR findings.
+            if "external" in kinds and "source" not in kinds:
+                out.setdefault((h.kind, h.file, h.line), h)
+    return [out[k] for k in sorted(out, key=lambda k: (k[1], k[2], k[0]))]
+
+
 def entry_hits(model, refs: list) -> list[EntryHit]:
     """Sink hits mapped to the entry point that reaches them (see module docstring)."""
     solve(model)
@@ -614,9 +628,10 @@ def entry_hits(model, refs: list) -> list[EntryHit]:
             if any(o.kind == "source" for o in h.taint.origins):
                 for ref in reach.get(key) or [None]:
                     cands.append((ref, h))
-            elif scc[key] not in called:
+            elif scc[key] not in called and not (h.taint.origins and all(o.kind == "external" for o in h.taint.origins)):
                 # only the method's own parameters are tainted and nothing outside its
-                # call cycle calls it
+                # call cycle calls it. A flow that starts at an outbound response alone (origin
+                # kind "external") is DNL-CONSUME-002's, never a request-source row.
                 cands.append((None, h))
 
     def loc(h: SinkHit) -> tuple:

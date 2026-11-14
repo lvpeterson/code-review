@@ -96,6 +96,19 @@ _add(["DNL-XXE-001", "DNL-XXE-002"], "A02", "A05", "API8")
 # Integrity markup and session/auth code rules (Plan 3).
 _add(["DNL-INT-003", "DNL-INT-004"], "A08", "A08", None)
 _add(["DNL-SESS-006", "DNL-SESS-007", "DNL-SESS-008"], "A07", "A07", "API2")
+# Exception handling.
+_add(["DNL-ERR-001", "DNL-ERR-003"], "A10", "A04", None)
+_add(["DNL-ERR-002"], "A10", "A05", "API8")
+# Logging, business-flow, resource, inventory and API-consumption rules.
+_add(["DNL-LOG-002", "DNL-LOG-003", "DNL-LOG-004"], "A09", "A09", None)
+_add(["DNL-DES-001"], "A06", "A04", "API6", "always")
+_add(["DNL-RES-002", "DNL-RES-003"], "A06", "A04", "API4")
+_add(["DNL-INV-002"], "A02", "A05", "API9", "always")
+_add(["DNL-CONSUME-001", "DNL-CONSUME-002"], "A08", "A08", "API10", "always")
+# Offline SCA rules (Plan 4).
+_add(["DNL-SCA-001", "DNL-SCA-002", "DNL-SCA-004"], "A03", "A06", None)
+_add(["DNL-SCA-003"], "A03", "A06", "API9", "always")
+_add(["DNL-SCA-005"], "A03", "A08", None)
 
 _PREFIX: list[tuple[str, tuple[str, str, Optional[str], str]]] = []
 

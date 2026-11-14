@@ -14,6 +14,13 @@
     <Compile Include="Search.vb" />
     <Compile Include="Gaps.vb" />
     <Compile Include="Crypto.vb" />
+    <Compile Include="Errors\ErrVb.vb" />
+    <Compile Include="Errors\ErrRound1.vb" />
+    <Compile Include="Errors\ErrRound2.vb" />
+    <Compile Include="Errors\ErrTailFlow.vb" />
+    <Compile Include="Errors\ErrRefusals.vb" />
+    <Compile Include="Errors\ErrCatchPaths.vb" />
+    <Compile Include="Misc\MiscVb.vb" />
     <Compile Include="Search.designer.vb" />
     <Compile Include="Pages\Search.aspx.vb" />
     <Compile Include="Pages\Search.aspx.designer.vb" />

@@ -29,6 +29,7 @@ py-modules = ["main", "enumerator"]
 packages = [
     "core",
     "checks",
+    "checks.dnl",
     "languages",
     "languages.python",
     "languages.java",
@@ -41,6 +42,9 @@ packages = [
     "languages.infra",
     "languages.crypto",
 ]
+
+[tool.setuptools.package-data]
+"checks.dnl" = ["data/*.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

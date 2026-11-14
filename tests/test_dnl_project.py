@@ -53,7 +53,9 @@ def test_degraded_model(monkeypatch, mvc_fixture):
     monkeypatch.setattr(helper, "preflight", lambda *a, **k: None)
     project._CACHE.clear()
     m = project.prepare(mvc_fixture, allow_degraded=True)
-    assert m.files == {} and m.degraded == helper.DEGRADED_REASON
+    # No helper: C# comes from tree-sitter (no semantic keys), VB is only listed for the pattern scan.
+    assert m.degraded == helper.DEGRADED_REASON and "MvcApp/Controllers/HomeController.cs" in m.files
+    assert not any(f.endswith(".vb") for f in m.files) and any(f.endswith(".vb") for f in m.vb_files)
 
 
 def test_base_chain_cycle_safe(tmp_path):

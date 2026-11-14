@@ -51,7 +51,8 @@ is built automatically on first use if the .NET 8 SDK is installed (Windows:
 `dnf install dotnet-sdk-8.0` or `./dotnet-install.sh --channel 8.0`). Without
 the SDK, copy a prebuilt binary to `tools/roslyn-ir/bin/` or set
 `CODE_REVIEW_ROSLYN_IR`. If the helper is unavailable the scan exits 2 with
-install steps; `--allow-degraded` skips C#/VB code analysis instead.
+install steps; `--allow-degraded` parses C# with tree-sitter (no semantic symbols) and scans VB with
+patterns (REVIEW only) instead.
 
 `--sca` runs osv-scanner over the target's lockfiles/manifests and adds an
 SCA-001 finding per vulnerable package. It queries api.osv.dev with package
@@ -204,12 +205,15 @@ Currently implemented (route extraction + baseline checks):
 - **javascript**: express, nextjs, hono
 - **go**: gin, net_http
 - **dotnet**: aspnet
-- **dotnet_legacy**: mvc, webapi, webforms, wcf, config (.NET Framework MVC 5,
+- **dotnet_legacy**: mvc, webapi, webforms, wcf, config, deps (.NET Framework MVC 5,
   Web API 2, WebForms, WCF services and Web.config, C# and VB, via the Roslyn
   helper in `tools/roslyn-ir`; cross-file taint analysis for injection / XSS /
   path / redirect / SSRF / deserialization / XXE, object-level authz, WCF
   binding and behavior rules, crypto and hardcoded-secret rules, SRI and
-  ViewState integrity, session heuristics; OWASP 2025/2021/API tags) -- see
+  ViewState integrity, session heuristics, error / logging / business-flow /
+  resource / inventory / API-consumption rules, offline NuGet and bundled-JS
+  composition analysis; `--allow-degraded` runs without the helper; OWASP
+  2025/2021/API tags) -- see
   `languages/dotnet_legacy/README.md`.
 - **ruby**: rails, sinatra
 - **sql**: plsql (Oracle). No routes: every finding is project-wide and

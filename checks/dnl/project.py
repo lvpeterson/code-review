@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
-from checks.dnl import helper
+from checks.dnl import frontend_ts, helper
 from checks.dnl.files import is_legacy_project, iter_dnl_files, read_source, resolve_ci
 from checks.dnl.ir import FileIR, TypeIR, load_file_ir
 
@@ -52,6 +52,8 @@ class ProjectModel:
     # Per-model results shared by the analyzers (routes, filters, auth findings),
     # so mvc / webapi / webforms / config do the work once per scan.
     cache: dict = field(default_factory=dict)
+    # Degraded mode only: VB sources (rel paths) for the vb_regex scan; the IR has none.
+    vb_files: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # Lazy indexes; built on first lookup.
@@ -202,15 +204,56 @@ def _request(projects: list[Project]) -> list[dict]:
     return out
 
 
+_TYPE_WORD = re.compile(r"\b(?:class|struct|interface|enum|record)\b")
+
+
+def _declares_types(path: Path) -> bool:
+    """True when the file text (comments dropped) mentions a type keyword."""
+    try:
+        text = read_source(path)
+    except OSError:
+        return False
+    text = re.sub(r"//[^\n]*|/\*.*?\*/", "", text, flags=re.S)
+    return bool(_TYPE_WORD.search(text))
+
+
+def _degraded_files(root: Path, projects: list[Project], notes: list[str]) -> tuple[dict[str, FileIR], list[str]]:
+    """No helper: lower every C# file of the legacy / loose projects with tree-sitter
+    (no `sym` / `type_full`); VB files are only listed, for the pattern scan."""
+    files: dict[str, FileIR] = {}
+    vb: list[str] = []
+    for req in _request(projects):
+        for f in req["files"]:
+            path = Path(f)
+            rel = path.resolve().relative_to(root).as_posix() if path.resolve().is_relative_to(root) else path.as_posix()
+            if req["language"] == "vb":
+                vb.append(rel)
+                continue
+            obj = frontend_ts.lower_file(path, rel, req["name"])
+            fir = load_file_ir(obj)
+            if fir is None:
+                notes.append(f"{rel}: {obj.get('error', 'no IR produced')}")
+            else:
+                files[fir.path] = fir
+                if fir.parse_errors:
+                    notes.append(f"{rel}: {fir.parse_errors} C# parse errors in degraded mode; "
+                                 "code in the affected region may be missing")
+                if not fir.types and _declares_types(path):
+                    notes.append(f"{rel}: C# file lowered to no types in degraded mode; its code was not analyzed")
+    return files, vb
+
+
 def prepare(target: Path, allow_degraded: bool) -> ProjectModel:
     """Preflight the helper, parse every project once and cache the model.
-    Without a helper (allow_degraded) the model has projects but no IR."""
+    Without a helper (allow_degraded) C# is lowered by tree-sitter and VB files
+    are left for the pattern scan."""
     root = target.resolve()
     notes: list[str] = []
     projects = load_projects(root, notes)
     binary = helper.preflight(target, allow_degraded)
     if binary is None:
-        model = ProjectModel(root, projects, {}, helper.DEGRADED_REASON, notes)
+        files, vb = _degraded_files(root, projects, notes)
+        model = ProjectModel(root, projects, files, helper.DEGRADED_REASON, notes, vb_files=vb)
     else:
         files: dict[str, FileIR] = {}
         for obj in helper.parse_projects(binary, root, _request(projects)):

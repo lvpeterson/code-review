@@ -1,18 +1,19 @@
 """Analyzer registrations for the legacy .NET Framework package.
 
-Five analyzers share one ProjectModel (prepared once by the enumerator, so the
+Six analyzers share one ProjectModel (prepared once by the enumerator, so the
 Roslyn helper runs once per scan): mvc, webapi, webforms and wcf split the routes
-and auth findings by route kind, config runs the web.config rules. Route
+and auth findings by route kind, config runs the web.config rules and deps the
+offline SCA rules. Route
 discovery and auth resolution happen once per model and are cached on
-`model.cache`. In degraded mode (no helper) the code-driven analyzers return
-nothing and only config still reports.
+`model.cache`. In degraded mode (no helper) the code rules run on the tree-sitter C# IR
+(no semantic symbols) and VB files only get the marked pattern scan (vb_regex, REVIEW).
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
-from checks.dnl import auth, project, routes, rules_auth, rules_config, rules_crypto, rules_deser_xml, rules_integrity, rules_object, rules_session, rules_taint, rules_wcf_config, rules_xss
+from checks.dnl import auth, project, routes, vb_regex, rules_auth, rules_config, rules_crypto, rules_deser_xml, rules_errors, rules_integrity, rules_misc, rules_object, rules_sca, rules_session, rules_taint, rules_wcf_config, rules_xss
 from checks.dnl.files import iter_dnl_files
 from checks.dnl.project import ProjectModel
 from checks.dnl.webconfig import load_configs
@@ -60,7 +61,7 @@ def _owner_kind(model: ProjectModel, f: Finding) -> str:
     if refs is None:
         refs = model.cache["refs_union"] = (set().union(*(p.references for p in model.projects))
                                             if model.projects else set())
-    running = [k for k in _enumerated(model) if k != "config"]
+    running = [k for k in _enumerated(model) if k not in ("config", "deps")]
     if f.file.lower().endswith((".aspx", ".ascx", ".master")):
         want = "webforms"
     elif proj is not None and _MVC_REF in proj.references:
@@ -82,23 +83,46 @@ def _code_results(model: ProjectModel) -> dict[str, tuple[list[Route], list[Find
     if cached is not None:
         return cached
     out: dict[str, tuple[list[Route], list[Finding]]] = {k: ([], []) for k in ("mvc", "webapi", "webforms", "wcf", "config")}
-    if not model.degraded:
-        # Deeply nested expressions recurse through the evaluator; give it headroom.
-        sys.setrecursionlimit(max(sys.getrecursionlimit(), 4000))
-        refs = routes.discover_mvc_webapi(model) + routes.discover_webforms(model) + routes.discover_wcf(model)
-        findings = rules_auth.check_routes(model, refs, auth.global_filters(model), auth.chain_for_model(model))
-        findings += rules_taint.check(model, refs)
-        findings += rules_xss.check(model, refs)
-        findings += rules_object.check(model, refs)
-        findings += rules_crypto.check(model, refs)
-        findings += rules_deser_xml.check(model, refs)
-        findings += rules_integrity.check(model, refs)
-        findings += rules_session.check(model, refs)
-        for ref in refs:
-            out[ref.route.meta["kind"]][0].append(ref.route)
-        for f in findings:
-            kind = f.route.meta["kind"] if f.route is not None else _owner_kind(model, f)
-            out[kind][1].append(f)
+    # Deeply nested expressions recurse through the evaluator; give it headroom.
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), 4000))
+    refs = routes.discover_mvc_webapi(model) + routes.discover_webforms(model) + routes.discover_wcf(model)
+    findings: list[Finding] = []
+    misc_notes: list[str] = []
+
+    def guarded(name: str, fn):
+        # One crashing rule module must not hide the others; say so in the report.
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            note = f"{name} failed ({type(exc).__name__}: {exc}); its findings are missing"
+            if note not in model.notes:
+                model.notes.append(note)
+            return []
+
+    findings += guarded("rules_auth", lambda: rules_auth.check_routes(model, refs, auth.global_filters(model), auth.chain_for_model(model)))
+    findings += guarded("rules_taint", lambda: rules_taint.check(model, refs))
+    findings += guarded("rules_xss", lambda: rules_xss.check(model, refs))
+    findings += guarded("rules_object", lambda: rules_object.check(model, refs))
+    findings += guarded("rules_crypto", lambda: rules_crypto.check(model, refs))
+    findings += guarded("rules_deser_xml", lambda: rules_deser_xml.check(model, refs))
+    findings += guarded("rules_integrity", lambda: rules_integrity.check(model, refs))
+    findings += guarded("rules_session", lambda: rules_session.check(model, refs))
+    findings += guarded("rules_errors", lambda: rules_errors.check(model, refs))
+
+    def run_misc():
+        found, notes = rules_misc.check(model, refs, load_configs(model.root))
+        misc_notes.extend(notes)
+        return found
+    findings += guarded("rules_misc", run_misc)
+    if model.degraded:
+        # VB has no IR without the helper: pattern findings only, all REVIEW.
+        findings += guarded("vb_regex", lambda: vb_regex.scan(model))
+    model.notes.extend(n for n in misc_notes if n not in model.notes)
+    for ref in refs:
+        out[ref.route.meta["kind"]][0].append(ref.route)
+    for f in findings:
+        kind = f.route.meta["kind"] if f.route is not None else _owner_kind(model, f)
+        out[kind][1].append(f)
     model.cache["code_results"] = out
     return out
 
@@ -173,8 +197,23 @@ class ConfigAnalyzer(_DnlAnalyzer):
         wcf_findings, wcf_notes = rules_wcf_config.check_configs(configs, rules_wcf_config.hosted_services(model))
         findings += wcf_findings
         self._notes += wcf_notes + rules_wcf_config.non_web_config_notes(model.root)
-        if model.degraded:
-            # Markup rules need no IR; in degraded mode they run here, without page routes.
-            findings += rules_integrity.check(model)
         # Route-less findings whose owning code analyzer is not enumerated land here.
         return findings + list(_code_results(model)["config"][1])
+
+
+@register("dotnet_legacy", "deps")
+class DepsAnalyzer(_DnlAnalyzer):
+    """Offline SCA (packages.config / HintPath packages, bundled JS, target framework,
+    unmanaged binaries, nuget.config); needs no IR, so it also runs in degraded mode."""
+    framework = "deps"
+
+    def find_routes(self) -> list[Route]:
+        return []
+
+    def run_baseline_checks(self, routes_: list[Route]) -> list[Finding]:
+        try:
+            findings, self._notes = rules_sca.check(self.model)
+        except Exception as exc:  # noqa: BLE001
+            self._notes = [f"rules_sca failed ({type(exc).__name__}: {exc}); its findings are missing"]
+            return []
+        return findings

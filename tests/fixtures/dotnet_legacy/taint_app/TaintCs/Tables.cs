@@ -76,7 +76,7 @@ namespace Cs.Fixes
 
         private static string NoopLdapEscape(string s) { return s; }
 
-        private static string RealLdapEscape(string s) { return s.Replace("*", "\2a").Replace("(", "\28"); }
+        private static string RealLdapEscape(string s) { return s.Replace("*", "\\2a").Replace("(", "\\28"); }
 
         public void LdapNoop()
         {
