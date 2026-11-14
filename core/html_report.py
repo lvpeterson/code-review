@@ -1719,8 +1719,18 @@ document.getElementById('reset-reviewed').addEventListener('click', () => {
   if (hideReviewed.checked) applyFilters();
 });
 
+// The SARIF file is named after this report: `X - Code Review.html` -> `X - Code Review.sarif`
+// (follows a renamed report too); a page with no file name falls back to appsec-review.sarif.
+function sarifFileName() {
+  let base = '';
+  try { base = decodeURIComponent(window.location.pathname.split('/').pop() || ''); } catch (e) { base = ''; }
+  base = base.replace(/[.]html?$/i, '');
+  return (base || 'appsec-review') + '.sarif';
+}
+
 document.getElementById('download-sarif').addEventListener('click', async () => {
   const text = JSON.stringify(SARIF_DATA, null, 2);
+  const fileName = sarifFileName();
 
   // showSaveFilePicker gives a real native "choose folder + filename"
   // dialog -- Chrome/Edge only as of writing, not Firefox/Safari, which
@@ -1729,7 +1739,7 @@ document.getElementById('download-sarif').addEventListener('click', async () => 
   if (window.showSaveFilePicker) {
     try {
       const handle = await window.showSaveFilePicker({
-        suggestedName: 'appsec-review.sarif',
+        suggestedName: fileName,
         types: [{ description: 'SARIF file', accept: { 'application/json': ['.sarif'] } }],
       });
       const writable = await handle.createWritable();
@@ -1746,7 +1756,7 @@ document.getElementById('download-sarif').addEventListener('click', async () => 
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = 'appsec-review.sarif';
+  a.download = fileName;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);

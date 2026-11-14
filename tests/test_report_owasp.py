@@ -53,3 +53,13 @@ def test_dnl_authz_findings_render_in_auth_tab():
     assert _is_auth_finding(dnl_finding("DNL-AUTHZ-004", "low", "t", "d", "a.cs", 1))
     assert not _is_auth_finding(dnl_finding("DNL-CSRF-001", "medium", "t", "d", "a.cs", 1))
     assert not _is_auth_finding(dnl_finding("DNL-CFG-001", "medium", "t", "d", "a.cs", 1))
+
+
+def test_sarif_download_is_named_after_the_report():
+    from pathlib import Path
+    from core.html_report import render_html
+    h = render_html([], Path("."))
+    assert "function sarifFileName()" in h
+    assert "suggestedName: fileName" in h and "a.download = fileName" in h
+    assert "'appsec-review.sarif'" not in h  # the fixed name is only the fallback base now
+    assert "(base || 'appsec-review') + '.sarif'" in h
