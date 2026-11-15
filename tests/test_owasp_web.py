@@ -2,9 +2,9 @@ from core.owasp_web import RULES, TITLES, owasp_for
 from checks.dnl.findings import dnl_finding
 
 
-def test_every_dnl_rule_has_2025_and_2021_tags():
+def test_every_rule_has_2025_and_2021_tags():
     for rid, (c25, c21, api, mode) in RULES.items():
-        assert rid.startswith("DNL-")
+        assert rid.isupper() and "-" in rid
         assert c25 in TITLES["2025"] and c21 in TITLES["2021"]
         assert api is None or api in TITLES["api2023"]
         assert mode in ("always", "api_surface")
@@ -22,7 +22,7 @@ def test_api_tag_only_on_api_surface():
 
 
 def test_unknown_id_has_no_tags():
-    assert owasp_for("TF-S3-001") == {}
+    assert owasp_for("NOT-A-RULE-001") == {}
 
 
 def test_dnl_finding_sets_owasp_and_leaves_isr_category_alone():

@@ -1217,6 +1217,8 @@ class SpringAnalyzer(BaseFrameworkAnalyzer):
                             explicit_access=explicit_access,
                             request_body_param_types=_request_body_param_types(member),
                             accepts_pageable_or_sort=_has_pageable_or_sort_param(member),
+                            # @RestController answers with bodies (an API); plain @Controller renders views.
+                            meta={"api_surface": "RestController" in class_annotation_names},
                         )
                     )
 

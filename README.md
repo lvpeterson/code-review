@@ -164,6 +164,7 @@ core/
   allowlist.py                 --allow-path glob suppression of AUTH-001
   rulescan.py                  line-regex rule engine + comment masking for the file-oriented (no-route) analyzers
   owasp_isr.py                 check id -> OWASP Top 10 Infrastructure Security Risks (2024) category
+  owasp_web.py                 check id -> OWASP Web 2025 / Web 2021 / API 2023 categories + the central tag_results() fill
 checks/                    heuristics that build Finding objects from Route data
   idor.py                    IDOR-001 -- id-like path or query/body params (all languages)
   auth.py                    AUTH-001..006 -- auth coverage + infrastructure (AUTH-001 all languages, 002-006 Spring only so far)
@@ -239,6 +240,70 @@ services alongside it mid-migration, or a Go service using gin for its main
 API plus a raw net/http health-check endpoint), and each gets its own
 deep-dive and its own section in the report, rather than one silently
 winning detection and the other's routes going unscanned.
+
+## OWASP tagging
+
+Every finding the scanner can emit carries OWASP tags, in all languages: the
+**OWASP Top 10 Web 2025**, **Web 2021** and **API Security Top 10 2023**
+categories. They show in the HTML report's OWASP tab (and as a badge on each
+finding), as `owasp` in JSON, and as `owasp-*` rule tags plus a `properties`
+entry in SARIF. Infrastructure and crypto rules additionally keep their
+**OWASP Top 10 Infrastructure Security Risks (2024)** ISR label in
+`category`, exactly as before.
+
+- `core/owasp_web.py` holds the id -> category mapping (`RULES`); the
+  dotnet_legacy rules tag themselves (`checks/dnl/findings.py`), and
+  `tag_results()` fills every other finding once, after the analyzers run
+  (`enumerator.py`, and `main.py` for the `--sca` results). It never
+  overwrites a tag that is already set. A rule id with no mapping fails
+  `tests/test_owasp_all_rules.py`, so new rules cannot ship untagged.
+- The API 2023 tag is emitted only when it is meaningful: rules marked
+  "always" (SSRF, TLS validation off, API Gateway / function-URL resources,
+  end-of-support frameworks) always carry it; the others carry it only when
+  the finding sits on an **API surface**. A finding is on an API surface
+  when its route says so (`Route.meta["api_surface"]`: Spring
+  `@RestController`, ASP.NET Core `[ApiController]` or a minimal-API route,
+  dotnet_legacy Web API/WCF/ASMX), otherwise when the scan's framework only
+  serves APIs (`fastapi`, `gin`, `hono`), otherwise not. Flask, Express,
+  Rails, Sinatra, Django, net/http and Spring `@Controller` mix pages and
+  JSON, so they are not guessed from the name.
+- Where a DNL rule and a shared rule describe the same risk they map to the
+  same categories (hardcoded credentials A07/A07, weak crypto A04/A02, TLS
+  validation off A08/A08, ...); the 2025 semantics (SSRF merged into A01,
+  A02 Security Misconfiguration, A03 Software Supply Chain Failures, A10
+  Mishandling of Exceptional Conditions) are those of `TITLES` in
+  `core/owasp_web.py`.
+
+### Per-language coverage
+
+Which Web 2025 and API 2023 categories at least one rule of the language
+family can emit, and which have none (the gaps -- "none" in the gaps column
+means full coverage). Membership is derived from the source: a rule belongs
+to the families whose analyzer packages emit it (an id literal under
+`languages/<lang>/`, or in a shared `checks/` module reached from that
+package -- only the languages that call the specific check function count),
+and the shared secret scanner counts for python (Lambda), infra and crypto.
+`sca` is the `--sca` osv-scanner path in `main.py`. An API 2023 category
+counts only if the tag can actually be emitted for that family (an "always"
+rule, or a family with an API-surface signal: python/fastapi, java,
+javascript/hono, go/gin, dotnet). dotnet_legacy has its own table in
+`languages/dotnet_legacy/README.md` (every category covered).
+`tests/test_owasp_readme.py` fails if this table drifts from `RULES`.
+
+<!-- owasp-coverage:start -->
+| Family | Rules | Web 2025 covered | Web 2025 gaps | API 2023 covered | API 2023 gaps |
+|---|---|---|---|---|---|
+| python | 28 | A01 A02 A04 A05 A06 A07 A08 A09 A10 | A03 | API1 API2 API4 API5 API7 API8 API10 | API3 API6 API9 |
+| java | 21 | A01 A02 A03 A05 A06 A07 A08 | A04 A09 A10 | API1 API2 API3 API5 API7 API8 API9 | API4 API6 API10 |
+| javascript | 7 | A01 A02 A05 | A03 A04 A06 A07 A08 A09 A10 | API1 API5 API7 API8 | API2 API3 API4 API6 API9 API10 |
+| go | 6 | A01 A05 | A02 A03 A04 A06 A07 A08 A09 A10 | API1 API5 API7 API8 | API2 API3 API4 API6 API9 API10 |
+| ruby | 2 | A01 | A02 A03 A04 A05 A06 A07 A08 A09 A10 | none | API1 API2 API3 API4 API5 API6 API7 API8 API9 API10 |
+| dotnet | 2 | A01 | A02 A03 A04 A05 A06 A07 A08 A09 A10 | API1 API5 | API2 API3 API4 API6 API7 API8 API9 API10 |
+| sql | 34 | A01 A04 A05 A06 A07 A10 | A02 A03 A08 A09 | none | API1 API2 API3 API4 API5 API6 API7 API8 API9 API10 |
+| infra | 155 | A01 A02 A03 A04 A05 A06 A07 A08 A09 A10 | none | API5 API8 | API1 API2 API3 API4 API6 API7 API9 API10 |
+| crypto | 47 | A01 A03 A04 A07 A08 A09 | A02 A05 A06 A10 | API10 | API1 API2 API3 API4 API5 API6 API7 API8 API9 |
+| sca | 1 | A03 | A01 A02 A04 A05 A06 A07 A08 A09 A10 | none | API1 API2 API3 API4 API5 API6 API7 API8 API9 API10 |
+<!-- owasp-coverage:end -->
 
 ## Adding a new framework to an existing language
 

@@ -139,6 +139,7 @@ def _find_minimal_api_routes(tree_root, src: bytes, relative_file: str) -> list[
                 line=node.start_point[0] + 1,
                 auth_decorators=middleware_names,
                 raw_snippet=node_text(node, src)[:120],
+                meta={"api_surface": True},  # minimal APIs map HTTP endpoints directly, no views
             )
         )
     return routes
@@ -202,6 +203,8 @@ def _find_attribute_routing_routes(tree_root, src: bytes, relative_file: str) ->
                     source_file=relative_file,
                     source_start_line=member.start_point[0] + 1,
                     source_end_line=member.end_point[0] + 1,
+                    # [ApiController] opts into API behavior; a plain [Controller] serves MVC views.
+                    meta={"api_surface": "ApiController" in class_attr_names},
                 )
             )
     return routes

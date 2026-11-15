@@ -8,6 +8,7 @@ from pathlib import Path
 from checks.dnl import project
 import languages  # noqa: F401  (import triggers analyzer registration)
 from core.models import ScanResult
+from core.owasp_web import tag_results
 from core.registry import get_analyzer
 from languages import crypto, dotnet, dotnet_legacy, go, infra, java, javascript, python, ruby, sql
 
@@ -47,6 +48,7 @@ def enumerate_target(
             raise ValueError(f"Unknown --language '{force_language}'. Known: {', '.join(LANGUAGE_MODULES)}")
         frameworks = [force_framework] if force_framework else module.detector.detect_frameworks(target_path)
         _run_frameworks(target_path, force_language, frameworks, results, allow_degraded)
+        tag_results(results)
         return results
 
     for language_name, module in LANGUAGE_MODULES.items():
@@ -55,6 +57,7 @@ def enumerate_target(
         frameworks = module.detector.detect_frameworks(target_path)
         _run_frameworks(target_path, language_name, frameworks, results, allow_degraded)
 
+    tag_results(results)
     return results
 
 

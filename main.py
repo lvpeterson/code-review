@@ -20,6 +20,7 @@ from pathlib import Path
 from checks.dnl.helper import PreflightError
 from core.allowlist import apply_allowlist
 from core.html_report import write_html
+from core.owasp_web import tag_results
 from core.report import meets_or_exceeds, print_console, worst_severity, write_json
 from core.sarif_report import write_sarif
 from enumerator import enumerate_target
@@ -85,6 +86,7 @@ def main() -> int:
     if args.sca or args.sca_offline:
         from checks import sca
         results.append(sca.run(target_path, offline=args.sca_offline))
+        tag_results(results)  # the SCA findings arrive after enumerate_target tagged the rest
 
     if args.allow_path:
         apply_allowlist(results, args.allow_path)

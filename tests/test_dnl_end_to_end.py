@@ -117,6 +117,8 @@ def test_readme_lists_every_rule_with_tags():
     text = README.read_text(encoding="utf-8")
     assert chr(0x2014) not in text  # no em-dashes
     for rid, (c25, c21, api, _mode) in RULES.items():
+        if not rid.startswith("DNL-"):
+            continue  # other languages are documented in the root README
         row = next((ln for ln in text.splitlines() if ln.startswith(f"| {rid} ")), None)
         assert row is not None, f"{rid} missing from README rule table"
         cells = [c.strip() for c in row.strip("|").split("|")]
