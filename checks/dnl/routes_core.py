@@ -680,6 +680,9 @@ RequireRateLimiting RequireHost DisableAntiforgery AddEndpointFilter AddEndpoint
 ExcludeFromDescription DisableRateLimiting CacheOutput WithRequestTimeout
 """.split())
 _SWEEP_MSG = "registration not reached by the pipeline walk"
+_SWEEP_ENV_MSG = "environment and group prefix of this registration were not traced"
+# Map* calls other discovery code handles (controllers, pages) or that register nothing worth listing.
+_HANDLED_MAPS = frozenset(_MAP_NAMES) | {"MapRazorPages", "MapStaticAssets"}
 
 
 @dataclass(eq=False)
@@ -712,6 +715,7 @@ class _Result:
     line: int
     group: Group | None = None
     depth: int = 0
+    origin: object = None   # the value an untraced call was made on (its group is what a trailing convention missed)
 
 
 @dataclass
@@ -835,10 +839,13 @@ class _Scan:
                     if not name or id(link) in self.consumed:
                         continue
                     if name in ("UseSwagger", "UseSwaggerUI") and self.is_endpoint_call(link, name, True):
+                        before = len(self.entries)
                         self.middleware(fr, link, name, None)
+                        for e in self.entries[before:]:
+                            e.ref.unknown[:0] = [_SWEEP_MSG, _SWEEP_ENV_MSG]
                     elif self.is_map(link, name, False):
                         entry = self.register(fr, link, name, None, None)
-                        entry.ref.unknown.insert(0, _SWEEP_MSG)
+                        entry.ref.unknown[:0] = [_SWEEP_MSG, _SWEEP_ENV_MSG]
 
     def finish(self, e: _Entry) -> CoreRouteRef:
         """Fill in the group chain (outermost first) once every convention has been seen."""
@@ -924,7 +931,9 @@ class _Scan:
             self.stmts(fr, s.get("resource"))
             self.stmts(fr, s.get("body"))
         elif k == "try":
+            fr.cond += 1            # an exception may skip the rest of the block
             self.stmts(fr, s.get("body"))
+            fr.cond -= 1
             self.branch(fr, [c.get("body") for c in s.get("catches") or []] + [[]])
             self.stmts(fr, s.get("finally"))
 
@@ -980,11 +989,26 @@ class _Scan:
             return g
         if not arg and self.is_map(link, name, known):
             return self.register(fr, link, name, node, pc)
+        if (not arg and name.startswith("Map") and name != "MapGroup" and name not in _HANDLED_MAPS
+                and self.is_endpoint_call(link, name, known)):
+            self.unmodelled(fr, link, name, pc, node)
         if (not arg and name in ("UseSwagger", "UseSwaggerUI")
                 and self.is_endpoint_call(link, name, known or (pc is not None and pc.kind == "app"))):
             self.middleware(fr, link, name, pc)
             return state
         return self.convention(fr, link, state, name)
+
+    def unmodelled(self, fr: _Frame, link: dict, name: str, pc: PipeCall | None, node: _Node | None) -> None:
+        """A Map* extension on a builder (`MapIdentityApi`) registers endpoints this engine cannot
+        list: say so on the model, and on the routes of the group it was called on."""
+        where = f"{pc.file if pc is not None else fr.type.file}:{link.get('line', 0)}"
+        note = f"{name} at {where} registers endpoints the engine cannot list; review them manually"
+        if note not in self.model.notes:
+            self.model.notes.append(note)
+        if node is not None and node.kind == "group":
+            msg = f"{name} registers endpoints the engine cannot list on this group"
+            if msg not in node.notes:
+                node.notes.append(msg)
 
     # -- values ---------------------------------------------------------------
     @staticmethod
@@ -1049,7 +1073,7 @@ class _Scan:
         sym = link.get("sym")
         if sym:
             return sym.rsplit(".", 1)[0].startswith("Microsoft.AspNetCore.")
-        if name in _CONVENTION_NAMES or name in _FRAMEWORK_CALLS:
+        if (name in _CONVENTION_NAMES or name in _FRAMEWORK_CALLS) and isinstance(state, (_Node, _Entry, _Result)):
             return True
         return isinstance(state, _Node) and state.kind == "root" and name.startswith(("Use", "Add"))
 
@@ -1058,7 +1082,7 @@ class _Scan:
         if state is None:
             return None
         if not self.passes_through(link, name, state):
-            return _Result([], False, name, [], fr.type.file, link.get("line", 0), depth=fr.cond)
+            return _Result([], False, name, [], fr.type.file, link.get("line", 0), depth=fr.cond, origin=state)
         cond_note = f"{name} applied conditionally"
         if isinstance(state, _Entry):
             state.ref.endpoint_calls.append(link)
@@ -1078,6 +1102,13 @@ class _Scan:
                 for e in state.entries:
                     if msg not in e.ref.unknown:
                         e.ref.unknown.append(msg)
+                # The convention may belong to the receiver's group: every route on it, registered
+                # before or after, carries the note (a root builder would mark every route).
+                o = state.origin
+                if isinstance(o, _Node) and o.kind == "group" and msg not in o.notes:
+                    o.notes.append(msg)
+                elif isinstance(o, _Entry) and msg not in o.ref.unknown:
+                    o.ref.unknown.append(msg)
             else:
                 # What the method provably returns takes the call: as an extra group on a group,
                 # on the route itself for a returned Map call.

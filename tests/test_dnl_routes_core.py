@@ -733,3 +733,44 @@ rg.MapGet("/r1", () => 1);
 app.Run();""")
     r = ep(_discover_eps(root), "/r/r1")
     assert not any("RequireAuthorization" in _names(g.calls) for g in r.groups)
+    assert any("RequireAuthorization applied to the result of MapIdentityApi could not be traced" in u for u in r.unknown)
+
+
+def test_unmodelled_map_extension_is_noted_on_model_and_group(roslyn_helper, tmp_path):
+    root = _copy_minimal(tmp_path)
+    _edit(root, "Program.cs", "app.Run();", """app.MapGroup("/account").MapIdentityApi<IdentityUser>();
+var ag = app.MapGroup("/acct2");
+ag.MapGet("/me", () => 1);
+ag.MapIdentityApi<IdentityUser>();
+app.Run();""")
+    project._CACHE.clear()
+    project.prepare(root, False)
+    model = project.get_model(root, "dotnet")
+    out = discover_endpoints(model)
+    assert any("MapIdentityApi" in n and "Program.cs:" in n and "review them manually" in n for n in model.notes)
+    # called on a group local: routes on that group, registered before or after, carry the note
+    assert any("MapIdentityApi registers endpoints" in u for u in ep(out, "/acct2/me").unknown)
+    assert ep(out, "/").unknown == []
+
+
+def test_dev_only_swept_registration_is_flagged(roslyn_helper, tmp_path):
+    root = _copy_minimal(tmp_path)
+    _edit(root, "Program.cs", "app.Run();",
+          'app.MapWhen(c => true, b => { if (app.Environment.IsDevelopment()) b.UseEndpoints(e => e.MapGet("/dv", () => 1)); });'
+          + chr(10) + "app.Run();")
+    r = ep(_discover_eps(root), "/dv")
+    assert any("environment and group prefix" in u for u in r.unknown)
+
+
+@pytest.mark.parametrize("wrapper", [
+    "for (var i = 0; i < args.Length; i++) { G.RequireAuthorization(); }",
+    "try { G.RequireAuthorization(); } catch (Exception) { }",
+    "switch (args.Length) { case 0: G.RequireAuthorization(); break; default: break; }",
+    "while (args.Length > 5) { G.RequireAuthorization(); }",
+])
+def test_conditional_conventions_in_loop_try_and_switch(roslyn_helper, tmp_path, wrapper):
+    root = _copy_minimal(tmp_path)
+    _edit(root, "Program.cs", "app.Run();",
+          'var G = app.MapGroup("/cx");' + chr(10) + wrapper + chr(10) + 'G.MapGet("/x", () => 1);' + chr(10) + "app.Run();")
+    r = ep(_discover_eps(root), "/cx/x")
+    assert any("RequireAuthorization applied conditionally" in u for u in r.unknown), wrapper
