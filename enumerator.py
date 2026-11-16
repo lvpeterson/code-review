@@ -28,6 +28,10 @@ LANGUAGE_MODULES = {
 }
 
 
+# Packages that read the shared .NET project model (checks.dnl.project).
+_DOTNET_PACKAGES = ("dotnet", "dotnet_legacy")
+
+
 def enumerate_target(
     target_path: Path,
     force_language: str | None = None,
@@ -41,6 +45,7 @@ def enumerate_target(
     alongside it) -- all matches run, each as its own ScanResult.
     """
     results: list[ScanResult] = []
+    prepared = False
 
     if force_language:
         module = LANGUAGE_MODULES.get(force_language)
@@ -55,21 +60,25 @@ def enumerate_target(
         if not module.detector.detect_language(target_path):
             continue
         frameworks = module.detector.detect_frameworks(target_path)
-        _run_frameworks(target_path, language_name, frameworks, results, allow_degraded)
+        # One preparation (one helper run) serves every .NET package in this scan.
+        prepared = _run_frameworks(target_path, language_name, frameworks, results, allow_degraded, prepared) or prepared
 
     tag_results(results)
     return results
 
 
 def _run_frameworks(target_path: Path, language_name: str, frameworks: list[str], results: list[ScanResult],
-                    allow_degraded: bool = False) -> None:
+                    allow_degraded: bool = False, prepared: bool = False) -> bool:
+    """Run the analyzers of one language. Returns True when the shared .NET model is
+    prepared (here or by an earlier call), so the caller does not prepare it again."""
     if not frameworks:
         print(f"[{language_name}] language detected but no known framework matched -- skipping deep-dive")
-        return
+        return False
 
-    if language_name == "dotnet_legacy":
+    if language_name in _DOTNET_PACKAGES and not prepared:
         # Fail fast (PreflightError -> CLI exit 2) before any analyzer runs.
         project.prepare(target_path, allow_degraded)
+        prepared = True
 
     for framework in frameworks:
         analyzer_cls = get_analyzer(language_name, framework)
@@ -79,3 +88,4 @@ def _run_frameworks(target_path: Path, language_name: str, frameworks: list[str]
 
         analyzer = analyzer_cls(target_path)
         results.append(analyzer.analyze())
+    return prepared and language_name in _DOTNET_PACKAGES

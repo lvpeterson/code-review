@@ -376,7 +376,7 @@ _DISPLAY = {"jquery-ui": "jQuery UI", "jquery-validation": "jQuery Validation", 
 
 def _check_js(model: ProjectModel, notes: list[str]) -> list[Finding]:
     findings: list[Finding] = []
-    for path in iter_dnl_files(model.root, (".js",)):
+    for path in model.iter_files((".js",)):
         try:
             parts = path.resolve().relative_to(model.root).parts[:-1]
         except ValueError:

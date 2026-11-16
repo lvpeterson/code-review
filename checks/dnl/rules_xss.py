@@ -21,7 +21,6 @@ import re
 from pathlib import Path
 
 from checks.dnl import taint, taint_solver, templates
-from checks.dnl.files import iter_dnl_files
 from checks.dnl.findings import dnl_finding
 from checks.dnl.ir import has_attr, receiver_text, walk
 from core.models import Finding
@@ -101,7 +100,7 @@ def _template_findings(model, refs) -> list[Finding]:
                 view_refs.setdefault(v.resolve(), []).append(ref)
     actions = _Actions(model)
     best: dict[tuple, tuple] = {}
-    for f in iter_dnl_files(model.root, templates.TEMPLATE_EXT):
+    for f in model.iter_files(templates.TEMPLATE_EXT):
         rel = model.rel(f)
         linked = sorted(view_refs.get(f.resolve(), []), key=_route_key)
         page = page_refs.get(rel)

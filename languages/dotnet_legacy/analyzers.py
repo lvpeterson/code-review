@@ -138,7 +138,7 @@ class _DnlAnalyzer(BaseFrameworkAnalyzer):
     @property
     def model(self) -> ProjectModel:
         if self._model is None:
-            self._model = project.get_model(self.target_path)
+            self._model = project.get_model(self.target_path, "dotnet_legacy")
         return self._model
 
     def find_routes(self) -> list[Route]:
@@ -151,8 +151,10 @@ class _DnlAnalyzer(BaseFrameworkAnalyzer):
         result = super().analyze()
         result.degraded = self.model.degraded
         # Model notes describe the whole scan: the first analyzer to report takes them.
-        notes = [] if self.model.cache.get("notes_taken") else list(self.model.notes)
-        self.model.cache["notes_taken"] = True
+        # The flag lives on the full model: it is shared by every view of the scan.
+        shared = self.model.parent or self.model
+        notes = [] if shared.cache.get("notes_taken") else list(self.model.notes)
+        shared.cache["notes_taken"] = True
         result.notes = notes + self._notes
         return result
 

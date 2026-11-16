@@ -5,6 +5,7 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from checks.dnl import project
 from checks.dnl.files import is_legacy_project, iter_dnl_files, read_source
 
 _FRAMEWORK_ORDER = ["mvc", "webapi", "webforms", "wcf", "config", "deps"]
@@ -67,13 +68,16 @@ def _scan(target: Path) -> tuple[bool, set[str]]:
             fw.add("wcf")
         if suffix in (".csproj", ".vbproj"):
             text = _safe_read(path)
-            if is_legacy_project(text):
+            legacy = is_legacy_project(text)
+            # SDK-style projects on .NET Framework (net472, ...) belong here too; the
+            # ones on modern .NET belong to the dotnet package.
+            if legacy or project.sdk_profile(path, target) == "net48":
                 lang = True
-                if "<HintPath>" in text or "<TargetFrameworkVersion>" in text:
+                if legacy and ("<HintPath>" in text or "<TargetFrameworkVersion>" in text):
                     deps = True
-                if "System.Web.Mvc" in text:
+                if "System.Web.Mvc" in text or (not legacy and "Microsoft.AspNet.Mvc" in text):
                     fw.add("mvc")
-                if "System.Web.Http" in text:
+                if "System.Web.Http" in text or (not legacy and "Microsoft.AspNet.WebApi" in text):
                     fw.add("webapi")
         elif name == "packages.config":
             lang = True
