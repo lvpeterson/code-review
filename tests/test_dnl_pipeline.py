@@ -197,3 +197,12 @@ def test_ambiguous_startup_fallback_records_note(roslyn_helper):
     assert p.style == "startup"
     assert len(p.notes) == 1 and "AppStartup" in p.notes[0] and "LegacyStartup" in p.notes[0]
     assert _names(p) == ["AddRazorPages", "UseRouting"]
+
+
+def test_top_level_plus_use_startup_is_merged(roslyn_helper):
+    p = _pipe("toplevel_startup")
+    assert p.style == "startup"
+    names = _names(p)
+    # Top-level calls first, then T's ConfigureServices, then T's Configure; LegacyStartup is not used.
+    assert names.index("AddCors") < names.index("AddRazorPages") < names.index("UseRouting")
+    assert "AddSession" not in names and "UseStaticFiles" not in names

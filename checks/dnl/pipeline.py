@@ -482,11 +482,10 @@ def _startup_targets(types: list[TypeIR]) -> list[str]:
 def _entry_methods(types: list[TypeIR], notes: list[str]) -> tuple[str, list[tuple[TypeIR, MethodIR]]]:
     wanted = _startup_targets(types)
     startup = [t for t in types if t.name.split(".")[-1] in wanted] if wanted else []
+    tops = [(t, m) for t in types for m in t.methods if is_top_level(m)]
     if not startup:
-        for t in types:
-            for m in t.methods:
-                if is_top_level(m):
-                    return "minimal", [(t, m)]
+        if tops:
+            return "minimal", tops
         startup = [t for t in types if t.name == "Startup"]
         if not startup:
             # No usable `UseStartup<T>()`: take the types that look like startup classes.
@@ -499,7 +498,8 @@ def _entry_methods(types: list[TypeIR], notes: list[str]) -> tuple[str, list[tup
     out = [(t, m) for want in ("ConfigureServices", "Configure") for t in startup
            for m in t.methods if m.name == want]
     if out:
-        return "startup", out
+        # Top-level statements plus a resolved UseStartup<T>: the merge, top-level calls first.
+        return "startup", (tops + out if wanted and startup and tops else out)
     for t in types:
         for m in t.methods:
             if m.name == "Main" and "static" in [x.lower() for x in m.modifiers]:
