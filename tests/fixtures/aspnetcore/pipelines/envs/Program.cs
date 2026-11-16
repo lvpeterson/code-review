@@ -59,4 +59,8 @@ if (SomeCheck(app.Environment))
 app.MapGroup("/a").RequireAuthorization().MapGet("/b", () => "b").AllowAnonymous();
 app.Run();
 
-static bool SomeCheck(IWebHostEnvironment env) => env.IsDevelopment();
+static bool SomeCheck(IWebHostEnvironment env)
+{
+    var name = env.EnvironmentName;
+    return name.Length > 3;
+}

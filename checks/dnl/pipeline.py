@@ -138,28 +138,64 @@ def _is_env_name_expr(e) -> bool:
     return isinstance(e, dict) and e.get("k") == "member" and e.get("name") == "EnvironmentName"
 
 
-def _mentions_env(e, locs: dict) -> bool:
-    for n in walk(e):
-        k = n.get("k")
-        if k == "call" and (call_name(n) or "").lower() in ("isdevelopment", "isproduction", "isstaging", "isenvironment"):
-            return True
-        if k == "member" and n.get("name") in ("EnvironmentName", "Environment"):
-            return True
-        if k == "name" and n.get("id") in locs:
-            return True
+def _env_node(n: dict) -> bool:
+    """True for a node that reads the hosting environment."""
+    k = n.get("k")
+    if k == "call":
+        return (call_name(n) or "").lower() in ("isdevelopment", "isproduction", "isstaging", "isenvironment")
+    if k == "member":
+        obj = n.get("obj")
+        return n.get("name") in ("EnvironmentName", "Environment") or (
+            isinstance(obj, dict) and obj.get("k") == "name" and obj.get("id") == "Environments")
     return False
 
 
-def _pred(e, locs: dict):
-    """Predicate of an environment condition; None when it mentions no environment at all.
+def _callee_body(ctx: _Ctx, scope: dict, call: dict):
+    """Body of the solution method or local function a call goes to (a stmt list, or the
+    expression of an expression-bodied lambda); None for framework / external calls."""
+    fn = call.get("fn") or {}
+    if fn.get("k") == "name":
+        lam = scope.get(_LOCAL_FN + (fn.get("id") or ""))
+        if isinstance(lam, dict):
+            return lam.get("body")
+    t = _find_target(ctx, call)
+    return t[1].body if t is not None else None
+
+
+def _single_return(body):
+    """The returned expression of a body that is one expression or one `return`; else None."""
+    if isinstance(body, dict):
+        return body
+    if isinstance(body, list) and len(body) == 1 and isinstance(body[0], dict) and body[0].get("k") == "return":
+        return body[0].get("value")
+    return None
+
+
+def _mentions_env(e, scope: dict, ctx: _Ctx, depth: int = 0) -> bool:
+    """True when e reads the environment, directly, through a flag local, or through a
+    solution method / local function that does."""
+    locs = _env_locals(scope)
+    for n in walk(e):
+        if _env_node(n) or (n.get("k") == "name" and n.get("id") in locs):
+            return True
+        if n.get("k") == "call" and depth < 4:
+            body = _callee_body(ctx, scope, n)
+            if body is not None and _mentions_env(body, {}, ctx, depth + 1):
+                return True
+    return False
+
+
+def _pred(e, scope: dict, ctx: _Ctx, depth: int = 0):
+    """Predicate of an environment condition; None when it reads no environment at all.
     Operands of a mixed condition that are not environment checks count as unknown."""
-    if not isinstance(e, dict) or not _mentions_env(e, locs):
+    if not isinstance(e, dict) or not _mentions_env(e, scope, ctx, depth):
         return None
+    locs = _env_locals(scope)
     k = e.get("k")
     if k == "name":
         return locs.get(e.get("id"), _UNKNOWN)
     if k == "unary" and e.get("op") == "!":
-        return ("not", _pred(e.get("e"), locs) or _UNKNOWN)
+        return ("not", _pred(e.get("e"), scope, ctx, depth) or _UNKNOWN)
     if k == "call":
         nm = (call_name(e) or "").lower()
         if nm in _ENV_CALLS:
@@ -179,12 +215,18 @@ def _pred(e, locs: dict):
                     n = _env_name(b)
                     if _is_env_name_expr(a) and n:
                         return ("env", n)
+        # A solution method / local function: its single returned expression, else unknown.
+        body = _callee_body(ctx, scope, e) if depth < 4 else None
+        expr = _single_return(body) if body is not None else None
+        if expr is not None:
+            return _pred(expr, {}, ctx, depth + 1) or _UNKNOWN
         return _UNKNOWN
     if k == "bin":
         op = e.get("op")
         if op in ("&&", "and", "andalso", "||", "or", "orelse"):
             kind = "and" if op in ("&&", "and", "andalso") else "or"
-            return (kind, _pred(e.get("l"), locs) or _UNKNOWN, _pred(e.get("r"), locs) or _UNKNOWN)
+            return (kind, _pred(e.get("l"), scope, ctx, depth) or _UNKNOWN,
+                    _pred(e.get("r"), scope, ctx, depth) or _UNKNOWN)
         if op in ("==", "!="):
             for a, b in ((e.get("l"), e.get("r")), (e.get("r"), e.get("l"))):
                 n = _env_name(b)
@@ -355,39 +397,91 @@ def _scope_for(m: MethodIR, recv_kind: str | None, arg_kinds: list[str | None], 
 
 # -- walking ----------------------------------------------------------------
 
-_ENV_LOCAL = "$env:"  # scope key prefix; `$` cannot start a C# identifier
+_ENV_LOCAL = "$env:"  # scope key prefixes; `$` cannot start a C# identifier
+_TAINT = "$flag:"
+_LOCAL_FN = "$fn:"
 
 
 def _env_locals(scope: dict) -> dict:
-    return {k[len(_ENV_LOCAL):]: v for k, v in scope.items() if k.startswith(_ENV_LOCAL)}
+    """Names whose value depends on the environment: single-assignment env-bool locals map
+    to their predicate; flag locals assigned under a guard (or re-assigned) map to unknown."""
+    out: dict = {}
+    for k, v in scope.items():
+        if k.startswith(_ENV_LOCAL):
+            out[k[len(_ENV_LOCAL):]] = v
+        elif k.startswith(_TAINT):
+            out[k[len(_TAINT):]] = _UNKNOWN
+    return out
 
 
-def _set_env_local(scope: dict, name: str, init) -> None:
-    """Remember `var dev = env.IsDevelopment();` so a later `if (dev)` is an environment guard."""
-    pred = _pred(init, _env_locals(scope)) if isinstance(init, dict) else None
+def _declare_local(ctx: _Ctx, scope: dict, name: str, init) -> None:
+    """`var dev = env.IsDevelopment();` makes a later `if (dev)` an environment guard."""
+    scope.pop(_TAINT + name, None)
+    pred = _pred(init, scope, ctx) if isinstance(init, dict) else None
     if pred:
         scope[_ENV_LOCAL + name] = pred
     else:
         scope.pop(_ENV_LOCAL + name, None)
+    if isinstance(init, dict) and init.get("k") == "lambda":
+        scope[_LOCAL_FN + name] = init
+    else:
+        scope.pop(_LOCAL_FN + name, None)
+
+
+def _assign_local(ctx: _Ctx, scope: dict, name: str, value, guards: tuple) -> None:
+    """A later assignment: a flag set under an environment guard, from an environment
+    expression, or re-assigned after being an env-bool local no longer has a single value
+    to read, so conditions on it are unknown."""
+    if (guards or (isinstance(value, dict) and _mentions_env(value, scope, ctx))
+            or (_ENV_LOCAL + name) in scope):
+        scope.pop(_ENV_LOCAL + name, None)
+        scope[_TAINT + name] = True
+
+
+def _exits(stmts) -> bool:
+    """True when a statement list cannot fall through (ends in return / throw / break / continue)."""
+    if not stmts:
+        return False
+    last = stmts[-1]
+    if not isinstance(last, dict):
+        return False
+    k = last.get("k")
+    if k in ("return", "throw"):
+        return True
+    if k == "other":
+        return (last.get("text") or "").strip().rstrip(";").strip() in ("break", "continue")
+    if k == "if":
+        return _exits(last.get("then")) and _exits(last.get("else"))
+    return False
 
 
 def _stmts(ctx: _Ctx, stmts, scope: dict, guards: tuple, file: str, stack: tuple, depth: int) -> None:
+    # Local functions may be used before their declaration.
     for s in stmts or []:
-        _stmt(ctx, s, scope, guards, file, stack, depth)
+        if isinstance(s, dict) and s.get("k") == "local" and isinstance((s.get("init") or {}).get("k"), str)                 and s["init"]["k"] == "lambda" and s.get("name"):
+            scope[_LOCAL_FN + s["name"]] = s["init"]
+    for s in stmts or []:
+        guards = _stmt(ctx, s, scope, guards, file, stack, depth)
+        if guards is None:
+            return  # the rest of the list is unreachable
 
 
-def _stmt(ctx: _Ctx, s, scope: dict, guards: tuple, file: str, stack: tuple, depth: int) -> None:
+def _stmt(ctx: _Ctx, s, scope: dict, guards: tuple, file: str, stack: tuple, depth: int) -> tuple | None:
+    """Walk one statement; returns the guards in force for the statements after it, or
+    None when nothing after it can run."""
     if not isinstance(s, dict):
-        return
+        return guards
     k = s.get("k")
     if k == "expr":
         _expr(ctx, s.get("expr"), scope, guards, file, stack, depth)
+    elif k == "assign":
+        _expr(ctx, s, scope, guards, file, stack, depth)
     elif k == "local":
         init = s.get("init")
         kind = _expr(ctx, init, scope, guards, file, stack, depth)
         nm = s.get("name")
         if nm:
-            _set_env_local(scope, nm, init)
+            _declare_local(ctx, scope, nm, init)
             if kind == "other":
                 kind = None
             kind = kind or _type_kind(s.get("type_full")) or _type_kind(s.get("type"))
@@ -397,13 +491,27 @@ def _stmt(ctx: _Ctx, s, scope: dict, guards: tuple, file: str, stack: tuple, dep
                 scope[nm] = kind
             else:
                 scope.pop(nm, None)
-    elif k == "return":
+    elif k in ("return", "throw"):
         _expr(ctx, s.get("value"), scope, guards, file, stack, depth)
+        return None
+    elif k == "other":
+        if _exits([s]):
+            return None
     elif k == "if":
-        pred = _pred(s.get("cond"), _env_locals(scope))
+        pred = _pred(s.get("cond"), scope, ctx)
         # Nested conditions compose: every enclosing guard stays in force.
-        _stmts(ctx, s.get("then"), scope, guards + ((pred, True),) if pred else guards, file, stack, depth)
-        _stmts(ctx, s.get("else"), scope, guards + ((pred, False),) if pred else guards, file, stack, depth)
+        t_g = guards + ((pred, True),) if pred else guards
+        e_g = guards + ((pred, False),) if pred else guards
+        _stmts(ctx, s.get("then"), scope, t_g, file, stack, depth)
+        _stmts(ctx, s.get("else"), scope, e_g, file, stack, depth)
+        # An early exit leaves the rest of the list under the other branch's guard.
+        t_exit, e_exit = _exits(s.get("then")), _exits(s.get("else"))
+        if t_exit and e_exit:
+            return None
+        if t_exit:
+            return e_g
+        if e_exit:
+            return t_g
     elif k == "loop":
         _stmts(ctx, s.get("body"), scope, guards, file, stack, depth)
     elif k == "using":
@@ -414,6 +522,7 @@ def _stmt(ctx: _Ctx, s, scope: dict, guards: tuple, file: str, stack: tuple, dep
         for c in s.get("catches") or []:
             _stmts(ctx, c.get("body"), scope, guards, file, stack, depth)
         _stmts(ctx, s.get("finally"), scope, guards, file, stack, depth)
+    return guards
 
 
 def _expr(ctx: _Ctx, e, scope: dict, guards: tuple, file: str, stack: tuple, depth: int) -> str | None:
@@ -425,8 +534,8 @@ def _expr(ctx: _Ctx, e, scope: dict, guards: tuple, file: str, stack: tuple, dep
     if k == "assign":
         kind = _expr(ctx, e.get("value"), scope, guards, file, stack, depth)
         tgt = e.get("target")
-        if isinstance(tgt, dict) and tgt.get("k") == "name" and e.get("op") == "=":
-            _set_env_local(scope, tgt.get("id"), e.get("value"))
+        if isinstance(tgt, dict) and tgt.get("k") == "name":
+            _assign_local(ctx, scope, tgt.get("id"), e.get("value"), guards)
         if kind and isinstance(tgt, dict) and tgt.get("k") == "name":
             scope[tgt.get("id")] = kind
         return kind

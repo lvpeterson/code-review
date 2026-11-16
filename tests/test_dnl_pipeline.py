@@ -206,3 +206,37 @@ def test_top_level_plus_use_startup_is_merged(roslyn_helper):
     # Top-level calls first, then T's ConfigureServices, then T's Configure; LegacyStartup is not used.
     assert names.index("AddCors") < names.index("AddRazorPages") < names.index("UseRouting")
     assert "AddSession" not in names and "UseStaticFiles" not in names
+
+
+# -- fix round 2 ------------------------------------------------------------
+
+def _truth(p):
+    return {c.name: (c.runs_in("Development"), c.runs_in("Production")) for c in p.calls}
+
+
+def test_early_exits_and_indirect_env_conditions(roslyn_helper, monkeypatch):
+    p = _pipe("exits")
+    t = _truth(p)
+    # `if (!IsDevelopment()) return;` / `if (IsProduction()) return;` / throw / continue guard the rest.
+    assert t["UseDeveloperExceptionPage"] == (True, False)
+    assert t["UseHsts"] == (True, False)
+    assert t["UseHttpsRedirection"] == (False, True)
+    assert _runs(p, "UseSession", "Staging", "Production") == (True, False)
+    # IsDev() local function resolves; a multi-statement helper and flag locals are undecidable.
+    assert t["UseStaticFiles"] == (True, False)
+    assert t["UseRateLimiter"][1] is None
+    assert t["UseCors"][1] is None
+    assert t["UseAntiforgery"] == (True, False)
+    assert t["UseRouting"] == (True, True)
+    prod = {c.name for c in p.named()}
+    assert {"UseHttpsRedirection", "UseRouting"} <= prod
+    assert not prod & {"UseDeveloperExceptionPage", "UseHsts", "UseSession", "UseStaticFiles", "UseRateLimiter",
+                       "UseCors", "UseAntiforgery"}
+    assert {c.name for c in p.uncertain()} == {"UseRateLimiter", "UseCors"}
+    # Degraded mode gives the same answers.
+    project._CACHE.clear()
+    monkeypatch.setattr(helper, "find_helper", lambda *a: None)
+    monkeypatch.setattr(helper, "sdk_available", lambda: False)
+    deg = _pipe("exits", True)
+    assert _truth(deg) == t
+    assert _names(deg) == _names(p)
