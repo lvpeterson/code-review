@@ -693,15 +693,20 @@ internal sealed class CSharpLowering
                 w.OptStr("sym", sem?.NameSym(id));
                 w.End();
                 break;
-            case GenericNameSyntax g: w.Name(g.Identifier.ValueText, line); break;
+            case GenericNameSyntax g:
+                w.Begin("name", line);
+                w.Str("id", g.Identifier.ValueText);
+                TypeArgs(g);
+                w.End();
+                break;
             case PredefinedTypeSyntax pt: w.Name(pt.Keyword.ValueText, line); break;
             case ThisExpressionSyntax: w.Name("this", line); break;
             case BaseExpressionSyntax: w.Name("base", line); break;
             case QualifiedNameSyntax q:
-                Member(q.Left, q.Right.Identifier.ValueText, line, q);
+                Member(q.Left, q.Right.Identifier.ValueText, line, q, q.Right);
                 break;
             case MemberAccessExpressionSyntax ma:
-                Member(ma.Expression, ma.Name.Identifier.ValueText, line, ma);
+                Member(ma.Expression, ma.Name.Identifier.ValueText, line, ma, ma.Name);
                 break;
 
             case ConditionalAccessExpressionSyntax ca:
@@ -710,7 +715,7 @@ internal sealed class CSharpLowering
                 finally { receivers.Pop(); }
                 break;
             case MemberBindingExpressionSyntax mb when receivers.Count > 0:
-                WithReceiver(recv => Member(recv, mb.Name.Identifier.ValueText, line, mb));
+                WithReceiver(recv => Member(recv, mb.Name.Identifier.ValueText, line, mb, mb.Name));
                 break;
             case ElementBindingExpressionSyntax eb when receivers.Count > 0:
                 WithReceiver(recv => Index(recv, eb.ArgumentList.Arguments, line, eb));
@@ -857,11 +862,19 @@ internal sealed class CSharpLowering
 
     /// <summary>member node; symNode is the syntax the symbol binds to (the
     /// access itself, or the ?. member binding).</summary>
-    void Member(ExpressionSyntax obj, string name, int line, ExpressionSyntax symNode)
+    /// <summary>Optional "targs": the type arguments of a generic name, as written.</summary>
+    void TypeArgs(SimpleNameSyntax? n)
+    {
+        if (n is GenericNameSyntax g && g.TypeArgumentList.Arguments.Count > 0)
+            w.StrArray("targs", g.TypeArgumentList.Arguments.Select(a => a.ToString()));
+    }
+
+    void Member(ExpressionSyntax obj, string name, int line, ExpressionSyntax symNode, SimpleNameSyntax? nameNode = null)
     {
         w.Begin("member", line);
         ExprProp("obj", obj);
         w.Str("name", name);
+        TypeArgs(nameNode);
         w.OptStr("sym", sem?.MemberSym(symNode));
         w.End();
     }

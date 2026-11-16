@@ -98,6 +98,9 @@ failure), 2 usage.
   `byval`, `paramarray`, `optional`),
   `attributes`, `handles` (VB `Handles`), `implements` (VB method-level `Implements` targets, or the C# explicit interface
   implementation, as `IFoo.Bar`), `body`, `line`, `end_line`.
+- Generic names: a `name` or `member` Expr built from a generic name (`MapHub<ChatHub>`,
+  `UseStartup<Startup>`) also carries `targs`, the type arguments as written
+  (`["ChatHub"]`); `name` / `id` stay the bare identifier. The key is absent for non-generic names.
 - Synthetic top-level type: a C# file with top-level statements gets one extra type
   written before the declared ones: `Program` (namespace empty, modifiers `static`,
   `partial`) with a single static method `<Main>$` (`void`, no params) whose `body` is

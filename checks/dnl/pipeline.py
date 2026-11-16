@@ -6,14 +6,19 @@ Entry points per netcore project: the top-level `<Main>$`; else a `Startup` clas
 Calls to solution methods are followed inline at the call site. Lambdas passed as
 arguments are not separate calls -- rules read them from `PipeCall.node`.
 
-The IR drops generic arguments, so `UseStartup<T>()` cannot name T: the class named
-`Startup` is used, else a type that declares both `ConfigureServices` and `Configure`.
+`UseStartup<T>()` names the startup class through the IR's `targs`; without it the class
+named `Startup` is used, else a type that declares both `ConfigureServices` and `Configure`
+(a note is recorded on `Pipeline.notes` when that leaves several candidates).
+
+Environment conditions: every enclosing `if` becomes a guard (predicate + branch taken);
+`PipeCall.runs_in(env)` evaluates them three-valued, so an unparseable environment check
+gives None ("cannot tell"), never a silent "always".
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .ir import MethodIR, TypeIR, call_chain, call_name, is_top_level, literal_str, receiver_text
+from .ir import MethodIR, TypeIR, call_chain, call_name, is_top_level, literal_str, receiver_text, walk
 from .project import Project, ProjectModel
 
 # ASP.NET Core / Extensions method names treated as resolved when the helper gave no `sym`
@@ -54,6 +59,22 @@ class PipeCall:
     env: str | None      # None = always; "Development"; "!Development"; other env names as written
     resolved: bool       # sym present, or name in _FRAMEWORK_CALLS, or a followed solution method
     order: int           # execution order within the pipeline
+    # Environment conditions this call sits under: (predicate, branch taken) pairs, outermost first.
+    guards: tuple = ()
+
+    def runs_in(self, env_name: str) -> bool | None:
+        """True when the call runs in that environment, False when it does not, None when
+        the enclosing conditions cannot tell (an environment check that could not be parsed)."""
+        res: bool | None = True
+        for pred, taken in self.guards:
+            v = _eval(pred, env_name.lower())
+            if v is not None and not taken:
+                v = not v
+            if v is False:
+                return False
+            if v is None:
+                res = None
+        return res
 
 
 @dataclass
@@ -62,64 +83,134 @@ class Pipeline:
     style: str           # "minimal" | "startup" | "none"
     calls: list[PipeCall] = field(default_factory=list)
     target_framework: str | None = None
+    notes: list[str] = field(default_factory=list)
 
     def named(self, *names: str, kinds: tuple[str, ...] = (), include_dev: bool = False) -> list[PipeCall]:
-        """Calls in execution order, filtered by method name and kind. Calls that only
-        run in Development are left out unless include_dev."""
+        """Calls in execution order, filtered by method name and kind. Unless include_dev,
+        only calls that certainly run in Production are returned (see uncertain())."""
         want = set(names)
         return [c for c in self.calls
                 if (not want or c.name in want) and (not kinds or c.kind in kinds)
-                and (include_dev or c.env != "Development")]
+                and (include_dev or c.runs_in("Production") is True)]
+
+    def uncertain(self) -> list[PipeCall]:
+        """Calls under an environment condition that could not be parsed."""
+        return [c for c in self.calls if c.runs_in("Production") is None]
 
     def unresolved(self) -> list[PipeCall]:
         return [c for c in self.calls if not c.resolved]
 
 
 # -- environment conditions -------------------------------------------------
+# A predicate is ("env", lowered name) | ("not", p) | ("and", p, q) | ("or", p, q) | ("unknown",).
 
-def _negate(env: str | None) -> str | None:
-    if env is None:
+_UNKNOWN = ("unknown",)
+_ENV_MEMBERS = {"development", "staging", "production"}
+
+
+def _eval(p, env: str) -> bool | None:
+    k = p[0]
+    if k == "env":
+        return p[1] == env
+    if k == "not":
+        v = _eval(p[1], env)
+        return None if v is None else not v
+    if k in ("and", "or"):
+        vs = [_eval(x, env) for x in p[1:]]
+        stop = k == "or"
+        if stop in vs:
+            return stop
+        return None if None in vs else not stop
+    return None
+
+
+def _env_name(e) -> str | None:
+    """An environment name: a string literal or `Environments.X` (any qualifier), lowered."""
+    lit = literal_str(e)
+    if lit:
+        return lit.lower()
+    if isinstance(e, dict) and e.get("k") == "member" and (e.get("name") or "").lower() in _ENV_MEMBERS:
+        return e["name"].lower()
+    return None
+
+
+def _is_env_name_expr(e) -> bool:
+    return isinstance(e, dict) and e.get("k") == "member" and e.get("name") == "EnvironmentName"
+
+
+def _mentions_env(e, locs: dict) -> bool:
+    for n in walk(e):
+        k = n.get("k")
+        if k == "call" and (call_name(n) or "").lower() in ("isdevelopment", "isproduction", "isstaging", "isenvironment"):
+            return True
+        if k == "member" and n.get("name") in ("EnvironmentName", "Environment"):
+            return True
+        if k == "name" and n.get("id") in locs:
+            return True
+    return False
+
+
+def _pred(e, locs: dict):
+    """Predicate of an environment condition; None when it mentions no environment at all.
+    Operands of a mixed condition that are not environment checks count as unknown."""
+    if not isinstance(e, dict) or not _mentions_env(e, locs):
         return None
-    return env[1:] if env.startswith("!") else "!" + env
-
-
-def _cond_env(cond) -> tuple[str | None, str | None]:
-    """(env when cond is true, env when false) for an `if` condition; None = unknown."""
-    if not isinstance(cond, dict):
-        return None, None
-    k = cond.get("k")
+    k = e.get("k")
+    if k == "name":
+        return locs.get(e.get("id"), _UNKNOWN)
+    if k == "unary" and e.get("op") == "!":
+        return ("not", _pred(e.get("e"), locs) or _UNKNOWN)
     if k == "call":
-        nm = (call_name(cond) or "").lower()
+        nm = (call_name(e) or "").lower()
         if nm in _ENV_CALLS:
-            e = _ENV_CALLS[nm]
-            return e, _negate(e)
+            return ("env", _ENV_CALLS[nm].lower())
+        args = e.get("args") or []
         if nm == "isenvironment":
-            args = cond.get("args") or []
-            lit = literal_str(args[0]) if args else None
-            if lit:
-                return lit, _negate(lit)
-        return None, None
-    if k == "unary" and cond.get("op") == "!":
-        t, f = _cond_env(cond.get("e"))
-        return f, t
+            n = _env_name(args[0]) if args else None
+            return ("env", n) if n else _UNKNOWN
+        if nm == "equals":
+            # string.Equals(x.EnvironmentName, "X"[, cmp]) or x.EnvironmentName.Equals("X"[, cmp])
+            fn = e.get("fn") or {}
+            ops = list(args[:2])
+            if fn.get("k") == "member" and _is_env_name_expr(fn.get("obj")):
+                ops = [fn["obj"]] + list(args[:1])
+            if len(ops) == 2:
+                for a, b in ((ops[0], ops[1]), (ops[1], ops[0])):
+                    n = _env_name(b)
+                    if _is_env_name_expr(a) and n:
+                        return ("env", n)
+        return _UNKNOWN
     if k == "bin":
-        op = cond.get("op")
-        if op in ("&&", "and", "andalso"):
-            lt, _ = _cond_env(cond.get("l"))
-            rt, _ = _cond_env(cond.get("r"))
-            return lt or rt, None
-        if op in ("||", "or", "orelse"):
-            _, lf = _cond_env(cond.get("l"))
-            _, rf = _cond_env(cond.get("r"))
-            return None, lf or rf
+        op = e.get("op")
+        if op in ("&&", "and", "andalso", "||", "or", "orelse"):
+            kind = "and" if op in ("&&", "and", "andalso") else "or"
+            return (kind, _pred(e.get("l"), locs) or _UNKNOWN, _pred(e.get("r"), locs) or _UNKNOWN)
         if op in ("==", "!="):
-            # `x.EnvironmentName == "Name"`
-            for a, b in ((cond.get("l"), cond.get("r")), (cond.get("r"), cond.get("l"))):
-                if isinstance(a, dict) and a.get("k") == "member" and a.get("name") == "EnvironmentName":
-                    lit = literal_str(b)
-                    if lit:
-                        return (lit, _negate(lit)) if op == "==" else (_negate(lit), lit)
-    return None, None
+            for a, b in ((e.get("l"), e.get("r")), (e.get("r"), e.get("l"))):
+                n = _env_name(b)
+                if _is_env_name_expr(a) and n:
+                    p = ("env", n)
+                    return p if op == "==" else ("not", p)
+    return _UNKNOWN
+
+
+def _show(p) -> str:
+    """Human-readable form of a predicate for PipeCall.env."""
+    k = p[0]
+    if k == "env":
+        return next((v for v in _ENV_CALLS.values() if v.lower() == p[1]), p[1])
+    if k == "not":
+        return "!" + _show(p[1]) if p[1][0] == "env" else f"!({_show(p[1])})"
+    if k in ("and", "or"):
+        return "(" + (" && " if k == "and" else " || ").join(_show(x) for x in p[1:]) + ")"
+    return "?"
+
+
+def _display_env(guards: tuple) -> str | None:
+    """`Development`, `!Development`, or the guards joined with ` & ` (None = unconditional)."""
+    if not guards:
+        return None
+    return " & ".join(_show(p if taken else ("not", p)) for p, taken in guards)
 
 
 # -- kinds ------------------------------------------------------------------
@@ -183,6 +274,10 @@ def _call_kind(call: dict, root, calls: list[dict], scope: dict) -> str:
         return k
     nm = call_name(call) or ""
     if not call.get("sym") and nm.startswith("Map"):
+        return "endpoints"
+    # Links after an endpoint link (`MapGroup(..).RequireAuthorization().MapGet(..)`) stay endpoint calls.
+    idx = calls.index(call)
+    if idx and _call_kind(calls[idx - 1], root, calls, scope) == "endpoints":
         return "endpoints"
     # Chain root: `x.Services` / `services` / a known local or parameter.
     text = receiver_text(root) if root is not None else ""
@@ -260,22 +355,39 @@ def _scope_for(m: MethodIR, recv_kind: str | None, arg_kinds: list[str | None], 
 
 # -- walking ----------------------------------------------------------------
 
-def _stmts(ctx: _Ctx, stmts, scope: dict, env: str | None, file: str, stack: tuple, depth: int) -> None:
+_ENV_LOCAL = "$env:"  # scope key prefix; `$` cannot start a C# identifier
+
+
+def _env_locals(scope: dict) -> dict:
+    return {k[len(_ENV_LOCAL):]: v for k, v in scope.items() if k.startswith(_ENV_LOCAL)}
+
+
+def _set_env_local(scope: dict, name: str, init) -> None:
+    """Remember `var dev = env.IsDevelopment();` so a later `if (dev)` is an environment guard."""
+    pred = _pred(init, _env_locals(scope)) if isinstance(init, dict) else None
+    if pred:
+        scope[_ENV_LOCAL + name] = pred
+    else:
+        scope.pop(_ENV_LOCAL + name, None)
+
+
+def _stmts(ctx: _Ctx, stmts, scope: dict, guards: tuple, file: str, stack: tuple, depth: int) -> None:
     for s in stmts or []:
-        _stmt(ctx, s, scope, env, file, stack, depth)
+        _stmt(ctx, s, scope, guards, file, stack, depth)
 
 
-def _stmt(ctx: _Ctx, s, scope: dict, env: str | None, file: str, stack: tuple, depth: int) -> None:
+def _stmt(ctx: _Ctx, s, scope: dict, guards: tuple, file: str, stack: tuple, depth: int) -> None:
     if not isinstance(s, dict):
         return
     k = s.get("k")
     if k == "expr":
-        _expr(ctx, s.get("expr"), scope, env, file, stack, depth)
+        _expr(ctx, s.get("expr"), scope, guards, file, stack, depth)
     elif k == "local":
         init = s.get("init")
-        kind = _expr(ctx, init, scope, env, file, stack, depth)
+        kind = _expr(ctx, init, scope, guards, file, stack, depth)
         nm = s.get("name")
         if nm:
+            _set_env_local(scope, nm, init)
             if kind == "other":
                 kind = None
             kind = kind or _type_kind(s.get("type_full")) or _type_kind(s.get("type"))
@@ -286,32 +398,35 @@ def _stmt(ctx: _Ctx, s, scope: dict, env: str | None, file: str, stack: tuple, d
             else:
                 scope.pop(nm, None)
     elif k == "return":
-        _expr(ctx, s.get("value"), scope, env, file, stack, depth)
+        _expr(ctx, s.get("value"), scope, guards, file, stack, depth)
     elif k == "if":
-        t_env, f_env = _cond_env(s.get("cond"))
-        _stmts(ctx, s.get("then"), scope, t_env or env, file, stack, depth)
-        _stmts(ctx, s.get("else"), scope, f_env or env, file, stack, depth)
+        pred = _pred(s.get("cond"), _env_locals(scope))
+        # Nested conditions compose: every enclosing guard stays in force.
+        _stmts(ctx, s.get("then"), scope, guards + ((pred, True),) if pred else guards, file, stack, depth)
+        _stmts(ctx, s.get("else"), scope, guards + ((pred, False),) if pred else guards, file, stack, depth)
     elif k == "loop":
-        _stmts(ctx, s.get("body"), scope, env, file, stack, depth)
+        _stmts(ctx, s.get("body"), scope, guards, file, stack, depth)
     elif k == "using":
-        _stmts(ctx, s.get("resource"), scope, env, file, stack, depth)
-        _stmts(ctx, s.get("body"), scope, env, file, stack, depth)
+        _stmts(ctx, s.get("resource"), scope, guards, file, stack, depth)
+        _stmts(ctx, s.get("body"), scope, guards, file, stack, depth)
     elif k == "try":
-        _stmts(ctx, s.get("body"), scope, env, file, stack, depth)
+        _stmts(ctx, s.get("body"), scope, guards, file, stack, depth)
         for c in s.get("catches") or []:
-            _stmts(ctx, c.get("body"), scope, env, file, stack, depth)
-        _stmts(ctx, s.get("finally"), scope, env, file, stack, depth)
+            _stmts(ctx, c.get("body"), scope, guards, file, stack, depth)
+        _stmts(ctx, s.get("finally"), scope, guards, file, stack, depth)
 
 
-def _expr(ctx: _Ctx, e, scope: dict, env: str | None, file: str, stack: tuple, depth: int) -> str | None:
+def _expr(ctx: _Ctx, e, scope: dict, guards: tuple, file: str, stack: tuple, depth: int) -> str | None:
     """Record the calls of one expression statement or initializer; returns the builder
     kind of its value (for `var app = builder.Build()`)."""
     if not isinstance(e, dict):
         return None
     k = e.get("k")
     if k == "assign":
-        kind = _expr(ctx, e.get("value"), scope, env, file, stack, depth)
+        kind = _expr(ctx, e.get("value"), scope, guards, file, stack, depth)
         tgt = e.get("target")
+        if isinstance(tgt, dict) and tgt.get("k") == "name" and e.get("op") == "=":
+            _set_env_local(scope, tgt.get("id"), e.get("value"))
         if kind and isinstance(tgt, dict) and tgt.get("k") == "name":
             scope[tgt.get("id")] = kind
         return kind
@@ -330,15 +445,15 @@ def _expr(ctx: _Ctx, e, scope: dict, env: str | None, file: str, stack: tuple, d
         if target is not None and target[1] in stack:
             continue  # cycle guard: re-entering a method being followed adds no new fact
         ctx.calls.append(PipeCall(
-            name=nm, kind=kind, node=call, chain=calls, file=file, line=call.get("line", 0), env=env,
+            name=nm, kind=kind, node=call, chain=calls, file=file, line=call.get("line", 0), env=_display_env(guards),
             resolved=bool(call.get("sym")) or nm in _FRAMEWORK_CALLS or target is not None,
-            order=ctx.order))
+            order=ctx.order, guards=guards))
         ctx.order += 1
         if target is not None and depth < _MAX_DEPTH:
             t, m = target
             ext = _is_ext(m) and _is_member_call(call)
             arg_kinds = [_expr_kind(a, scope) for a in call.get("args") or []]
-            _stmts(ctx, m.body, _scope_for(m, recv_kind, arg_kinds, ext), env, t.file, stack + (m,), depth + 1)
+            _stmts(ctx, m.body, _scope_for(m, recv_kind, arg_kinds, ext), guards, t.file, stack + (m,), depth + 1)
         recv_kind = kind
     # A `Build()` result is the app, whatever the builder was called.
     if calls and call_name(calls[-1]) == "Build" and kind == "other":
@@ -348,17 +463,39 @@ def _expr(ctx: _Ctx, e, scope: dict, env: str | None, file: str, stack: tuple, d
 
 # -- entry points -----------------------------------------------------------
 
-def _entry_methods(types: list[TypeIR]) -> tuple[str, list[tuple[TypeIR, MethodIR]]]:
+def _simple_type(t: str) -> str:
+    return t.split("<")[0].strip().split(".")[-1]
+
+
+def _startup_targets(types: list[TypeIR]) -> list[str]:
+    """Simple type names from every `UseStartup<T>()` call in the project."""
+    out: list[str] = []
     for t in types:
         for m in t.methods:
-            if is_top_level(m):
-                return "minimal", [(t, m)]
-    startup = [t for t in types if t.name == "Startup"]
+            for n in walk(m.body):
+                if n.get("k") == "call" and call_name(n) == "UseStartup":
+                    fn = n.get("fn") or {}
+                    out += [_simple_type(a) for a in (fn.get("targs") or [])[:1]]
+    return out
+
+
+def _entry_methods(types: list[TypeIR], notes: list[str]) -> tuple[str, list[tuple[TypeIR, MethodIR]]]:
+    wanted = _startup_targets(types)
+    startup = [t for t in types if t.name.split(".")[-1] in wanted] if wanted else []
     if not startup:
-        # `UseStartup<T>()`: T is not in the IR; take a type that looks like a startup class.
-        startup = [t for t in types if {"ConfigureServices", "Configure"} <= {m.name for m in t.methods}]
-        first = sorted({t.name for t in startup})[:1]
-        startup = [t for t in startup if t.name in first]
+        for t in types:
+            for m in t.methods:
+                if is_top_level(m):
+                    return "minimal", [(t, m)]
+        startup = [t for t in types if t.name == "Startup"]
+        if not startup:
+            # No usable `UseStartup<T>()`: take the types that look like startup classes.
+            startup = [t for t in types if {"ConfigureServices", "Configure"} <= {m.name for m in t.methods}]
+            names = sorted({t.name for t in startup})
+            if len(names) > 1:
+                notes.append("several startup-like classes (" + ", ".join(names) + ") and no UseStartup<T>() "
+                             f"to choose between them; used {names[0]}")
+                startup = [t for t in startup if t.name == names[0]]
     out = [(t, m) for want in ("ConfigureServices", "Configure") for t in startup
            for m in t.methods if m.name == want]
     if out:
@@ -383,11 +520,12 @@ def _build(model: ProjectModel, proj: Project | None) -> Pipeline:
             types.append(t)
             for m in t.methods:
                 ctx.methods.setdefault(m.name, []).append((t, m))
-    style, entries = _entry_methods(types)
+    notes: list[str] = []
+    style, entries = _entry_methods(types, notes)
     for t, m in entries:
         scope = {p.name: k for p in m.params if (k := _type_kind(p.type))}
-        _stmts(ctx, m.body, scope, None, t.file, (m,), 1)
-    return Pipeline(proj, style, ctx.calls, tfm)
+        _stmts(ctx, m.body, scope, (), t.file, (m,), 1)
+    return Pipeline(proj, style, ctx.calls, tfm, notes)
 
 
 def pipeline_for(model: ProjectModel, proj: Project | None) -> Pipeline:

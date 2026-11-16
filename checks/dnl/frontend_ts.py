@@ -171,6 +171,15 @@ class _Lowering:
     def name_node(self, ident: str, line: int) -> dict:
         return {"k": "name", "line": line, "id": ident}
 
+    def with_targs(self, node: dict, name_node: Node | None) -> dict:
+        """Add the optional "targs" (type argument texts) of a generic name to a name / member node."""
+        if name_node is not None and name_node.type == "generic_name":
+            tal = next((c for c in name_node.children if c.type == "type_argument_list"), None)
+            targs = [self.text(c) for c in (tal.named_children if tal is not None else []) if c.type != "comment"]
+            if targs:
+                node["targs"] = targs
+        return node
+
     def lit(self, v, t: str, line: int) -> dict:
         return {"k": "lit", "line": line, "v": v, "t": t}
 
@@ -777,7 +786,7 @@ class _Lowering:
                 return self.alias_chain(self.aliases[ident], line)
             return self.name_node(ident, line)
         if t == "generic_name":
-            return self.name_node(self.simple_name(e), line)
+            return self.with_targs(self.name_node(self.simple_name(e), line), e)
         if t == "predefined_type":
             return self.name_node(self.text(e), line)
         if t in ("this_expression", "this"):
@@ -785,9 +794,9 @@ class _Lowering:
         if t in ("base_expression", "base"):
             return self.name_node("base", line)
         if t == "qualified_name":
-            return self.member(f("qualifier"), self.simple_name(f("name")), line)
+            return self.with_targs(self.member(f("qualifier"), self.simple_name(f("name")), line), f("name"))
         if t == "member_access_expression":
-            return self.member(f("expression"), self.simple_name(f("name")), line)
+            return self.with_targs(self.member(f("expression"), self.simple_name(f("name")), line), f("name"))
         if t == "conditional_access_expression":
             cond = f("condition")
             binding = next((c for c in reversed(e.children) if c != cond and self.is_expr(c)), None)
@@ -801,7 +810,7 @@ class _Lowering:
         if t == "member_binding_expression" and self.receivers:
             recv = self.receivers.pop()
             try:
-                return self.member(recv, self.simple_name(f("name")), line)
+                return self.with_targs(self.member(recv, self.simple_name(f("name")), line), f("name"))
             finally:
                 self.receivers.append(recv)
         if t == "element_binding_expression" and self.receivers:

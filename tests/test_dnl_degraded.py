@@ -980,3 +980,15 @@ def test_variant_merge_keeps_same_signature_member_with_different_body(tmp_path)
 def test_brace_count_ignores_braces_in_strings_with_letter_n(tmp_path):
     assert frontend_ts._NOISE.sub(b"", b'x = "need {"; y = \'{\';') == b"x = ; y = ;"
     assert frontend_ts._NOISE.sub(b"", b'x = "a\\"{";') == b"x = ;"
+
+
+def test_generic_names_carry_targs(tmp_path):
+    rec = lower(tmp_path, 'var app = b.Build();\napp.MapHub<ChatHub>("/c");\nMapOf<A.B, int>();\n'
+                          'var x = Outer.Make<Dict<string, int>>();\n')
+    body = rec["types"][0]["methods"][0]["body"]
+    fn = body[1]["expr"]["fn"]
+    assert (fn["k"], fn["name"], fn["targs"]) == ("member", "MapHub", ["ChatHub"])
+    bare = body[2]["expr"]["fn"]
+    assert (bare["k"], bare["id"], bare["targs"]) == ("name", "MapOf", ["A.B", "int"])
+    assert body[3]["init"]["fn"]["targs"] == ["Dict<string, int>"]
+    assert "targs" not in body[0]["init"]["fn"]

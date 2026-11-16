@@ -615,3 +615,22 @@ def test_is_top_level_helper():
     from checks.dnl.ir import MethodIR, TOP_LEVEL_MAIN, is_top_level
     assert TOP_LEVEL_MAIN == "<Main>$"
     assert is_top_level(MethodIR(name="<Main>$")) and not is_top_level(MethodIR(name="Main"))
+
+
+# -- generic type arguments ("targs") ------------------------------------------
+
+TARGS_SRC = ('var app = WebApplication.CreateBuilder(args).Build();\n'
+             'app.MapHub<ChatHub>("/c");\nMapOf<A.B, int>();\nvar x = Outer.Make<Dict<string, int>>();\n'
+             'static void MapOf<T, U>() { }\npublic class ChatHub { }\n')
+
+
+def test_generic_names_carry_targs(helper, tmp_path):
+    ir = parse_profile(helper, tmp_path, TARGS_SRC, refs="netcore", global_usings=CORE_USINGS)
+    body = ir["types"][0]["methods"][0]["body"]
+    fn = body[1]["expr"]["fn"]
+    assert (fn["k"], fn["name"], fn["targs"]) == ("member", "MapHub", ["ChatHub"])
+    bare = body[2]["expr"]["fn"]
+    assert (bare["k"], bare["id"], bare["targs"]) == ("name", "MapOf", ["A.B", "int"])
+    assert body[3]["init"]["fn"]["targs"] == ["Dict<string, int>"]
+    # Non-generic names carry no key.
+    assert "targs" not in body[0]["init"]["fn"]

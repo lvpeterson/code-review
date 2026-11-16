@@ -120,3 +120,80 @@ def test_cached_on_model(roslyn_helper):
     proj = model.projects[0]
     assert pipeline_for(model, proj) is pipeline_for(model, proj)
     assert "pipelines" in model.cache
+
+
+# -- fix round 1 ------------------------------------------------------------
+
+def _runs(p, name, *envs):
+    c = _by(p, name)
+    return tuple(c.runs_in(e) for e in envs)
+
+
+def test_chain_links_after_map_stay_endpoints_in_both_modes(roslyn_helper, monkeypatch):
+    full = _pipe("envs")
+    project._CACHE.clear()
+    monkeypatch.setattr(helper, "find_helper", lambda *a: None)
+    monkeypatch.setattr(helper, "sdk_available", lambda: False)
+    deg = _pipe("envs", True)
+    for p in (full, deg):
+        kinds = {c.name: c.kind for c in p.calls}
+        assert (kinds["MapGroup"], kinds["RequireAuthorization"], kinds["MapGet"], kinds["AllowAnonymous"]) == \
+            ("endpoints",) * 4
+    assert [c.kind for c in deg.calls] == [c.kind for c in full.calls]
+
+
+def test_env_guards_compose_and_are_three_valued(roslyn_helper):
+    p = _pipe("envs")
+    dsp, prod = "Development", "Production"
+    assert _runs(p, "UseDeveloperExceptionPage", dsp, "Staging", prod) == (True, False, False)
+    # else-if chain: the outer tags are kept, not dropped.
+    assert _runs(p, "UseHsts", dsp, "Staging", prod) == (False, True, False)
+    assert _runs(p, "UseHttpsRedirection", dsp, "Staging", prod) == (False, False, True)
+    assert _runs(p, "UseCors", dsp, "Staging", prod, "QA") == (False, False, False, True)
+    # nested ifs, case-insensitive IsEnvironment("staging")
+    assert _runs(p, "UseSession", dsp, "Staging", prod) == (False, True, False)
+    assert _runs(p, "UseStaticFiles", dsp, "Staging", prod) == (False, False, True)
+    # ||
+    assert _runs(p, "UseRateLimiter", dsp, "Staging", prod) == (True, True, False)
+    # && with a non-environment operand cannot be decided in Production
+    assert _by(p, "UseAntiforgery").runs_in(prod) is None
+    assert _by(p, "UseAntiforgery").runs_in(dsp) is False
+    # bool local, EnvironmentName == Environments.X
+    assert _runs(p, "UseExceptionHandler", dsp, prod) == (True, False)
+    assert _runs(p, "UseAuthentication", "Staging", prod) == (True, False)
+    # unparseable environment condition
+    assert _by(p, "UseAuthorization").runs_in(prod) is None
+    assert _by(p, "UseHttpsRedirection").env == "!Development & !Staging & Production"
+    assert _by(p, "UseDeveloperExceptionPage").env == "Development"
+    assert _by(p, "RequireAuthorization").runs_in(prod) is True and _by(p, "RequireAuthorization").env is None
+
+
+def test_named_and_uncertain(roslyn_helper):
+    p = _pipe("envs")
+    prod_names = {c.name for c in p.named()}
+    assert {"UseHttpsRedirection", "UseStaticFiles", "MapGet"} <= prod_names
+    # Staging-only, Development-only and undecidable calls are not in the Production view.
+    assert not prod_names & {"UseHsts", "UseSession", "UseDeveloperExceptionPage", "UseAntiforgery", "UseAuthorization"}
+    assert {c.name for c in p.named(include_dev=True)} == set(_names(p))
+    assert {c.name for c in p.uncertain()} == {"UseAntiforgery", "UseAuthorization"}
+
+
+def test_startup_class_from_use_startup_targs(roslyn_helper):
+    p = _pipe("startup_generic")
+    assert p.style == "startup"
+    assert _names(p) == ["AddRazorPages", "UseRouting"]
+    assert p.notes == []
+
+
+def test_startup_class_from_use_startup_targs_degraded(roslyn_helper, monkeypatch):
+    monkeypatch.setattr(helper, "find_helper", lambda *a: None)
+    monkeypatch.setattr(helper, "sdk_available", lambda: False)
+    p = _pipe("startup_generic", True)
+    assert _names(p) == ["AddRazorPages", "UseRouting"]
+
+
+def test_ambiguous_startup_fallback_records_note(roslyn_helper):
+    p = _pipe("startup_ambiguous")
+    assert p.style == "startup"
+    assert len(p.notes) == 1 and "AppStartup" in p.notes[0] and "LegacyStartup" in p.notes[0]
+    assert _names(p) == ["AddRazorPages", "UseRouting"]
