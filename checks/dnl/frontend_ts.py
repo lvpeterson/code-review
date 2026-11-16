@@ -693,6 +693,9 @@ class _Lowering:
             if params:
                 lam["params"] = params
                 lam["param_info"] = self.lambda_param_info(f("parameters"))
+            attrs = self.attributes(s)
+            if attrs:
+                lam["attributes"] = attrs
             lam["end_line"] = self.end_line(s)
             lam["body"] = self.lambda_body(body_node, s)
             ty = f("type") or f("returns")
@@ -1080,6 +1083,9 @@ class _Lowering:
         if names:
             node["params"] = names
             node["param_info"] = self.lambda_param_info(plist)
+        attrs = self.attributes(e)
+        if attrs:
+            node["attributes"] = attrs
         node["end_line"] = self.end_line(e)
         body = f("body") or next((c for c in e.children if c.type == "block"), None)
         node["body"] = self.lambda_body(body, e)

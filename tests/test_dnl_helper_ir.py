@@ -634,3 +634,16 @@ def test_generic_names_carry_targs(helper, tmp_path):
     assert body[3]["init"]["fn"]["targs"] == ["Dict<string, int>"]
     # Non-generic names carry no key.
     assert "targs" not in body[0]["init"]["fn"]
+
+
+def test_lambda_and_local_function_attributes(helper, tmp_path):
+    src = ('app.MapGet("/a", [Authorize] () => 1);\n'
+           'app.MapGet("/b", [AllowAnonymous] static (int id) => id);\n'
+           '[Authorize(Roles = "x")] static int Loc(int p) => p;\n'
+           'app.MapGet("/c", () => 2);\n')
+    ir = parse_profile(helper, tmp_path, src, refs="netcore", global_usings=CORE_USINGS)
+    lams = [n for n in walk_nodes(ir) if n.get("k") == "lambda"]
+    assert [[a["name"] for a in l.get("attributes", [])] for l in lams] == [
+        ["Authorize"], ["AllowAnonymous"], ["Authorize"], []]
+    assert "attributes" not in lams[3]
+    assert lams[2]["attributes"][0]["named"]["Roles"]["v"] == "x"

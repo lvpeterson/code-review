@@ -116,10 +116,11 @@ failure), 2 usage.
   `if`, `loop`, `try`, `using`, `with`, `other {text}`.
 - Expr `k`: `lit`, `name`, `member`, `call`, `new`, `bin`, `interp`, `cond`,
   `index` (C# only), `cast`, `lambda`, `unary {op, e}`, `unknown {text}`.
-  `lambda {body, params?, param_info?, end_line}`: `body` is an Expr or a Stmt list,
+  `lambda {body, params?, param_info?, attributes?, end_line}`: `body` is an Expr or a Stmt list,
   `params` the lowered parameter names and `param_info` one `{name, type, attributes,
   modifiers}` per parameter (`type` null when implicit, `modifiers` lowercased, possibly
-  empty); both omitted when there are no parameters. `end_line` is the lambda's last line
+  empty); both omitted when there are no parameters. `attributes` is the lambda's (or local
+  function's) own attribute list, `[Authorize] () => ..`, omitted when there is none. `end_line` is the lambda's last line
   and is always present. A local function lowers as a `local` whose `init` is a lambda.
   Modern C# shapes (all syntactic, so identical with or without a reference profile):
   a collection expression `[a, ..b]` is an untyped `new` (`type` null, no `args`) whose

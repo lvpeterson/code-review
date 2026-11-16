@@ -553,7 +553,7 @@ internal sealed class CSharpLowering
                 w.Str("type", lf.ReturnType.ToString());
                 j.WritePropertyName("init");
                 w.Begin("lambda", line);
-                LambdaParams(lf.ParameterList.Parameters, lf);
+                LambdaParams(lf.ParameterList.Parameters, lf, lf.AttributeLists);
                 j.WritePropertyName("body");
                 LambdaBody(lf.Body, lf.ExpressionBody?.Expression, lf);
                 w.End();
@@ -839,7 +839,12 @@ internal sealed class CSharpLowering
                     ParenthesizedLambdaExpressionSyntax pl => pl.ParameterList.Parameters,
                     AnonymousMethodExpressionSyntax am when am.ParameterList is not null => am.ParameterList.Parameters,
                     _ => [],
-                }, fn);
+                }, fn, fn switch
+                {
+                    SimpleLambdaExpressionSyntax sl => sl.AttributeLists,
+                    ParenthesizedLambdaExpressionSyntax pl => pl.AttributeLists,
+                    _ => default,
+                });
                 j.WritePropertyName("body");
                 LambdaBody(fn.Block, fn.ExpressionBody, fn);
                 w.End();
@@ -991,9 +996,10 @@ internal sealed class CSharpLowering
     };
 
     /// <summary>Optional `params` key of a lambda: its parameter names, omitted when it has none,
-    /// plus "param_info" (type, attributes, modifiers per parameter) and the
+    /// plus "param_info" (type, attributes, modifiers per parameter), the lambda's own optional
+    /// "attributes" (`[Authorize] () => ..`, omitted when there are none) and the
     /// lambda's "end_line".</summary>
-    void LambdaParams(IEnumerable<ParameterSyntax> ps, SyntaxNode node)
+    void LambdaParams(IEnumerable<ParameterSyntax> ps, SyntaxNode node, SyntaxList<AttributeListSyntax> attrs)
     {
         var list = ps.ToList();
         if (list.Count > 0)
@@ -1012,6 +1018,7 @@ internal sealed class CSharpLowering
             }
             j.WriteEndArray();
         }
+        if (attrs.Count > 0) Attributes("attributes", attrs);
         w.J.WriteNumber("end_line", EndLine(node));
     }
 

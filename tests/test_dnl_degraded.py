@@ -992,3 +992,15 @@ def test_generic_names_carry_targs(tmp_path):
     assert (bare["k"], bare["id"], bare["targs"]) == ("name", "MapOf", ["A.B", "int"])
     assert body[3]["init"]["fn"]["targs"] == ["Dict<string, int>"]
     assert "targs" not in body[0]["init"]["fn"]
+
+
+def test_lambda_and_local_function_attributes(tmp_path):
+    src = ('app.MapGet("/a", [Authorize] () => 1);\n'
+           'app.MapGet("/b", [AllowAnonymous] static (int id) => id);\n'
+           '[Authorize(Roles = "x")] static int Loc(int p) => p;\n'
+           'app.MapGet("/c", () => 2);\n')
+    lams = [n for n in walk_nodes(lower(tmp_path, src)) if n.get("k") == "lambda"]
+    assert [[a["name"] for a in l.get("attributes", [])] for l in lams] == [
+        ["Authorize"], ["AllowAnonymous"], ["Authorize"], []]
+    assert "attributes" not in lams[3]
+    assert lams[2]["attributes"][0]["named"]["Roles"]["v"] == "x"
