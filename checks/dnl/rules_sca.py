@@ -19,7 +19,7 @@ import re
 from functools import lru_cache
 from pathlib import Path
 
-from checks.dnl.files import iter_dnl_files, read_source
+from checks.dnl.files import read_source
 from checks.dnl.findings import dnl_finding
 from checks.dnl.project import ProjectModel
 from core.models import Finding
@@ -209,7 +209,7 @@ def _check_packages(model: ProjectModel, notes: list[str]) -> tuple[list[Finding
     """SCA-001 over packages.config; also returns the package ids declared per directory."""
     findings: list[Finding] = []
     declared: dict[Path, set[str]] = {}
-    for path in iter_dnl_files(model.root, (".config",)):
+    for path in model.iter_files((".config",)):
         if path.name.lower() != "packages.config":
             continue
         text = _safe_read(path, notes)
@@ -294,7 +294,7 @@ _LOOPBACK = re.compile(r"^http://(localhost|127\.0\.0\.1|\[::1\])([:/]|$)", re.I
 
 def _check_nuget_config(model: ProjectModel, notes: list[str]) -> list[Finding]:
     findings: list[Finding] = []
-    for path in iter_dnl_files(model.root, (".config",)):
+    for path in model.iter_files((".config",)):
         if path.name.lower() != "nuget.config":
             continue
         text = _blank_comments(_safe_read(path, notes))

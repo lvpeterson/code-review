@@ -158,6 +158,13 @@ def test_views_split_by_owner(roslyn_helper):
     full = project.get_model(FX)
     assert core.parent is full and old.parent is full and full.view("dotnet") is core
     assert core.notes is full.notes and core.cache is not full.cache
+    # Projects and files are filtered by owner, not just the types.
+    assert {p.name for p in core.projects} >= {"Modern", "Modern.Tests"}
+    assert not {p.name for p in core.projects} & {"Legacy", "Framework"}
+    assert {p.name for p in old.projects} >= {"Legacy", "Framework"}
+    assert not {p.name for p in old.projects} & {"Modern", "Modern.Tests"}
+    assert all(not f.startswith("Modern/") for f in old.files) and old.files
+    assert all(f.startswith("Modern/") for f in core.files) and core.files
 
 
 def test_helper_runs_once_for_both_packages(roslyn_helper, monkeypatch):
@@ -169,8 +176,12 @@ def test_helper_runs_once_for_both_packages(roslyn_helper, monkeypatch):
         return real(*a, **k)
 
     monkeypatch.setattr(helper, "parse_projects", counting)
-    enumerator.enumerate_target(FX)
+    results = enumerator.enumerate_target(FX)
     assert len(calls) == 1
+    # The single preparation fed the legacy package's results and holds both views.
+    assert any(r.language == "dotnet_legacy" for r in results)
+    assert project.get_model(FX, "dotnet").files and project.get_model(FX, "dotnet_legacy").files
+    assert len(calls) == 1  # get_model reused the prepared model
 
 
 def _legacy_keys(results, prefix=""):
@@ -191,3 +202,30 @@ def test_legacy_findings_unchanged_in_mixed_solution(roslyn_helper, tmp_path):
     project._CACHE.clear()
     mixed = _legacy_keys(enumerator.enumerate_target(FX), "Legacy/")
     assert alone and mixed == alone
+
+
+def test_core_project_side_files_never_reach_legacy(roslyn_helper, tmp_path):
+    """A web.config, Razor view, bundled script, .aspx and packages.config inside a
+    modern project are not analyzed by the legacy package."""
+    root = tmp_path / "sol"
+    shutil.copytree(FX, root)
+    modern = root / "Modern"
+    (modern / "wwwroot" / "lib").mkdir(parents=True)
+    (modern / "Views").mkdir()
+    (modern / "web.config").write_text(
+        '<configuration><system.web><compilation debug="true" />'
+        '<customErrors mode="Off" /></system.web></configuration>')
+    (modern / "Views" / "Index.cshtml").write_text("@Html.Raw(Model.Name)")
+    (modern / "wwwroot" / "lib" / "jquery-1.6.1.js").write_text("/*! jQuery JavaScript Library v1.6.1 */")
+    (modern / "Page.aspx").write_text('<%@ Page Language="C#" %><html></html>')
+    (modern / "packages.config").write_text(
+        '<packages><package id="jQuery" version="1.6.1" targetFramework="net8.0" /></packages>')
+    results = enumerator.enumerate_target(root)
+    legacy = [r for r in results if r.language == "dotnet_legacy"]
+    assert legacy
+    files = [f.file.replace("\\", "/") for r in legacy for f in r.findings]
+    files += [rt.file.replace("\\", "/") for r in legacy for rt in r.routes if getattr(rt, "file", None)]
+    assert files and not [f for f in files if f.startswith("Modern/")], files
+    view = project.get_model(root, "dotnet_legacy")
+    assert not view.owns(modern / "web.config") and not view.owns(modern / "Page.aspx")
+    assert project.get_model(root, "dotnet").owns(modern / "web.config")

@@ -378,13 +378,13 @@ def _mark_review(findings: list[Finding]) -> list[Finding]:
     return findings
 
 
-def non_web_config_notes(root: Path) -> list[str]:
+def non_web_config_notes(root: Path, owns=None) -> list[str]:
     """Notes for non-web `.config` files (App.config...) that declare `<service>` elements: WCF hosting
     is only discovered through .svc files and web.config serviceActivations, so those services are
     not analyzed."""
     out: list[str] = []
     for p in iter_dnl_files(root, (".config",)):
-        if re.fullmatch(r"web(\..+)?\.config", p.name, re.I):
+        if re.fullmatch(r"web(\..+)?\.config", p.name, re.I) or (owns is not None and not owns(p)):
             continue
         try:
             tree = ET.fromstring(read_source(p).encode("utf-8"))

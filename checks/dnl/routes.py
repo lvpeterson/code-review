@@ -283,7 +283,7 @@ def _webform_pages(model: ProjectModel, exts: tuple[str, ...] = (".aspx", ".asmx
             if _owner(project_dirs, f) is proj:
                 pages.append((f, proj))
     sites: dict[Path, Project] = {}
-    for f in iter_dnl_files(model.root, exts):
+    for f in model.iter_files(exts):
         if _owner(project_dirs, f) is None:
             d = _site_dir(model.root, f)
             pages.append((f, sites.setdefault(d, Project(name=SITE, path=None, language="cs", dir=d))))
@@ -399,7 +399,7 @@ def _wcf_services(model: ProjectModel) -> list[tuple[str, str, str | None, str, 
     projects = [p for p in model.projects if p.path is not None]
     project_dirs = [(p, p.dir.resolve()) for p in projects]
     sites: dict[Path, Project] = {}
-    for cfg in load_configs(model.root):
+    for cfg in load_configs(model.root, model.owns):
         if cfg.root is None or cfg.is_views:
             continue
         proj = _owner(project_dirs, cfg.path)
