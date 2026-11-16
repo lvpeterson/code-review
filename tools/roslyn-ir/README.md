@@ -98,13 +98,35 @@ failure), 2 usage.
   `byval`, `paramarray`, `optional`),
   `attributes`, `handles` (VB `Handles`), `implements` (VB method-level `Implements` targets, or the C# explicit interface
   implementation, as `IFoo.Bar`), `body`, `line`, `end_line`.
+- Synthetic top-level type: a C# file with top-level statements gets one extra type
+  written before the declared ones: `Program` (namespace empty, modifiers `static`,
+  `partial`) with a single static method `<Main>$` (`void`, no params) whose `body` is
+  the lowered statements and whose `line` / `end_line` span them. A hand-written
+  `partial class Program` in the same file stays a separate type record.
+- Primary constructors: a class, struct or record with a parameter list gets a `.ctor`
+  method (first in `methods`, no modifiers, null `return_type`, those `params`); a
+  `: Base(args)` in the base list becomes its leading `base(args)` call statement.
+  Positional record parameters also become properties (`{name, type, attributes, line}`,
+  no accessors), except those the record body declares itself.
 - Stmt `k`: `local`, `assign` (`op` is `=`, `+=`, `-=` or `concat=`; other
   compound ops lower to `=` with a `bin` value), `expr`, `return`, `throw`,
   `if`, `loop`, `try`, `using`, `with`, `other {text}`.
 - Expr `k`: `lit`, `name`, `member`, `call`, `new`, `bin`, `interp`, `cond`,
   `index` (C# only), `cast`, `lambda`, `unary {op, e}`, `unknown {text}`.
-  `lambda {body, params?}`: `body` is an Expr or a Stmt list, `params` the lowered
-  parameter names (omitted when there are none).
+  `lambda {body, params?, param_info?, end_line}`: `body` is an Expr or a Stmt list,
+  `params` the lowered parameter names and `param_info` one `{name, type, attributes,
+  modifiers}` per parameter (`type` null when implicit, `modifiers` lowercased, possibly
+  empty); both omitted when there are no parameters. `end_line` is the lambda's last line
+  and is always present. A local function lowers as a `local` whose `init` is a lambda.
+  Modern C# shapes (all syntactic, so identical with or without a reference profile):
+  a collection expression `[a, ..b]` is an untyped `new` (`type` null, no `args`) whose
+  `init` entries are the elements (a spread contributes its inner expression); a switch
+  expression is nested `cond` (`c` the governing expression, `t` an arm value, `f` the
+  remaining arms, the last arm contributing just its value; guards are dropped); an
+  `is` pattern is `bin {op: "is"}` whose right side is `unknown {text}` holding the
+  pattern (a plain `x is Type` keeps the type as an Expr); `x with { A = 1 }` is an
+  untyped `new` whose `args` is `[x]` and whose `init` entries are the assignments. A raw
+  string literal is a `lit` with the indentation of its closing line removed.
   `unary` ops: C# `!`, `-`, `~`, `++`, `--` (prefix and postfix alike), VB `Not`, `-`;
   a negated numeric literal still folds to a `lit`.
 

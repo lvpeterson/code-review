@@ -977,8 +977,7 @@ internal sealed class CSharpLowering
         _ => null,
     };
 
-    /// <summary>Lambda body: Stmt list for a block (or an assignment expression), else a single Expr.</summary>
-    /// <summary>Optional `params` key of a lambda: its parameter names, omitted when it has none,</summary>
+    /// <summary>Optional `params` key of a lambda: its parameter names, omitted when it has none,
     /// plus "param_info" (type, attributes, modifiers per parameter) and the
     /// lambda's "end_line".</summary>
     void LambdaParams(IEnumerable<ParameterSyntax> ps, SyntaxNode node)
@@ -1003,6 +1002,7 @@ internal sealed class CSharpLowering
         w.J.WriteNumber("end_line", EndLine(node));
     }
 
+    /// <summary>Lambda body: Stmt list for a block (or an assignment expression), else a single Expr.</summary>
     void LambdaBody(BlockSyntax? block, ExpressionSyntax? expr, SyntaxNode fallback)
     {
         if (block is null && expr is not null && expr is not AssignmentExpressionSyntax)

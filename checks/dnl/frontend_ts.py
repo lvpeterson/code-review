@@ -1,4 +1,4 @@
-"""tree-sitter-c-sharp lowering to the roslyn-ir schema-1 subset (degraded mode).
+"""tree-sitter-c-sharp lowering to the roslyn-ir schema-2 subset (degraded mode).
 
 Mirrors tools/roslyn-ir/src/CSharpLowering.cs shape for shape, minus the
 semantic keys (`sym` on call/member/name/index, `type_full` on new/local): a
@@ -64,6 +64,27 @@ def _number(text: str):
         return float(body)
     except ValueError:
         return None
+
+
+_NEWLINE = re.compile(r"(\r\n|\n|\r)")
+
+
+def _raw_string_value(content: str) -> str:
+    """Value of a raw string literal's content: a multi-line literal drops its first and last line and
+    the closing line's indentation from every line (a single-line literal is taken as written)."""
+    parts = _NEWLINE.split(content)
+    lines, seps = parts[0::2], parts[1::2]
+    if len(lines) < 3 or lines[0].strip(" \t") or lines[-1].strip(" \t"):
+        return content
+    indent = lines[-1]
+    kept = list(range(1, len(lines) - 1))
+    out = ""
+    for n, i in enumerate(kept):
+        ln = lines[i]
+        out += ln[len(indent):] if ln.startswith(indent) else ln.lstrip(" \t")
+        if n < len(kept) - 1:
+            out += seps[i]
+    return out
 
 
 class _Lowering:
@@ -231,6 +252,8 @@ class _Lowering:
         base_list = next((c for c in node.children if c.type == "base_list"), None)
         if base_list is not None:
             for b in base_list.named_children:
+                if b.type == "argument_list":      # `: Base(x)` primary-ctor arguments, not a base
+                    continue
                 if b.type == "primary_constructor_base_type":
                     b = next((k for k in b.named_children if k.type != "argument_list"), b)
                 bases.append(self.simple_name(b))
@@ -240,6 +263,13 @@ class _Lowering:
             "attributes": self.attributes(node),
             "fields": self.fields(node, members), "properties": [], "methods": [],
         }
+        plist = next((c for c in node.children if c.type == "parameter_list"), None)
+        if plist is not None and t != "interface_declaration":
+            # Primary constructor: a .ctor with those params, ": Base(x)" as its leading base(...) call.
+            try:
+                rec["methods"].append(self.primary_ctor(node, plist, base_list))
+            except Exception:  # noqa: BLE001
+                pass
         for m in members:
             try:
                 if m.type == "property_declaration":
@@ -248,9 +278,69 @@ class _Lowering:
                     rec["methods"].append(self.method(m))
             except Exception:  # noqa: BLE001 -- one bad member must not lose the file
                 pass
+        if plist is not None and t in ("record_declaration", "record_struct_declaration"):
+            # Positional record parameters declare one property each, unless the body redeclares it.
+            declared = {p["name"] for p in rec["properties"]}
+            for p in (c for c in plist.children if c.type == "parameter"):
+                try:
+                    nm = self.text(p.child_by_field_name("name"))
+                    if nm in declared:
+                        continue
+                    ty = p.child_by_field_name("type")
+                    rec["properties"].append({"name": nm, "type": self.text(ty) if ty is not None else None,
+                                              "attributes": self.attributes(p), "line": self.decl_line(p)})
+                except Exception:  # noqa: BLE001
+                    continue
         rec["line"] = self.decl_line(node)
         rec["end_line"] = self.end_line(node)
         return rec
+
+    def primary_ctor(self, node: Node, plist: Node, base_list: Node | None) -> dict:
+        body: list[dict] = []
+        if base_list is not None:
+            kids = list(base_list.children)
+            for i, c in enumerate(kids):
+                # Grammar versions differ: a wrapper node, or the argument_list as a sibling of the type.
+                if c.type == "primary_constructor_base_type":
+                    alist, anchor = next((k for k in c.children if k.type == "argument_list"), None), c
+                elif c.type == "argument_list" and i > 0:
+                    alist, anchor = c, kids[i - 1]
+                else:
+                    continue
+                if alist is None:
+                    continue
+                ln = self.line(anchor)
+                call = {"k": "call", "line": ln, "fn": self.name_node("base", ln)}
+                call.update(self.args(alist))
+                body.append({"k": "expr", "line": ln, "expr": call})
+                break
+        return {"name": ".ctor", "modifiers": [], "return_type": None, "params": self.params(plist),
+                "attributes": [], "handles": [], "implements": [], "body": body,
+                "line": self.decl_line(node), "end_line": self.end_line(node)}
+
+    def top_level(self, root: Node) -> dict | None:
+        """Synthetic `Program` type holding the file's top-level statements as one static `<Main>$`
+        method, like the helper's TopLevel. Statements inside `#if` regions are collected too (every
+        branch, in source order); declarations among them are lowered by the normal type walk."""
+        stmts: list[Node] = []
+        for c in self.unwrap(root.children):
+            if c.type == "global_statement":
+                stmts.extend(k for k in c.children if k.is_named and k.type != "comment")
+            elif c.type.endswith("_statement"):
+                stmts.append(c)
+        if not stmts:
+            return None
+        line, end = self.line(stmts[0]), self.end_line(stmts[-1])
+        try:
+            body = self.seq(stmts)
+        except Exception:  # noqa: BLE001 -- keep the synthetic type, lose only the statements
+            body = [{"k": "other", "line": line, "text": ""}]
+        main = {"name": "<Main>$", "modifiers": ["static"], "return_type": "void", "params": [],
+                "attributes": [], "handles": [], "implements": [], "body": body,
+                "line": line, "end_line": end}
+        return {"name": "Program", "namespace": "", "kind": "class", "modifiers": ["static", "partial"],
+                "bases": [], "attributes": [], "fields": [], "properties": [], "methods": [main],
+                "line": line, "end_line": end}
 
     def fields(self, node: Node, members: list[Node]) -> list[dict]:
         out: list[dict] = []
@@ -593,6 +683,8 @@ class _Lowering:
             lam = {"k": "lambda", "line": line}
             if params:
                 lam["params"] = params
+                lam["param_info"] = self.lambda_param_info(f("parameters"))
+            lam["end_line"] = self.end_line(s)
             lam["body"] = self.lambda_body(body_node, s)
             ty = f("type") or f("returns")
             return [{"k": "local", "line": line, "name": self.text(f("name")), "type": self.text(ty),
@@ -741,6 +833,29 @@ class _Lowering:
             return self.new(None, None, init, line)
         if t == "initializer_expression":
             return self.new(None, None, e, line)
+        if t == "collection_expression":
+            # [a, ..b]: an untyped new; a spread contributes its inner expression.
+            entries = []
+            for el in self.kids(e):
+                inner = el
+                if el.type == "collection_element":
+                    inner = next((k for k in self.kids(el)), None)
+                if inner is not None and inner.type in ("expression_element", "spread_element"):
+                    inner = next((k for k in self.kids(inner)), None)
+                elif inner is not None and inner.type == "with_element":
+                    inner = None
+                if inner is not None:
+                    entries.append({"name": None, "value": self.expr(inner)})
+            return {"k": "new", "line": line, "type": None, "args": [], "init": entries}
+        if t == "with_expression":
+            kids = self.kids(e)
+            entries = []
+            for wi in (c for c in kids if c.type == "with_initializer"):
+                parts = self.kids(wi)
+                if len(parts) >= 2:
+                    entries.append({"name": self.text(parts[0]), "value": self.expr(parts[-1])})
+            recv = next((c for c in kids if c.type != "with_initializer"), None)
+            return {"k": "new", "line": line, "type": None, "args": [self.expr(recv)], "init": entries}
         if t == "anonymous_object_creation_expression":
             return self.anonymous_object(e, line)
         if t == "as_expression":
@@ -760,10 +875,14 @@ class _Lowering:
         if t == "is_pattern_expression":
             pat = f("pattern")
             inner = self.kids(pat)[0] if pat is not None and pat.type == "constant_pattern" and self.kids(pat) else None
-            # `x is Type` is a binary `is` for Roslyn; `is null`, `is Type v`, `is not` stay unknown.
+            # `x is Type` is a binary `is` for Roslyn with the type as an Expr; every other pattern is a
+            # binary `is` whose right side is an `unknown` holding the pattern text.
             if inner is not None and inner.type in ("identifier", "qualified_name", "member_access_expression",
                                                     "generic_name", "predefined_type"):
                 return {"k": "bin", "line": line, "op": "is", "l": self.expr(f("expression")), "r": self.expr(inner)}
+            # Any other pattern (`is null`, `is T v`, `is not ..`, property patterns): the pattern's text.
+            if pat is not None:
+                return {"k": "bin", "line": line, "op": "is", "l": self.expr(f("expression")), "r": self.unknown(pat)}
             return self.unknown(e)
         if t in ("binary_expression", "is_expression"):
             return {"k": "bin", "line": line, "op": self.text(f("operator")),
@@ -817,7 +936,7 @@ class _Lowering:
             return self.lit(txt[2:-1].replace('""', '"'), "string", line)
         if t == "raw_string_literal":
             content = next((c for c in e.children if c.type == "raw_string_content"), None)
-            return self.lit(self.text(content) if content is not None else "", "string", line)
+            return self.lit(_raw_string_value(self.text(content)) if content is not None else "", "string", line)
         if t == "character_literal":
             return self.lit(_unescape(txt[1:-1]), "char", line)
         v = _number(txt)
@@ -918,6 +1037,29 @@ class _Lowering:
             return [self.text(plist.child_by_field_name("name"))]
         return [self.text(p.child_by_field_name("name")) for p in plist.children if p.type == "parameter"]
 
+    def lambda_param_info(self, plist: Node | None) -> list[dict]:
+        """Per-parameter name / type / attributes / modifiers of a lambda (type None when implicit)."""
+        if plist is None:
+            return []
+        if plist.type in ("identifier", "implicit_parameter"):
+            return [{"name": self.text(plist), "type": None, "attributes": [], "modifiers": []}]
+        ps = [plist] if plist.type == "parameter" else [p for p in plist.children if p.type == "parameter"]
+        out = []
+        for p in ps:
+            ty = p.child_by_field_name("type")
+            mods = [self.text(c).lower() for c in p.children
+                    if c.type in ("modifier", "params", "this", "ref", "out", "in")]
+            if ty is not None and ty.type == "ref_type":
+                # `(ref int r) =>` parses as a ref_type; Roslyn has the `ref` modifier and type `int`.
+                inner = ty.child_by_field_name("type")
+                if inner is not None:
+                    mods.append("ref")
+                    ty = inner
+            out.append({"name": self.text(p.child_by_field_name("name")),
+                        "type": self.text(ty) if ty is not None else None,
+                        "attributes": self.attributes(p), "modifiers": mods})
+        return out
+
     def lambda_expr(self, e: Node, line: int) -> dict:
         f = e.child_by_field_name
         plist = f("parameters")
@@ -928,6 +1070,8 @@ class _Lowering:
         names = self.lambda_params(plist)
         if names:
             node["params"] = names
+            node["param_info"] = self.lambda_param_info(plist)
+        node["end_line"] = self.end_line(e)
         body = f("body") or next((c for c in e.children if c.type == "block"), None)
         node["body"] = self.lambda_body(body, e)
         return node
@@ -1041,6 +1185,12 @@ def _lower_source(src: bytes) -> tuple[list[dict], int]:
     low = _Lowering(src)
     low.collect_aliases(tree.root_node)
     types = []
+    try:
+        top = low.top_level(tree.root_node)
+        if top is not None:
+            types.append(top)
+    except Exception:  # noqa: BLE001
+        pass
     for node, ns, name in low.collect_types(tree.root_node):
         try:
             types.append(low.type_record(node, ns, name))
