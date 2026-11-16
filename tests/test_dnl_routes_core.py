@@ -261,3 +261,78 @@ def test_template_overrides_and_indexes(roslyn_helper, tmp_path):
     assert ("IndexModel.OnPutAsync", "/dash/{n}", ("PUT",)) in got
     # the root IndexModel still binds to the root page
     assert ("IndexModel.OnGet", "/", ("GET",)) in got
+
+
+def _razor_copy(tmp_path):
+    root = tmp_path / "rz"
+    shutil.copytree(RAZOR, root)
+    return root
+
+
+def _names(calls):
+    from checks.dnl.ir import call_name
+    return [call_name(c) for c in calls]
+
+
+def test_qualified_model_with_other_namespace_is_not_bound(roslyn_helper, tmp_path):
+    root = _razor_copy(tmp_path)
+    idx = root / "Pages" / "Index.cshtml"
+    idx.write_text(idx.read_text().replace("@model IndexModel", "@model Other.Ns.IndexModel"))
+    out = _discover_pages(root)
+    hit = [r for r in out if r.route.file.replace("\\", "/").endswith("Pages/Index.cshtml")]
+    assert len(hit) == 1 and hit[0].type is None
+    assert "Other.Ns.IndexModel" in hit[0].unknown[0]
+
+
+def test_qualified_model_matching_namespace_binds(roslyn_helper, tmp_path):
+    root = _razor_copy(tmp_path)
+    idx = root / "Pages" / "Index.cshtml"
+    idx.write_text(idx.read_text().replace("@model IndexModel", "@model RazorApp.Pages.IndexModel"))
+    assert rt(_discover_pages(root), "IndexModel.OnGet").type.full_name == "RazorApp.Pages.IndexModel"
+
+
+def test_page_convention_calls_chain(roslyn_helper, tmp_path):
+    root = _razor_copy(tmp_path)
+    prog = root / "Program.cs"
+    prog.write_text(prog.read_text().replace("app.MapRazorPages();", "app.MapRazorPages().RequireAuthorization();"))
+    out = _discover_pages(root)
+    assert all(_names(r.convention_calls) == ["RequireAuthorization"] for r in out)
+    assert not any("chained differently" in u for r in out for u in r.unknown)
+
+
+def test_dev_only_page_conventions_do_not_protect_production(roslyn_helper, tmp_path):
+    root = _razor_copy(tmp_path)
+    prog = root / "Program.cs"
+    prog.write_text(prog.read_text().replace(
+        "app.MapRazorPages();",
+        "if (app.Environment.IsDevelopment()) { app.MapRazorPages().RequireAuthorization(); } else { app.MapRazorPages(); }"))
+    out = _discover_pages(root)
+    assert out and all(r.convention_calls == [] for r in out)
+
+
+def test_dev_only_controller_conventions_do_not_protect_production(roslyn_helper, tmp_path):
+    root = _copy(tmp_path)
+    prog = root / "Program.cs"
+    prog.write_text(prog.read_text().replace(
+        "app.MapControllers();",
+        "if (app.Environment.IsDevelopment()) { app.MapControllers().RequireAuthorization(); } else { app.MapControllers(); }"))
+    out = _discover(root)
+    get = rt(out, "OrdersController.Get")
+    assert get.convention_calls == []
+
+
+def test_controller_convention_calls_chain(roslyn_helper, tmp_path):
+    root = _copy(tmp_path)
+    prog = root / "Program.cs"
+    prog.write_text(prog.read_text().replace("app.MapControllers();", "app.MapControllers().RequireAuthorization();"))
+    assert _names(rt(_discover(root), "OrdersController.Get").convention_calls) == ["RequireAuthorization"]
+
+
+def test_dev_only_mapping_notes_unknown(roslyn_helper, tmp_path):
+    root = _razor_copy(tmp_path)
+    prog = root / "Program.cs"
+    prog.write_text(prog.read_text().replace(
+        "app.MapRazorPages();", "if (app.Environment.IsDevelopment()) { app.MapRazorPages().RequireAuthorization(); }"))
+    out = _discover_pages(root)
+    assert out and all(r.convention_calls == [] for r in out)
+    assert all(any("outside Production" in u for u in r.unknown) for r in out)

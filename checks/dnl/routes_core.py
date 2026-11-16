@@ -21,12 +21,13 @@ unknown set. meta["page"] is the page name conventions use (/Admin/Index), not t
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from checks.dnl.files import iter_dnl_files, read_source
-from checks.dnl.ir import MethodIR, TypeIR, attr_key, const_str, has_attr, literal_str
+from checks.dnl.ir import MethodIR, TypeIR, attr_key, call_name, const_str, has_attr, literal_str
 from checks.dnl.pipeline import PipeCall, pipeline_for
 from checks.dnl.project import ProjectModel
 from checks.dnl.routes import RouteRef, action_candidates, strip_constraints
@@ -268,6 +269,36 @@ def _tail(call: PipeCall) -> list[dict]:
     return []
 
 
+def _link_sig(link: dict) -> str:
+    """Identity of a fluent link: name and arguments, ignoring source positions."""
+    def strip(x):
+        if isinstance(x, dict):
+            return {k: strip(v) for k, v in x.items() if k not in ("line", "sym")}
+        if isinstance(x, list):
+            return [strip(v) for v in x]
+        return x
+    return json.dumps([call_name(link), strip(link.get("args")), strip(link.get("named"))],
+                      sort_keys=True, default=str)
+
+
+def _common_tail(calls: list[PipeCall]) -> tuple[list[dict], str | None]:
+    """Fluent links chained on every mapping call that may run in Production, plus a note when the
+    answer is uncertain: a dev-only chain must not lend its RequireAuthorization to Production,
+    and chains that differ between branches only protect what they all share."""
+    prod = [c for c in calls if c.runs_in("Production") is not False]
+    if not prod:
+        return [], "the mapping call only runs outside Production; its conventions were not applied"
+    tails = [_tail(c) for c in prod]
+    common: list[dict] = []
+    for links in zip(*tails):
+        if len({_link_sig(x) for x in links}) != 1:
+            break
+        common.append(links[0])
+    if any(len(t) != len(common) for t in tails) and len({tuple(map(_link_sig, t)) for t in tails}) > 1:
+        return common, "the mapping call is chained differently on different paths; only shared conventions were applied"
+    return common, None
+
+
 def discover_controllers(model: ProjectModel) -> list[CoreRouteRef]:
     refs: list[CoreRouteRef] = []
     global_maps: list[_Mapping] | None = None
@@ -301,7 +332,8 @@ def _controller_routes(model: ProjectModel, t: TypeIR, decls: list[TypeIR], chai
 
     unknown: list[str] = []
     # Attribute routes are served by whichever controller mapping call is registered; prefer MapControllers.
-    attr_map = next((m for m in maps if m.name == "MapControllers"), maps[0] if maps else None)
+    attr_calls = [m.call for m in maps if m.name == "MapControllers"] or [m.call for m in maps[:1]]
+    attr_links, attr_note = _common_tail(attr_calls) if attr_calls else ([], None)
     if not maps:
         unknown.append("no MapControllers/MapControllerRoute call found for this controller")
     elif any(m.call.runs_in("Production") is None for m in maps):
@@ -337,7 +369,7 @@ def _controller_routes(model: ProjectModel, t: TypeIR, decls: list[TypeIR], chai
         action = _action_name(m)
         seen: set[tuple[str, tuple[str, ...]]] = set()
 
-        def add(path: str, verbs: list[str] | None, mapping: _Mapping | None, assumed: bool = False) -> None:
+        def add(path: str, verbs: list[str] | None, mapping: _Mapping | str | None, assumed: bool = False) -> None:
             methods = verbs or ["ANY"]
             if (path, tuple(methods)) in seen:
                 return
@@ -350,9 +382,14 @@ def _controller_routes(model: ProjectModel, t: TypeIR, decls: list[TypeIR], chai
             route = Route(path=path, methods=methods, handler_name=f"{simple}.{m.name}",
                           file=decl.file, line=m.line, source_start_line=m.line, source_end_line=m.end_line,
                           meta=meta)
-            refs.append(CoreRouteRef(route, t, m, proj, style="controller",
-                                     convention_calls=_tail(mapping.call) if mapping else [],
-                                     unknown=list(unknown), partials=list(decls)))
+            if mapping == "attr":
+                links, note = attr_links, attr_note
+            elif mapping:
+                links, note = _common_tail([mapping.call])
+            else:
+                links, note = [], None
+            refs.append(CoreRouteRef(route, t, m, proj, style="controller", convention_calls=list(links),
+                                     unknown=list(unknown) + ([note] if note else []), partials=list(decls)))
 
         conv_verbs: list[str] | None = None
         conventional = False
@@ -362,7 +399,7 @@ def _controller_routes(model: ProjectModel, t: TypeIR, decls: list[TypeIR], chai
                 conventional, conv_verbs = True, verbs
                 continue
             for raw in raws:
-                add(_attribute_path(raw, controller, action, area), verbs, attr_map)
+                add(_attribute_path(raw, controller, action, area), verbs, "attr")
         if conventional:
             for cm in conv:
                 add(_conventional_path(cm.template, controller, action, area), conv_verbs, cm)
@@ -488,9 +525,14 @@ def _resolve_model(model: ProjectModel, proj, page: _Page) -> tuple[TypeIR | Non
     cands = [t for t in model.find_types(simple)
              if t.kind == "class" and model.project_of(t.file) is proj]
     if "." in name:
-        full = [t for t in cands if t.full_name.lower() == name.lower()]
-        if full:
-            return full[0], None
+        # A qualified name binds only to a type in that namespace; a same-named local type under
+        # another namespace is a different class (the real model may live in another assembly).
+        low = name.lower()
+        quals = {f"{ns}.{low}" for ns in page.namespaces if ns}
+        full = [t for t in cands
+                if t.full_name.lower() == low or t.full_name.lower().endswith("." + low)
+                or t.full_name.lower() in quals]
+        return (full[0], None) if full else (None, None)
     if not cands:
         return None, None
     for ns in page.namespaces:
@@ -548,7 +590,9 @@ def discover_pages(model: ProjectModel) -> list[CoreRouteRef]:
             unknown.append("Razor Pages mapping sits under an environment condition that could not be parsed")
         envs = {c.env for c in maps}
         env = None if not maps or None in envs else ", ".join(sorted(envs))
-        conv = _tail(maps[0]) if maps else []
+        conv, conv_note = _common_tail(maps) if maps else ([], None)
+        if conv_note:
+            unknown.append(conv_note)
 
         name, routed = _page_path(page)
         tmpl = (page.template or "").strip()
