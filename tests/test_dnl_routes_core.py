@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from checks.dnl import helper, project
-from checks.dnl.routes_core import discover_controllers
+from checks.dnl.routes_core import discover_controllers, discover_pages
 
 FX = Path(__file__).parent / "fixtures" / "aspnetcore" / "controllers_api"
 
@@ -170,3 +170,94 @@ def test_defaults_only_conventional_route_is_assumed_and_unknown(roslyn_helper, 
     idx = rt(_discover(root), "HomeController.Index")
     assert idx.route.meta["route_assumed"] is True
     assert idx.unknown and any("defaults" in u and "'d'" in u for u in idx.unknown)
+
+
+# -- Razor Pages ---------------------------------------------------------------
+
+RAZOR = Path(__file__).parent / "fixtures" / "aspnetcore" / "razor_app"
+
+
+def _discover_pages(root: Path, allow_degraded: bool = False):
+    project._CACHE.clear()
+    project.prepare(root, allow_degraded)
+    return discover_pages(project.get_model(root, "dotnet"))
+
+
+@pytest.fixture(scope="module")
+def pages(roslyn_helper):
+    return _discover_pages(RAZOR)
+
+
+def test_page_paths(pages):
+    got = triples(pages)
+    assert ("IndexModel.OnGet", "/", ("GET",)) in got
+    assert ("UsersModel.OnGet", "/Admin/Users/{id?}", ("GET",)) in got
+    assert ("UsersModel.OnPostDeleteAsync", "/Admin/Users/{id?}", ("POST",)) in got
+    assert ("CartModel.OnPostCheckout", "/Shop/Cart", ("POST",)) in got
+    assert ("EditModel.OnPostSave", "/Orders/Edit/{id}", ("POST",)) in got
+    assert not any(h == "UsersModel.Describe" for h, _, _ in got)
+    assert all(r.style == "razorpage" for r in pages)
+
+
+def test_handler_meta(pages):
+    d = rt(pages, "UsersModel.OnPostDeleteAsync").route.meta
+    assert d["handler"] == "Delete" and d["page"] == "/Admin/Users"
+    assert d["kind"] == "razorpage" and d["api_surface"] is False and "area" not in d
+    assert rt(pages, "IndexModel.OnGet").route.meta["handler"] == ""
+    assert rt(pages, "CartModel.OnGet").route.meta["area"] == "Shop"
+
+
+def test_convention_calls_and_source_range(pages):
+    r = rt(pages, "UsersModel.OnPostDeleteAsync")
+    assert r.convention_calls == [] and r.method is not None
+    assert r.route.file.endswith("Users.cshtml.cs")
+    assert (r.route.source_start_line, r.route.source_end_line) == (r.method.line, r.method.end_line)
+
+
+def test_layout_not_a_route(pages):
+    assert not any(r.route.file.endswith("_Layout.cshtml") for r in pages)
+
+
+def test_orphan_page_unknown(pages):
+    hits = [r for r in pages if r.route.file.replace("\\", "/").endswith("Orphan.cshtml")]
+    assert len(hits) == 1
+    r = hits[0]
+    assert r.type is None and r.method is None and r.route.methods == ["GET"]
+    assert r.unknown and "MissingModel" in r.unknown[0]
+    assert r.route.source_start_line == 1 and r.route.source_end_line >= 3
+
+
+def test_page_without_handlers(pages):
+    hits = [r for r in pages if r.route.path == "/Privacy"]
+    assert len(hits) == 1
+    assert hits[0].method is None and hits[0].type.name == "PrivacyModel"
+    assert hits[0].route.methods == ["GET"]
+
+
+def test_model_resolved_via_area_viewimports(pages):
+    cart = rt(pages, "CartModel.OnGet")
+    assert cart.type.full_name == "RazorApp.Areas.Shop.Pages.CartModel"
+    assert not cart.unknown
+
+
+def test_degraded_pages(pages, monkeypatch):
+    monkeypatch.setattr("checks.dnl.helper.find_helper", lambda *a, **k: None)
+    monkeypatch.setattr("checks.dnl.helper.sdk_available", lambda *a, **k: False)
+    deg = _discover_pages(RAZOR, True)
+    assert triples(deg) == triples(pages)
+
+
+def test_template_overrides_and_indexes(roslyn_helper, tmp_path):
+    root = tmp_path / "app"
+    shutil.copytree(RAZOR, root)
+    nl = chr(10)
+    (root / "Pages" / "Admin" / "Index.cshtml").write_text('@page "/dash/{n:int}"' + nl + "@model IndexModel" + nl)
+    (root / "Pages" / "Admin" / "Index.cshtml.cs").write_text(
+        "using Microsoft.AspNetCore.Mvc.RazorPages;" + nl + "namespace RazorApp.Pages.Admin;" + nl
+        + "public class IndexModel : PageModel { public void OnGet() { } public void OnPutAsync() { } }" + nl)
+    out = _discover_pages(root)
+    got = triples(out)
+    assert ("IndexModel.OnGet", "/dash/{n}", ("GET",)) in got
+    assert ("IndexModel.OnPutAsync", "/dash/{n}", ("PUT",)) in got
+    # the root IndexModel still binds to the root page
+    assert ("IndexModel.OnGet", "/", ("GET",)) in got

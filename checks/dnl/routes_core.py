@@ -1,4 +1,5 @@
-"""Route discovery for ASP.NET Core: controllers (attribute and conventional routing).
+"""Route discovery for ASP.NET Core: controllers (attribute and conventional routing)
+and Razor Pages.
 
 Routes come from [Route]/[Http*] templates on the controller and its actions, or
 from the conventional templates registered with MapControllerRoute /
@@ -12,12 +13,19 @@ base list and the actions are the union of all halves. CoreRouteRef.type is that
 merged TypeIR (attributes, bases and methods of every half; file/line of the first
 declaration) and CoreRouteRef.partials lists the original declarations. A route's
 route.file/line always point at the half that declares the action.
+
+Razor Pages: a .cshtml under Pages/ or Areas/<A>/Pages/ with @page first is a page; its
+PageModel is found by @model name (page namespace, then @using, via _ViewImports) and each
+On<Verb><Handler> method is one route. A page whose model is missing is one GET route with
+unknown set. meta["page"] is the page name conventions use (/Admin/Index), not the routed path.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 
+from checks.dnl.files import iter_dnl_files, read_source
 from checks.dnl.ir import MethodIR, TypeIR, attr_key, const_str, has_attr, literal_str
 from checks.dnl.pipeline import PipeCall, pipeline_for
 from checks.dnl.project import ProjectModel
@@ -361,4 +369,234 @@ def _controller_routes(model: ProjectModel, t: TypeIR, decls: list[TypeIR], chai
             if not conv:
                 tmpl = _DEFAULT_AREA_TEMPLATE if area else _DEFAULT_TEMPLATE
                 add(_conventional_path(tmpl, controller, action, area), conv_verbs, None, assumed=True)
+    return refs
+
+
+# -- Razor Pages ---------------------------------------------------------------
+# A page is a .cshtml under Pages/ (or Areas/<A>/Pages/) whose first directive is @page. Its
+# handlers live on the PageModel named by @model, found by name among the project's types.
+
+_HANDLER = re.compile(r"^On(Get|Post|Put|Delete|Patch)(\w*?)(Async)?$")
+_RAZOR_COMMENT = re.compile(r"@\*.*?\*@", re.DOTALL)
+_PAGE_DIRECTIVE = re.compile(r'^@page\b\s*(?:@?"((?:[^"\\]|\\.)*)")?')
+_USING = re.compile(r"^@using\s+(?!static\b)(?:\w+\s*=\s*)?([\w.]+)\s*;?\s*$", re.MULTILINE)
+_NAMESPACE = re.compile(r"^@namespace\s+([\w.]+)\s*;?\s*$", re.MULTILINE)
+_MODEL = re.compile(r"^@model\s+([^\s;]+)", re.MULTILINE)
+_FUNCTIONS = re.compile(r"^\s*@functions\b", re.MULTILINE)
+
+
+@dataclass
+class _Page:
+    path: Path
+    rel: str
+    area: str | None
+    folder: list[str]          # folders below Pages/
+    template: str | None       # None: no @page template
+    model: str | None
+    namespaces: list[str]      # candidate namespaces, innermost first
+    functions: bool
+    lines: int
+
+
+def _razor_text(path: Path) -> str:
+    # Razor comments are blanked, keeping line numbers.
+    return _RAZOR_COMMENT.sub(lambda mo: "\n" * mo.group(0).count("\n"), read_source(path))
+
+
+def _first_directive(text: str) -> str | None:
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("@"):
+            return s
+        if s:
+            # Markup before any directive: Razor only honours @page as the first directive.
+            return None
+    return None
+
+
+def _import_chain(path: Path, proj_dir: Path) -> list[Path]:
+    """_ViewImports.cshtml files that apply to the page, nearest first, up to the project root."""
+    out: list[Path] = []
+    cur = path.parent
+    while True:
+        for f in sorted(cur.iterdir()):
+            if f.name.lower() == "_viewimports.cshtml" and f.is_file():
+                out.append(f)
+        if cur == proj_dir or proj_dir not in cur.parents:
+            break
+        cur = cur.parent
+    return out
+
+
+def _page_namespaces(path: Path, proj, text: str, from_root: list[str]) -> list[str]:
+    """Namespaces to resolve @model in, innermost first: the page's namespace and its enclosing
+    ones, then the @using namespaces of the page and of every _ViewImports up the chain."""
+    own = _NAMESPACE.search(text)
+    ns = own.group(1) if own else None
+    usings = [m.group(1) for m in _USING.finditer(text)]
+    for imp in _import_chain(path, proj.dir.resolve()):
+        itext = _razor_text(imp)
+        usings.extend(m.group(1) for m in _USING.finditer(itext))
+        hit = _NAMESPACE.search(itext)
+        if ns is None and hit:
+            # A _ViewImports namespace is the base for pages in its folder and below (nearest wins).
+            depth = len(imp.parent.relative_to(proj.dir.resolve()).parts)
+            ns = ".".join([hit.group(1), *from_root[depth:]])
+    if ns is None:
+        ns = ".".join([proj.root_namespace or proj.name, *from_root])
+    parts = ns.split(".")
+    out = [".".join(parts[:i]) for i in range(len(parts), 0, -1)]
+    out.append("")
+    out.extend(usings)
+    return list(dict.fromkeys(out))
+
+
+def _find_pages(model: ProjectModel) -> list[tuple[_Page, object]]:
+    found: list[tuple[_Page, object]] = []
+    dirs = [p.dir.resolve() for p in model.projects]
+    for proj in model.projects:
+        pdir = proj.dir.resolve()
+        nested = [d for d in dirs if d != pdir and pdir in d.parents]
+        for f in iter_dnl_files(pdir, (".cshtml",)):
+            fr = f.resolve()
+            if f.name.startswith("_") or any(d in fr.parents for d in nested):
+                continue
+            rel_parts = list(fr.relative_to(pdir).parts)
+            area = None
+            if len(rel_parts) >= 4 and rel_parts[0].lower() == "areas" and rel_parts[2].lower() == "pages":
+                area, below = rel_parts[1], rel_parts[3:]
+            elif len(rel_parts) >= 2 and rel_parts[0].lower() == "pages":
+                below = rel_parts[1:]
+            else:
+                continue
+            text = _razor_text(f)
+            d = _first_directive(text)
+            pm = _PAGE_DIRECTIVE.match(d) if d else None
+            if pm is None:
+                continue
+            m = _MODEL.search(text)
+            found.append((_Page(f, model.rel(f), area, list(below[:-1]), pm.group(1), m.group(1) if m else None,
+                                _page_namespaces(f, proj, text, rel_parts[:-1]),
+                                bool(_FUNCTIONS.search(text)), len(text.splitlines()) or 1), proj))
+    return found
+
+
+def _resolve_model(model: ProjectModel, proj, page: _Page) -> tuple[TypeIR | None, str | None]:
+    """The PageModel type the page names, and a note when the name was a guess."""
+    name = (page.model or "").split("<")[0]
+    simple = name.split(".")[-1]
+    cands = [t for t in model.find_types(simple)
+             if t.kind == "class" and model.project_of(t.file) is proj]
+    if "." in name:
+        full = [t for t in cands if t.full_name.lower() == name.lower()]
+        if full:
+            return full[0], None
+    if not cands:
+        return None, None
+    for ns in page.namespaces:
+        hit = [t for t in cands if t.namespace.lower() == ns.lower()]
+        if hit:
+            return hit[0], None
+    if len({t.full_name.lower() for t in cands}) == 1:
+        return cands[0], None
+    return cands[0], f"page model {simple} matches several types and none is in scope; the first was used"
+
+
+def _handlers(model: ProjectModel, chain: list[TypeIR]) -> list[tuple[MethodIR, TypeIR, re.Match]]:
+    """Public instance handler methods of the PageModel and its project bases (nearest declaration wins)."""
+    out: list[tuple[MethodIR, TypeIR, re.Match]] = []
+    seen: set[str] = set()
+    for ct in chain:
+        decls = _declarations(model, ct)
+        for m in ct.methods:
+            if m.name.lower() in seen:
+                continue
+            seen.add(m.name.lower())
+            mods = {x.lower() for x in m.modifiers}
+            hit = _HANDLER.match(m.name)
+            if (hit is None or "public" not in mods or "static" in mods
+                    or has_attr(m.attributes, "NonHandler")):
+                continue
+            decl = next((d for d in decls if any(x is m for x in d.methods)), ct)
+            out.append((m, decl, hit))
+    return out
+
+
+def _page_path(page: _Page) -> tuple[str, str]:
+    """(page name as conventions see it, e.g. /Admin/Index; the routed path before the template)."""
+    name = "/" + "/".join([*page.folder, page.path.name[: -len(".cshtml")]])
+    routed = name
+    if page.path.name.lower() == "index.cshtml":
+        routed = "/" + "/".join(page.folder)
+    return name, routed
+
+
+def discover_pages(model: ProjectModel) -> list[CoreRouteRef]:
+    refs: list[CoreRouteRef] = []
+    global_maps: list[PipeCall] | None = None
+    for page, proj in _find_pages(model):
+        maps = pipeline_for(model, proj).named("MapRazorPages", include_dev=True)
+        if not maps:
+            # A Razor class library is mapped by its host project: fall back to every mapping call in the scan.
+            if global_maps is None:
+                global_maps = pipeline_for(model, None).named("MapRazorPages", include_dev=True)
+            maps = global_maps
+        unknown: list[str] = []
+        if not maps:
+            unknown.append("no MapRazorPages call found for this page")
+        elif any(c.runs_in("Production") is None for c in maps):
+            unknown.append("Razor Pages mapping sits under an environment condition that could not be parsed")
+        envs = {c.env for c in maps}
+        env = None if not maps or None in envs else ", ".join(sorted(envs))
+        conv = _tail(maps[0]) if maps else []
+
+        name, routed = _page_path(page)
+        tmpl = (page.template or "").strip()
+        if tmpl.startswith("~/") or tmpl.startswith("/"):
+            path = _join(tmpl.lstrip("~"))
+        else:
+            path = _join(routed, tmpl)
+        if page.area:
+            path = _join(page.area, path)
+        path = strip_constraints(path)
+        meta: dict = {"kind": "razorpage", "api_surface": False, "page": name}
+        if page.area:
+            meta["area"] = page.area
+        if env is not None:
+            meta["env"] = env
+
+        def route(handler_name: str, verb: str, file: str, line: int, start: int, end: int, **extra) -> Route:
+            return Route(path=path, methods=[verb], handler_name=handler_name, file=file, line=line,
+                         source_start_line=start, source_end_line=end, meta={**meta, **extra})
+
+        t = None
+        if page.model:
+            t, guess = _resolve_model(model, proj, page)
+            if guess:
+                unknown.append(guess)
+        if t is None:
+            what = f"page model {page.model} not found" if page.model else "page declares no @model"
+            unknown.append(f"{what}; handlers unknown")
+            refs.append(CoreRouteRef(route(page.model or page.path.name, "GET", page.rel, 1, 1, page.lines),
+                                     None, None, proj, style="razorpage", convention_calls=list(conv),
+                                     unknown=unknown))
+            continue
+        if page.functions:
+            unknown.append("page declares @functions; inline handlers are not analysed")
+        decls = _declarations(model, t)
+        mt = _merged(decls)
+        chain = _chain_types(model, mt)
+        simple = mt.name.split(".")[-1]
+        handlers = _handlers(model, chain)
+        if not handlers:
+            refs.append(CoreRouteRef(route(simple, "GET", mt.file, mt.line, mt.line, mt.end_line),
+                                     mt, None, proj, style="razorpage", convention_calls=list(conv),
+                                     unknown=list(unknown), partials=decls))
+            continue
+        for m, decl, hit in handlers:
+            refs.append(CoreRouteRef(
+                route(f"{simple}.{m.name}", hit.group(1).upper(), decl.file, m.line, m.line, m.end_line,
+                      handler=hit.group(2)),
+                mt, m, proj, style="razorpage", convention_calls=list(conv),
+                unknown=list(unknown), partials=decls))
     return refs
