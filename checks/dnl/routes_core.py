@@ -1,5 +1,5 @@
-"""Route discovery for ASP.NET Core: controllers (attribute and conventional routing)
-and Razor Pages.
+"""Route discovery for ASP.NET Core: controllers (attribute and conventional routing),
+Razor Pages, and minimal-API / other endpoints.
 
 Routes come from [Route]/[Http*] templates on the controller and its actions, or
 from the conventional templates registered with MapControllerRoute /
@@ -18,6 +18,16 @@ Razor Pages: a .cshtml under Pages/ or Areas/<A>/Pages/ with @page first is a pa
 PageModel is found by @model name (page namespace, then @using, via _ViewImports) and each
 On<Verb><Handler> method is one route. A page whose model is missing is one GET route with
 unknown set. meta["page"] is the page name conventions use (/Admin/Index), not the routed path.
+
+Endpoints (discover_endpoints): `Map{Get,Post,..}`, `MapMethods`, `Map` and the other Map*/Use* calls
+that register endpoints. The walk follows what the pipeline follows (entry points, solution methods
+and `UseEndpoints` lambdas, found through PipeCall.via/target) and keeps a small value model of the
+builders it meets: a root builder, a group (`MapGroup` nodes chained by parent), a registered route,
+or a `_Result` (what a followed method provably returns). Conventions chained on a group go into
+Group.calls, those chained on a Map call into endpoint_calls; conventions chained on a followed
+call apply as a Group(prefix="") on the group the method returns, or are recorded as an `unknown`
+note on the routes registered inside when the returned builder cannot be traced. Methods that take
+an endpoint builder but are never reached are scanned too, with caller_unknown set.
 """
 from __future__ import annotations
 
@@ -27,8 +37,9 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from checks.dnl.files import iter_dnl_files, read_source
-from checks.dnl.ir import MethodIR, TypeIR, attr_key, call_name, const_str, has_attr, literal_str
-from checks.dnl.pipeline import PipeCall, pipeline_for
+from checks.dnl.ir import (Attr, MethodIR, ParamIR, TypeIR, attr_key, call_chain, call_name, const_str,
+                           has_attr, literal_str, receiver_text, walk)
+from checks.dnl.pipeline import PipeCall, _is_ext, _is_member_call, pipeline_for
 from checks.dnl.project import ProjectModel
 from checks.dnl.routes import RouteRef, action_candidates, strip_constraints
 from core.models import Route
@@ -647,3 +658,571 @@ def discover_pages(model: ProjectModel) -> list[CoreRouteRef]:
                 mt, m, proj, style="razorpage", convention_calls=list(conv),
                 unknown=list(unknown), partials=decls))
     return refs
+
+
+# -- Minimal API and other endpoints -------------------------------------------
+# A forward walk over the pipeline's entry methods, mirroring its statement walk. Environment
+# and "was this call reached" facts come from the pipeline's PipeCall for the same node (looked
+# up by (via, id(node))); builder values and group chains are tracked here.
+
+_VERB_CALLS = {"MapGet": "GET", "MapPost": "POST", "MapPut": "PUT", "MapPatch": "PATCH", "MapDelete": "DELETE"}
+_OTHER_MAPS = ("MapMethods", "Map", "MapHub", "MapGrpcService", "MapRazorComponents", "MapBlazorHub",
+               "MapHealthChecks", "MapOpenApi", "MapSwagger")
+_SWAGGER_PATHS = ("/swagger/{documentName}/swagger.json", "/swagger")
+# Parameter types that make an unreached method worth scanning.
+_BUILDER_PARAMS = {"iendpointroutebuilder", "routegroupbuilder", "webapplication"}
+_ROOT_TYPES = _BUILDER_PARAMS | {"iapplicationbuilder"}
+
+
+@dataclass(eq=False)
+class _Node:
+    """A builder that routes register on: the app / a bare endpoint builder ("root"), or a group."""
+    group: Group | None
+    parent: "_Node | None" = None
+    kind: str = "root"                  # "root" | "group"
+    extras: list[Group] = field(default_factory=list)   # conventions a caller applied to the group
+    notes: list[str] = field(default_factory=list)
+    traced: bool = True                 # False: a builder whose group context is not known
+
+
+@dataclass(eq=False)
+class _Entry:
+    ref: CoreRouteRef
+    leaf: _Node
+
+
+@dataclass(eq=False)
+class _Result:
+    """The value a followed solution method returns: the builders it provably returns, or not."""
+    targets: list           # _Node (groups) and _Entry values
+    traced: bool
+    label: str              # the method's name
+    entries: list[_Entry]   # every route registered while the method ran
+    file: str
+    line: int
+    group: Group | None = None
+
+
+@dataclass
+class _Frame:
+    type: TypeIR
+    method: MethodIR
+    scope: dict             # name -> _Node | _Entry | _Result | None
+    fns: dict               # local function name -> lambda node
+    via: tuple
+    reached: bool           # False: scanned without a caller
+    lenient: bool = False   # local-function body: no PipeCalls of its own, the call site's env applies
+    env_pc: PipeCall | None = None
+    returns: list = field(default_factory=list)
+
+
+def _simple_type(t: str | None) -> str:
+    return (t or "").split("<")[0].strip().split(".")[-1].lower()
+
+
+def _merge_scopes(base: dict, branches: list[dict]) -> dict:
+    """Scope after alternative branches: a name keeps its value only when every branch agrees."""
+    out = dict(base)
+    for name in {n for b in branches for n in b}:
+        vals = [b.get(name) for b in branches]
+        out[name] = vals[0] if all(v is vals[0] for v in vals) else None
+    return out
+
+
+def _lambda_method(lam: dict, name: str | None = None) -> MethodIR:
+    """A synthetic MethodIR for a lambda / local function: params from param_info, an expression
+    body wrapped as one `return`."""
+    line = lam.get("line", 0)
+    infos = lam.get("param_info")
+    if infos is None:
+        infos = [{"name": n} for n in lam.get("params") or []]
+    params = [ParamIR(i.get("name", ""), i.get("type"),
+                      [Attr(a.get("name", ""), a.get("args") or [], a.get("named") or {}, a.get("line", 0))
+                       for a in i.get("attributes") or []],
+                      i.get("modifiers") or []) for i in infos]
+    body = lam.get("body")
+    stmts = body if isinstance(body, list) else [{"k": "return", "line": line, "value": body}]
+    return MethodIR(name=name or f"<lambda@{line}>", params=params, body=stmts, line=line,
+                    end_line=lam.get("end_line", line))
+
+
+def _is_branch_lambda(lam) -> bool:
+    """`app.Map("/x", b => b.Run(..))` is a middleware branch, not an endpoint handler."""
+    if not (isinstance(lam, dict) and lam.get("k") == "lambda"):
+        return False
+    params = lam.get("params") or []
+    if len(params) != 1:
+        return False
+    infos = lam.get("param_info") or []
+    if infos and _simple_type(infos[0].get("type")) == "iapplicationbuilder":
+        return True
+    return any(n.get("k") == "call" and call_name(n) in ("Run", "Use", "UseMiddleware")
+               and receiver_text((n.get("fn") or {}).get("obj")) == params[0] for n in walk(lam.get("body")))
+
+
+def _declared(type_text: str | None, certain: bool = False) -> _Node | None:
+    """A builder value for a declared parameter / local type, None for other types. The group
+    context of a declared RouteGroupBuilder is the caller's, hence not traced; a root builder is
+    only certain when the declaration is an entry point's (otherwise the caller may hold a group)."""
+    simple = _simple_type(type_text)
+    if simple == "routegroupbuilder":
+        return _Node(None, None, "group", notes=["the group this builder belongs to could not be traced"], traced=False)
+    if simple in _ROOT_TYPES:
+        if certain:
+            return _Node(None)
+        return _Node(None, None, "root", notes=["the endpoint builder routes were registered on could not be traced"],
+                     traced=False)
+    return None
+
+
+class _Scan:
+    """Endpoint discovery for one project (or the whole model when proj is None)."""
+
+    def __init__(self, model: ProjectModel, proj) -> None:
+        self.model, self.proj = model, proj
+        self.pipe = pipeline_for(model, proj)
+        self.index = {(c.via, id(c.node)): c for c in self.pipe.calls}
+        self.entries: list[_Entry] = []
+        self.visited: set[int] = set()
+        self.local_fns: list[tuple] = []        # (type, name, lambda) of every local function met
+        self.called_fns: set[int] = set()
+        self.fn_stack: set[int] = set()
+        self.seen_mw: set[tuple] = set()
+
+    # -- driver ------------------------------------------------------------
+    def run(self) -> list[CoreRouteRef]:
+        for t, m in self.pipe.entries:
+            self.walk_method(t, m, self.param_scope(m, True), (), True)
+        types = [t for rel, f in self.model.files.items()
+                 if self.proj is None or self.model.project_of(rel) is self.proj for t in f.types]
+        # Methods taking an endpoint builder that nothing reached: the caller is unknown.
+        for t in types:
+            for m in t.methods:
+                if id(m) not in self.visited and any(_simple_type(p.type) in _BUILDER_PARAMS for p in m.params):
+                    self.walk_method(t, m, self.param_scope(m, True), (), False)
+        for t, name, lam in list(self.local_fns):
+            m = _lambda_method(lam, name)
+            if id(lam) not in self.called_fns and any(_simple_type(p.type) in _BUILDER_PARAMS for p in m.params):
+                self.called_fns.add(id(lam))
+                self.walk_body(t, m, self.param_scope(m, True), (), False, True)
+        return [self.finish(e) for e in self.entries]
+
+    def finish(self, e: _Entry) -> CoreRouteRef:
+        """Fill in the group chain (outermost first) once every convention has been seen."""
+        chain: list[_Node] = []
+        n: _Node | None = e.leaf
+        while n is not None:
+            chain.append(n)
+            n = n.parent
+        for n in reversed(chain):
+            if n.group is not None:
+                e.ref.groups.append(n.group)
+            e.ref.groups.extend(n.extras)
+            for note in n.notes:
+                if note not in e.ref.unknown:
+                    e.ref.unknown.append(note)
+        return e.ref
+
+    @staticmethod
+    def param_scope(m: MethodIR, certain: bool) -> dict:
+        scope = {}
+        for p in m.params:
+            node = _declared(p.type, certain)
+            if node is not None:
+                scope[p.name] = node
+        return scope
+
+    # -- methods and statements ---------------------------------------------
+    def walk_method(self, t: TypeIR, m: MethodIR, scope: dict, via: tuple, reached: bool) -> list:
+        self.visited.add(id(m))
+        return self.walk_body(t, m, scope, via, reached)
+
+    def walk_body(self, t, m, scope, via, reached, lenient=False, env_pc=None, fns=None) -> list:
+        fr = _Frame(t, m, scope, dict(fns or {}), via, reached, lenient, env_pc)
+        self.stmts(fr, m.body)
+        return fr.returns
+
+    def stmts(self, fr: _Frame, stmts) -> None:
+        # Local functions may be used before their declaration.
+        for s in stmts or []:
+            if (isinstance(s, dict) and s.get("k") == "local" and s.get("name")
+                    and isinstance(s.get("init"), dict) and s["init"].get("k") == "lambda"):
+                fr.fns[s["name"]] = s["init"]
+                self.local_fns.append((fr.type, s["name"], s["init"]))
+        for s in stmts or []:
+            self.stmt(fr, s)
+
+    def branch(self, fr: _Frame, bodies: list) -> None:
+        """Run alternative bodies on copies of the scope and keep what they agree on."""
+        base = fr.scope
+        results = []
+        for b in bodies:
+            fr.scope = dict(base)
+            self.stmts(fr, b)
+            results.append(fr.scope)
+        fr.scope = _merge_scopes(base, results + ([base] if len(bodies) == 1 else []))
+
+    def stmt(self, fr: _Frame, s) -> None:
+        if not isinstance(s, dict):
+            return
+        k = s.get("k")
+        if k == "expr":
+            self.eval(fr, s.get("expr"))
+        elif k == "assign":
+            self.eval(fr, s)
+        elif k == "local":
+            state = self.eval(fr, s.get("init"))
+            nm = s.get("name")
+            if nm:
+                if state is None:
+                    state = _declared(s.get("type_full")) or _declared(s.get("type"))
+                fr.scope[nm] = state
+        elif k in ("return", "throw"):
+            state = self.eval(fr, s.get("value"))
+            if k == "return":
+                fr.returns.append(state)
+        elif k == "if":
+            self.branch(fr, [s.get("then"), s.get("else") or []])
+        elif k == "loop":
+            self.branch(fr, [s.get("body")])
+        elif k == "using":
+            self.stmts(fr, s.get("resource"))
+            self.stmts(fr, s.get("body"))
+        elif k == "try":
+            self.stmts(fr, s.get("body"))
+            self.branch(fr, [c.get("body") for c in s.get("catches") or []] + [[]])
+            self.stmts(fr, s.get("finally"))
+
+    # -- expressions ----------------------------------------------------------
+    def eval(self, fr: _Frame, e, arg: bool = False):
+        """Value of an expression, registering the routes in it. `arg`: an argument of a call,
+        which the pipeline does not visit -- groups are built there, routes are not registered."""
+        if not isinstance(e, dict):
+            return None
+        k = e.get("k")
+        if k == "assign":
+            state = self.eval(fr, e.get("value"))
+            tgt = e.get("target")
+            if isinstance(tgt, dict) and tgt.get("k") == "name":
+                fr.scope[tgt.get("id")] = state
+            return state
+        if k == "name":
+            return fr.scope.get(e.get("id"))
+        if k != "call":
+            return None
+        root, links = call_chain(e)
+        state = fr.scope.get(root.get("id")) if isinstance(root, dict) and root.get("k") == "name" else None
+        for link in links:
+            state = self.link(fr, link, state, arg)
+        return state
+
+    def link(self, fr: _Frame, link: dict, state, arg: bool):
+        """One call of a fluent chain applied to the value so far; returns the new value."""
+        name = call_name(link) or ""
+        pc = self.index.get((fr.via, id(link)))
+        if not arg and fr.reached and not fr.lenient and pc is None:
+            return None             # the pipeline did not visit it (dead code, or a cycle)
+        if pc is not None and pc.target is not None:
+            return self.follow(fr, link, pc, state)
+        if not arg and name in fr.fns and not _is_member_call(link):
+            return self.follow_local(fr, link, name, pc)
+        if name == "UseEndpoints" and not arg:
+            return self.use_endpoints(fr, link, state)
+        node = self.builder(state)
+        known = node is not None
+        if name in ("Build", "Create") and state is None and pc is not None and pc.kind == "app":
+            return _Node(None)      # WebApplication.CreateBuilder(..).Build() / WebApplication.Create(..)
+        if name == "MapGroup" and self.is_endpoint_call(link, name, known):
+            if node is None:
+                node = _Node(None, None, "group", notes=["the receiver of MapGroup could not be traced"], traced=False)
+            args = link.get("args") or []
+            prefix = const_str(args[0]) if args else ""
+            g = _Node(Group(prefix or "", [], fr.type.file, link.get("line", 0)), node, "group")
+            if prefix is None:
+                g.notes.append("a MapGroup prefix is not a literal")
+            return g
+        if not arg and self.is_map(link, name, known):
+            return self.register(fr, link, name, node, pc)
+        if (not arg and name in ("UseSwagger", "UseSwaggerUI")
+                and self.is_endpoint_call(link, name, known or (pc is not None and pc.kind == "app"))):
+            self.middleware(fr, link, name, pc)
+            return state
+        return self.convention(fr, link, state, name)
+
+    # -- values ---------------------------------------------------------------
+    @staticmethod
+    def builder(state) -> _Node | None:
+        """The builder a value stands for, when routes can register on it."""
+        if isinstance(state, _Node):
+            return state
+        if (isinstance(state, _Result) and state.traced and len(state.targets) == 1
+                and isinstance(state.targets[0], _Node)):
+            return state.targets[0]
+        return None
+
+    @staticmethod
+    def is_endpoint_call(link: dict, name: str, known: bool) -> bool:
+        """An ASP.NET Core endpoint-builder extension: by symbol, or (no symbol) on a known builder.
+        A symbol that resolves anywhere else is some other API with the same name."""
+        sym = link.get("sym")
+        if sym:
+            owner = sym.rsplit(".", 1)[0]
+            return owner.startswith("Microsoft.AspNetCore.") and (
+                name != "Map" or "EndpointRouteBuilder" in owner.rsplit(".", 1)[-1])
+        return known
+
+    def is_map(self, link: dict, name: str, known: bool) -> bool:
+        if name not in _VERB_CALLS and name not in _OTHER_MAPS and not name.startswith("MapFallback"):
+            return False
+        if name == "Map" and not link.get("sym") and _is_branch_lambda(self.handler_arg(link, name)):
+            return False
+        return self.is_endpoint_call(link, name, known)
+
+    @staticmethod
+    def handler_arg(link: dict, name: str):
+        return _arg(link, 2 if name == "MapMethods" else 1, "handler", "requestdelegate")
+
+    def convention(self, fr: _Frame, link: dict, state, name: str):
+        """A non-Map call chained on a builder, a route, or a followed call's result."""
+        if isinstance(state, _Entry):
+            state.ref.endpoint_calls.append(link)
+        elif isinstance(state, _Node):
+            if state.kind == "group":
+                if state.group is not None:
+                    state.group.calls.append(link)
+                else:
+                    state.extras.append(Group("", [link], fr.type.file, link.get("line", 0)))
+        elif isinstance(state, _Result):
+            if not state.traced:
+                msg = f"{name} applied to the result of {state.label} could not be traced"
+                for e in state.entries:
+                    if msg not in e.ref.unknown:
+                        e.ref.unknown.append(msg)
+            else:
+                # What the method provably returns takes the call: as an extra group on a group,
+                # on the route itself for a returned Map call.
+                if state.group is None:
+                    state.group = Group("", [], state.file, state.line)
+                    for t in state.targets:
+                        if isinstance(t, _Node):
+                            t.extras.append(state.group)
+                state.group.calls.append(link)
+                for t in state.targets:
+                    if isinstance(t, _Entry):
+                        t.ref.endpoint_calls.append(link)
+        return state
+
+    # -- following calls ---------------------------------------------------------
+    def follow(self, fr: _Frame, link: dict, pc: PipeCall, recv):
+        t, m = pc.target
+        scope = self.bind(fr, link, t, m, recv)
+        start = len(self.entries)
+        rets = self.walk_method(t, m, scope, fr.via + (id(link),), True)
+        return self.result(rets, m.name, start, fr, link)
+
+    def follow_local(self, fr: _Frame, link: dict, name: str, pc: PipeCall | None):
+        """A call to a local function: its body runs under the call site's environment."""
+        lam = fr.fns[name]
+        if id(lam) in self.fn_stack:
+            return None
+        self.called_fns.add(id(lam))
+        m = _lambda_method(lam, name)
+        scope = {k: v for k, v in fr.scope.items() if k not in {p.name for p in m.params}}
+        scope.update(self.bind(fr, link, fr.type, m, None, False))
+        start = len(self.entries)
+        self.fn_stack.add(id(lam))
+        rets = self.walk_body(fr.type, m, scope, fr.via, fr.reached, True, pc or fr.env_pc, fr.fns)
+        self.fn_stack.discard(id(lam))
+        return self.result(rets, name, start, fr, link)
+
+    def bind(self, fr: _Frame, link: dict, t: TypeIR, m: MethodIR, recv, ext_ok: bool = True) -> dict:
+        """Parameter values of a followed method: the receiver for an extension's first parameter,
+        the evaluated arguments for the rest. A declared builder type fills what stays unknown."""
+        params = list(m.params)
+        scope: dict = {}
+        if (ext_ok and params and _is_ext(m) and _is_member_call(link)
+                and receiver_text(link["fn"].get("obj")) not in ("this", t.name, t.full_name)):
+            scope[params[0].name] = recv
+            params = params[1:]
+        for p, a in zip(params, link.get("args") or []):
+            scope[p.name] = self.eval(fr, a, arg=True)
+        for k, a in (link.get("named") or {}).items():
+            for p in params:
+                if p.name.lower() == k.lower():
+                    scope[p.name] = self.eval(fr, a, arg=True)
+        for p in m.params:
+            if scope.get(p.name) is None:
+                node = _declared(p.type)
+                if node is not None:
+                    scope[p.name] = node
+        return scope
+
+    def result(self, rets: list, label: str, start: int, fr: _Frame, link: dict) -> _Result:
+        targets: list = []
+        traced = bool(rets)
+        for r in rets:
+            if isinstance(r, _Result):
+                traced = traced and r.traced
+                targets.extend(r.targets)
+            elif isinstance(r, _Entry) or (isinstance(r, _Node) and r.kind == "group" and r.traced):
+                targets.append(r)
+            else:
+                traced = False
+        return _Result(targets, traced, label, self.entries[start:], fr.type.file, link.get("line", 0))
+
+    def use_endpoints(self, fr: _Frame, link: dict, state):
+        """`UseEndpoints(e => ..)`: the lambda body runs with its parameter bound to the root builder."""
+        for a in link.get("args") or []:
+            if not (isinstance(a, dict) and a.get("k") == "lambda"):
+                continue
+            params = a.get("params") or []
+            inner = _Frame(fr.type, fr.method, dict(fr.scope), dict(fr.fns), fr.via, fr.reached, fr.lenient, fr.env_pc)
+            if params:
+                inner.scope[params[0]] = state if isinstance(state, _Node) else _Node(None)
+            body = a.get("body")
+            if isinstance(body, list):
+                self.stmts(inner, body)
+            else:
+                self.eval(inner, body)
+        return state
+
+    # -- registering endpoints -------------------------------------------------
+    def register(self, fr: _Frame, link: dict, name: str, node: _Node | None, pc: PipeCall | None):
+        notes: list[str] = []
+        if node is None:
+            node = _Node(None, None, "group", notes=[f"the receiver of {name} could not be traced"], traced=False)
+        prefixes: list[str] = []
+        n: _Node | None = node
+        while n is not None:
+            if n.group is not None:
+                prefixes.append(n.group.prefix)
+            n = n.parent
+        prefixes.reverse()
+        line = link.get("line", 0)
+        file = pc.file if pc is not None else fr.type.file
+        env_pc = pc or fr.env_pc
+        meta: dict = {"kind": "minimalapi", "api_surface": True}
+        style, methods, handler, htype, hmeth = "minimalapi", ["ANY"], None, None, None
+        start = end = line
+        pattern = const_str(_arg(link, 0, "pattern"))
+        targs = (link.get("fn") or {}).get("targs") or []
+        t_text = targs[0] if targs else None
+        if name in _VERB_CALLS or name in ("Map", "MapMethods"):
+            if name in _VERB_CALLS:
+                methods = [_VERB_CALLS[name]]
+            elif name == "MapMethods":
+                verbs = [v.strip().upper() for x in walk(_arg(link, 1, "httpmethods")) if (v := literal_str(x))]
+                if verbs:
+                    methods = list(dict.fromkeys(verbs))
+                else:
+                    notes.append("the HTTP methods of MapMethods are not literals")
+            harg = self.handler_arg(link, name)
+            htype, hmeth, handler, hnote = self.resolve_handler(fr, harg)
+            if hnote:
+                notes.append(hnote)
+            if isinstance(harg, dict) and harg.get("k") == "lambda":
+                start, end = min(line, hmeth.line), max(line, hmeth.end_line)
+        else:
+            style = "endpoint"
+            meta["api_surface"] = False
+            if name == "MapHub":
+                meta["kind"], handler = "hub", t_text or "Hub"
+                htype = self.find_type(t_text)
+            elif name == "MapGrpcService":
+                meta["kind"], meta["api_surface"], methods = "grpc", True, ["POST"]
+                handler, htype = t_text or "GrpcService", self.find_type(t_text)
+                pattern = f"/{t_text or '{service}'}/*"
+            elif name == "MapRazorComponents":
+                meta["kind"], handler, pattern = "blazor", t_text or "App", "/*"
+                htype = self.find_type(t_text)
+            elif name == "MapBlazorHub":
+                meta["kind"], handler, pattern = "blazor", name, pattern or "/_blazor"
+            elif name == "MapHealthChecks":
+                meta["kind"], handler = "health", name
+            elif name.startswith("MapFallback"):
+                meta["kind"], handler, pattern = "fallback", name, "/{**path}"
+            elif name == "MapOpenApi":
+                meta["kind"], methods, handler = "openapi", ["GET"], name
+                pattern = pattern or "/openapi/{documentName}.json"
+            else:   # MapSwagger
+                meta["kind"], methods, handler = "openapi", ["GET"], name
+                pattern = pattern or _SWAGGER_PATHS[0]
+        if pattern is None:
+            notes.append(f"the pattern of {name} is not a literal")
+            pattern = "{?}"
+        path = strip_constraints(_join(*prefixes, pattern))
+        if env_pc is not None and env_pc.runs_in("Production") is not True and env_pc.env:
+            meta["env"] = env_pc.env
+        route = Route(path=path, methods=methods, handler_name=handler or name, file=file, line=line,
+                      source_start_line=start, source_end_line=end, meta=meta)
+        ref = CoreRouteRef(route, htype, hmeth, self.proj, style=style, caller_unknown=not fr.reached, unknown=notes)
+        entry = _Entry(ref, node)
+        self.entries.append(entry)
+        return entry
+
+    def middleware(self, fr: _Frame, link: dict, name: str, pc: PipeCall | None) -> None:
+        """UseSwagger / UseSwaggerUI: middleware that serves the document and the UI."""
+        env_pc = pc or fr.env_pc
+        env = env_pc.env if env_pc is not None and env_pc.runs_in("Production") is not True else None
+        line = link.get("line", 0)
+        for path in _SWAGGER_PATHS:
+            if (path, env) in self.seen_mw:
+                continue
+            self.seen_mw.add((path, env))
+            meta: dict = {"kind": "openapi", "api_surface": False, "middleware": True}
+            if env:
+                meta["env"] = env
+            route = Route(path=path, methods=["GET"], handler_name=name, file=pc.file if pc is not None else fr.type.file,
+                          line=line, source_start_line=line, source_end_line=line, meta=meta)
+            self.entries.append(_Entry(CoreRouteRef(route, None, None, self.proj, style="endpoint",
+                                                    caller_unknown=not fr.reached), _Node(None)))
+
+    def find_type(self, text: str | None) -> TypeIR | None:
+        if not text:
+            return None
+        simple = text.split("<")[0].split(".")[-1]
+        cands = [t for t in self.model.find_types(simple)
+                 if self.proj is None or self.model.project_of(t.file) is self.proj]
+        return cands[0] if cands else None
+
+    def resolve_handler(self, fr: _Frame, arg) -> tuple:
+        """(declaring type, MethodIR, handler name, note) of a handler argument."""
+        if isinstance(arg, dict):
+            k = arg.get("k")
+            if k == "lambda":
+                m = _lambda_method(arg)
+                return fr.type, m, m.name, None
+            if k == "name":
+                nm = arg.get("id") or ""
+                if nm in fr.fns:
+                    self.called_fns.add(id(fr.fns[nm]))
+                    return fr.type, _lambda_method(fr.fns[nm], nm), nm, None
+                hit = next((m for m in fr.type.methods if m.name == nm), None)
+                if hit is not None:
+                    return fr.type, hit, f"{fr.type.name.split('.')[-1]}.{nm}", None
+            elif k == "member":
+                recv = receiver_text(arg.get("obj"))
+                nm = arg.get("name") or ""
+                owners = [fr.type] if recv == "this" else (self.model.find_types(recv.split(".")[-1]) if recv else [])
+                for ot in owners:
+                    hit = next((m for m in ot.methods if m.name == nm), None)
+                    if hit is not None:
+                        return ot, hit, f"{ot.name.split('.')[-1]}.{nm}", None
+        text = receiver_text(arg) or "<expression>"
+        return fr.type, None, text, f"handler {text} not resolved"
+
+
+def discover_endpoints(model: ProjectModel) -> list[CoreRouteRef]:
+    """Minimal-API routes (Map{Get,Post,..}/MapMethods/Map, through groups and followed methods)
+    and the other endpoint registrations (hubs, gRPC, health checks, fallbacks, OpenAPI)."""
+    refs: list[CoreRouteRef] = []
+    for proj in list(model.projects) or [None]:
+        refs.extend(_Scan(model, proj).run())
+    return refs
+
+
+def discover_all(model: ProjectModel) -> list[CoreRouteRef]:
+    """Controllers, Razor Pages and endpoints, computed once per model."""
+    if "core_routes" not in model.cache:
+        model.cache["core_routes"] = discover_controllers(model) + discover_pages(model) + discover_endpoints(model)
+    return model.cache["core_routes"]

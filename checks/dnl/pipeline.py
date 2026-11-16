@@ -3,8 +3,10 @@ middleware and endpoint calls of an app's Program.cs / Startup code.
 
 Entry points per netcore project: the top-level `<Main>$`; else a `Startup` class
 (`ConfigureServices` then `Configure`, every partial half); else a static `Main`.
-Calls to solution methods are followed inline at the call site. Lambdas passed as
-arguments are not separate calls -- rules read them from `PipeCall.node`.
+Calls to solution methods are followed inline at the call site (PipeCall.target, and
+PipeCall.via on the calls inside). Lambdas passed as arguments are not separate calls --
+rules read them from `PipeCall.node` -- except the body of a `UseEndpoints` lambda, whose
+parameter is an endpoint builder and whose calls are walked in place.
 
 `UseStartup<T>()` names the startup class through the IR's `targs`; without it the class
 named `Startup` is used, else a type that declares both `ConfigureServices` and `Configure`
@@ -61,6 +63,11 @@ class PipeCall:
     order: int           # execution order within the pipeline
     # Environment conditions this call sits under: (predicate, branch taken) pairs, outermost first.
     guards: tuple = ()
+    # Solution calls followed to reach this one (id() of each call node, outermost first), so the
+    # same method followed from two sites yields distinct (via, node) keys.
+    via: tuple = ()
+    # (type, method) this call was followed into; None for framework calls and calls not followed.
+    target: tuple | None = None
 
     def runs_in(self, env_name: str) -> bool | None:
         """True when the call runs in that environment, False when it does not, None when
@@ -84,6 +91,8 @@ class Pipeline:
     calls: list[PipeCall] = field(default_factory=list)
     target_framework: str | None = None
     notes: list[str] = field(default_factory=list)
+    # The entry methods the walk started from (type, method), in walk order.
+    entries: list = field(default_factory=list)
 
     def named(self, *names: str, kinds: tuple[str, ...] = (), include_dev: bool = False) -> list[PipeCall]:
         """Calls in execution order, filtered by method name and kind. Unless include_dev,
@@ -304,6 +313,8 @@ class _Ctx:
     order: int = 0
     # Solution methods by simple name.
     methods: dict[str, list[tuple[TypeIR, MethodIR]]] = field(default_factory=dict)
+    # id() of the solution call nodes being followed right now (becomes PipeCall.via).
+    via: list[int] = field(default_factory=list)
 
 
 def _expr_kind(e, scope: dict) -> str | None:
@@ -540,6 +551,23 @@ def _stmt(ctx: _Ctx, s, scope: dict, guards: tuple, file: str, stack: tuple, dep
     return guards
 
 
+def _endpoints_lambda(ctx: _Ctx, call: dict, scope: dict, guards: tuple, file: str, stack: tuple, depth: int) -> None:
+    """`app.UseEndpoints(e => { e.MapGet(..); })`: the lambda's parameter is an endpoint builder and
+    its body runs under the call's own conditions, so the calls inside are part of the pipeline."""
+    for a in call.get("args") or []:
+        if not (isinstance(a, dict) and a.get("k") == "lambda"):
+            continue
+        params = a.get("params") or []
+        inner = dict(scope)
+        if params and isinstance(params[0], str):
+            inner[params[0]] = "endpoints"
+        body = a.get("body")
+        if isinstance(body, list):
+            _stmts(ctx, body, inner, guards, file, stack, depth)
+        else:
+            _expr(ctx, body, inner, guards, file, stack, depth)
+
+
 def _expr(ctx: _Ctx, e, scope: dict, guards: tuple, file: str, stack: tuple, depth: int) -> str | None:
     """Record the calls of one expression statement or initializer; returns the builder
     kind of its value (for `var app = builder.Build()`)."""
@@ -568,16 +596,21 @@ def _expr(ctx: _Ctx, e, scope: dict, guards: tuple, file: str, stack: tuple, dep
         target = _find_target(ctx, call)
         if target is not None and target[1] in stack:
             continue  # cycle guard: re-entering a method being followed adds no new fact
+        followed = target is not None and depth < _MAX_DEPTH
         ctx.calls.append(PipeCall(
             name=nm, kind=kind, node=call, chain=calls, file=file, line=call.get("line", 0), env=_display_env(guards),
             resolved=bool(call.get("sym")) or nm in _FRAMEWORK_CALLS or target is not None,
-            order=ctx.order, guards=guards))
+            order=ctx.order, guards=guards, via=tuple(ctx.via), target=target if followed else None))
         ctx.order += 1
-        if target is not None and depth < _MAX_DEPTH:
+        if followed:
             t, m = target
             ext = _is_ext(m) and _is_member_call(call)
             arg_kinds = [_expr_kind(a, scope) for a in call.get("args") or []]
+            ctx.via.append(id(call))
             _stmts(ctx, m.body, _scope_for(m, recv_kind, arg_kinds, ext), guards, t.file, stack + (m,), depth + 1)
+            ctx.via.pop()
+        elif nm == "UseEndpoints":
+            _endpoints_lambda(ctx, call, scope, guards, file, stack, depth)
         recv_kind = kind
     # A `Build()` result is the app, whatever the builder was called.
     if calls and call_name(calls[-1]) == "Build" and kind == "other":
@@ -649,7 +682,7 @@ def _build(model: ProjectModel, proj: Project | None) -> Pipeline:
     for t, m in entries:
         scope = {p.name: k for p in m.params if (k := _type_kind(p.type))}
         _stmts(ctx, m.body, scope, (), t.file, (m,), 1)
-    return Pipeline(proj, style, ctx.calls, tfm, notes)
+    return Pipeline(proj, style, ctx.calls, tfm, notes, list(entries))
 
 
 def pipeline_for(model: ProjectModel, proj: Project | None) -> Pipeline:

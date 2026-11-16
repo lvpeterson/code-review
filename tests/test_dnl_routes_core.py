@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from checks.dnl import helper, project
-from checks.dnl.routes_core import discover_controllers, discover_pages
+from checks.dnl.routes_core import discover_all, discover_controllers, discover_endpoints, discover_pages
 
 FX = Path(__file__).parent / "fixtures" / "aspnetcore" / "controllers_api"
 
@@ -365,3 +365,245 @@ def test_differently_chained_page_mappings_keep_shared_prefix_and_note(roslyn_he
     for r in out:
         assert _names(r.convention_calls) == ["RequireAuthorization"]
         assert any("chained differently" in u for u in r.unknown)
+
+
+# -- Minimal API and other endpoints ---------------------------------------------
+
+MINIMAL = Path(__file__).parent / "fixtures" / "aspnetcore" / "minimal_api"
+
+
+def _discover_eps(root: Path, allow_degraded: bool = False):
+    project._CACHE.clear()
+    project.prepare(root, allow_degraded)
+    return discover_endpoints(project.get_model(root, "dotnet"))
+
+
+@pytest.fixture(scope="module")
+def eps(roslyn_helper):
+    return _discover_eps(MINIMAL)
+
+
+def ep(refs, path):
+    hits = [r for r in refs if r.route.path == path]
+    assert len(hits) == 1, path
+    return hits[0]
+
+
+def pm(refs):
+    return {(r.route.path, tuple(r.route.methods)) for r in refs}
+
+
+def test_minimal_paths_and_verbs(eps):
+    got = pm(eps)
+    for want in [("/", ("GET",)), ("/api/orders/{id}", ("GET",)), ("/api/orders", ("POST",)),
+                 ("/api/status", ("GET",)), ("/api/admin/users/{id}", ("DELETE",)),
+                 ("/v2/users", ("GET",)), ("/audit/a", ("GET",))]:
+        assert want in got, want
+    r = ep(eps, "/api/orders")
+    assert r.style == "minimalapi" and r.route.meta["kind"] == "minimalapi"
+    assert r.route.meta["api_surface"] is True and "env" not in r.route.meta
+
+
+def test_lambda_handler_body_and_params(eps):
+    r = ep(eps, "/api/orders/{id}")
+    assert r.method.name.startswith("<lambda@")
+    assert [p.name for p in r.method.params] == ["id", "store"]
+    assert [p.type for p in r.method.params] == ["int", "OrderStore"]
+    assert r.method.body and r.method.body[0]["k"] == "return"
+    assert r.type.name == "Program"
+    assert r.route.source_start_line <= r.method.line <= r.method.end_line <= r.route.source_end_line
+
+
+def test_method_group_handler(eps):
+    r = ep(eps, "/api/orders")
+    assert r.method.name == "CreateOrder"
+    assert [p.name for p in r.method.params] == ["o"]
+
+
+def test_group_calls_recorded(eps):
+    r = ep(eps, "/api/admin/users/{id}")
+    assert [g.prefix for g in r.groups] == ["/api", "/admin"]
+    assert all(_names(g.calls) == ["RequireAuthorization"] for g in r.groups)
+    assert _names(ep(eps, "/api/status").endpoint_calls) == ["AllowAnonymous"]
+    assert ep(eps, "/api/orders").endpoint_calls == []
+    assert ep(eps, "/").groups == []
+
+
+def test_extension_method_followed(eps):
+    r = ep(eps, "/v2/users")
+    assert [g.prefix for g in r.groups] == ["/v2"]
+    assert r.caller_unknown is False and r.unknown == []
+
+
+def test_untraced_chain_marked(eps):
+    for path in ("/audit/a", "/audit/b"):
+        r = ep(eps, path)
+        assert not any("RequireAuthorization" in _names(g.calls) for g in r.groups)
+        assert any("MapAuditEndpoints" in u for u in r.unknown), path
+        assert r.caller_unknown is False
+
+
+def test_unreached_method_caller_unknown(eps):
+    r = ep(eps, "/orphan")
+    assert r.caller_unknown is True and r.route.methods == ["POST"]
+    assert ep(eps, "/").caller_unknown is False
+
+
+def test_other_endpoints(eps):
+    hub = ep(eps, "/chat")
+    assert hub.route.meta["kind"] == "hub" and hub.type.name == "ChatHub" and hub.style == "endpoint"
+    assert ep(eps, "/healthz").route.meta["kind"] == "health"
+    sw = ep(eps, "/swagger")
+    assert sw.route.meta["kind"] == "openapi" and sw.route.meta["middleware"] is True
+    assert sw.route.meta["env"] == "Development"
+    assert ep(eps, "/swagger/{documentName}/swagger.json").route.meta["middleware"] is True
+    assert ep(eps, "/debug/env").route.meta["env"] == "Development"
+
+
+def _copy_minimal(tmp_path):
+    root = tmp_path / "mini"
+    shutil.copytree(MINIMAL, root)
+    return root
+
+
+def test_resolved_sym_elsewhere_is_not_a_route(roslyn_helper, tmp_path):
+    root = _copy_minimal(tmp_path)
+    (root / "Router.cs").write_text(
+        "public class Router { public void MapGet(string p, Func<int> h) { } }" + chr(10)
+        + 'public static class RouterUse { public static void Go() { new Router().MapGet("/x", () => 1); } }' + chr(10))
+    out = _discover_eps(root)
+    assert not any(r.route.path == "/x" for r in out)
+    assert ("/" , ("GET",)) in pm(out)
+
+
+def test_degraded_minimal_routes(roslyn_helper, monkeypatch):
+    full = pm(_discover_eps(MINIMAL))
+    monkeypatch.setattr("checks.dnl.helper.find_helper", lambda *a, **k: None)
+    monkeypatch.setattr("checks.dnl.helper.sdk_available", lambda *a, **k: False)
+    assert pm(_discover_eps(MINIMAL, True)) == full
+
+
+def test_discover_all_combines_and_caches(roslyn_helper):
+    project._CACHE.clear()
+    project.prepare(MINIMAL, False)
+    model = project.get_model(MINIMAL, "dotnet")
+    allr = discover_all(model)
+    assert allr is discover_all(model) and model.cache["core_routes"] is allr
+    assert {r.style for r in allr} == {"minimalapi", "endpoint"}
+    assert len(allr) == len(discover_endpoints(model)) + len(discover_controllers(model)) + len(discover_pages(model))
+
+
+def _edit(root, name, old, new):
+    f = root / name
+    text = f.read_text()
+    assert old in text, (name, old)
+    f.write_text(text.replace(old, new))
+
+
+def test_convention_after_followed_group_applies_as_extra_group(roslyn_helper, tmp_path):
+    root = _copy_minimal(tmp_path)
+    _edit(root, "Program.cs", 'app.MapGroup("/v2").MapUserEndpoints();',
+          'app.MapGroup("/v2").MapUserEndpoints().RequireAuthorization();')
+    r = ep(_discover_eps(root), "/v2/users")
+    assert [g.prefix for g in r.groups] == ["/v2", ""]
+    assert _names(r.groups[1].calls) == ["RequireAuthorization"] and r.groups[0].calls == []
+    assert r.unknown == []
+
+
+def test_convention_after_returned_route_applies_to_that_route_only(roslyn_helper, tmp_path):
+    root = _copy_minimal(tmp_path)
+    _edit(root, "AuditEndpoints.cs", 'var b = e.MapGet("/audit/b", () => 2);\n        return new CompositeConventionBuilder(a, b);',
+          'e.MapGet("/audit/b", () => 2);\n        return a;')
+    out = _discover_eps(root)
+    a, b = ep(out, "/audit/a"), ep(out, "/audit/b")
+    assert _names(a.endpoint_calls) == ["RequireAuthorization"] and a.unknown == []
+    assert b.endpoint_calls == [] and b.unknown == []
+
+
+def test_group_bound_from_a_local_through_static_call_form(roslyn_helper, tmp_path):
+    root = _copy_minimal(tmp_path)
+    _edit(root, "Program.cs", 'app.MapGroup("/v2").MapUserEndpoints();',
+          'var v2 = app.MapGroup("/v2").RequireAuthorization();\nUserEndpoints.MapUserEndpoints(v2);')
+    r = ep(_discover_eps(root), "/v2/users")
+    assert [g.prefix for g in r.groups] == ["/v2"] and _names(r.groups[0].calls) == ["RequireAuthorization"]
+
+
+STARTUP = """using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Routing;
+
+public class Startup
+{
+    public void ConfigureServices(IServiceCollection services) { services.AddGrpc(); }
+
+    public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
+    {
+        app.UseRouting();
+        app.UseEndpoints(endpoints =>
+        {
+            endpoints.MapMethods("/m", new[] { "get", "put" }, () => "m");
+            var g = endpoints.MapGroup("/g").WithTags("t");
+            g.MapGet("/one", Handlers.One);
+            g.MapGet("/two", Missing);
+            endpoints.MapGrpcService<GreeterService>();
+            endpoints.MapFallbackToFile("index.html");
+            if (env.IsDevelopment()) { endpoints.MapGet("/dev", () => 1); }
+            Local(endpoints);
+            void Local(IEndpointRouteBuilder b) { b.MapPut("/local", () => 2); }
+        });
+    }
+}
+
+public static class Handlers { public static string One() => "1"; }
+public class GreeterService { }
+"""
+
+
+def _startup_app(tmp_path):
+    root = tmp_path / "su"
+    root.mkdir()
+    (root / "Su.csproj").write_text('<Project Sdk="Microsoft.NET.Sdk.Web"><PropertyGroup>'
+                                     "<TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings>"
+                                     "</PropertyGroup></Project>")
+    (root / "Startup.cs").write_text(STARTUP)
+    return root
+
+
+def test_useendpoints_lambda_groups_handlers_and_other_maps(roslyn_helper, tmp_path):
+    out = _discover_eps(_startup_app(tmp_path))
+    got = {(r.route.path, tuple(r.route.methods)) for r in out}
+    assert ("/m", ("GET", "PUT")) in got
+    assert ("/g/one", ("GET",)) in got and ("/g/two", ("GET",)) in got
+    assert ("/local", ("PUT",)) in got
+    one, two = ep(out, "/g/one"), ep(out, "/g/two")
+    assert one.method.name == "One" and one.type.name == "Handlers" and one.route.handler_name == "Handlers.One"
+    assert two.method is None and any("handler Missing not resolved" in u for u in two.unknown)
+    assert _names(one.groups[0].calls) == ["WithTags"]
+    grpc = ep(out, "/GreeterService/*")
+    assert grpc.route.meta["kind"] == "grpc" and grpc.route.meta["api_surface"] is True
+    assert grpc.type.name == "GreeterService"
+    assert ep(out, "/{**path}").route.meta["kind"] == "fallback"
+    assert ep(out, "/dev").route.meta["env"] == "Development"
+    assert ep(out, "/local").route.meta.get("env") is None
+
+
+def test_dev_only_local_function_call_carries_env(roslyn_helper, tmp_path):
+    root = _startup_app(tmp_path)
+    _edit(root, "Startup.cs", "            Local(endpoints);", "            if (env.IsDevelopment()) { Local(endpoints); }")
+    assert ep(_discover_eps(root), "/local").route.meta["env"] == "Development"
+
+
+def test_unresolved_group_receiver_is_marked(roslyn_helper, tmp_path):
+    root = _copy_minimal(tmp_path)
+    _edit(root, "Program.cs", 'var admin = api.MapGroup("/admin").RequireAuthorization("AdminOnly");',
+          'var admin = args.Length > 0 ? api.MapGroup("/admin") : api.MapGroup("/other");')
+    r = ep(_discover_eps(root), "/users/{id}")
+    assert any("could not be traced" in u for u in r.unknown)
+
+
+def test_extension_methods_nobody_calls_are_all_caller_unknown(roslyn_helper, tmp_path):
+    root = tmp_path / "empty"
+    shutil.copytree(MINIMAL, root)
+    (root / "Program.cs").write_text("var app = WebApplication.CreateBuilder(args).Build(); app.Run();")
+    out = _discover_eps(root)
+    assert {r.route.path for r in out} == {"/orphan", "/users", "/audit/a", "/audit/b"}
+    assert all(r.caller_unknown for r in out)

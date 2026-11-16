@@ -280,3 +280,24 @@ def test_local_function_bindings_hide_captured_env_locals(roslyn_helper, monkeyp
     monkeypatch.setattr(helper, "find_helper", lambda *a: None)
     monkeypatch.setattr(helper, "sdk_available", lambda: False)
     assert _truth(_pipe("shadow", True)) == t
+
+
+def test_useendpoints_lambda_calls_are_pipeline_calls(roslyn_helper):
+    p = _pipe("startup")
+    mc = _by(p, "MapControllers")
+    assert mc.kind == "endpoints" and mc.env is None and mc.via == ()
+    assert names_in_order(p, "UseEndpoints", "MapControllers")
+
+
+def names_in_order(p, *want):
+    seq = [c.name for c in p.calls if c.name in want]
+    return seq == list(want)
+
+
+def test_followed_calls_record_via_and_target(roslyn_helper):
+    p = _pipe("minimal")
+    followed = [c for c in p.calls if c.target is not None]
+    assert followed and all(c.target[1].name == c.name for c in followed)
+    inner = [c for c in p.calls if c.via]
+    assert inner and all(c.via[-1] in {id(f.node) for f in followed} for c in inner)
+    assert p.entries and all(isinstance(t, ir.TypeIR) for t, _ in p.entries)
