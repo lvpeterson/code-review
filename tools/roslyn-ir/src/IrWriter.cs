@@ -12,7 +12,7 @@ namespace RoslynIr;
 /// </summary>
 internal sealed class IrWriter
 {
-    public const int Schema = 1;
+    public const int Schema = 2;
 
     // Relaxed escaping keeps non-ASCII text readable; quotes and control
     // characters are still escaped, so each record stays a single line.

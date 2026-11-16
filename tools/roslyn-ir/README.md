@@ -1,7 +1,7 @@
 # roslyn-ir
 
 A small .NET 8 console tool that parses C# and VB.NET sources with Roslyn and
-emits a JSON IR (schema 1) for the `dotnet_legacy` analyzer. The Python side
+emits a JSON IR (schema 2) for the `dotnet_legacy` analyzer. The Python side
 (`checks/dnl/`) drives it as a subprocess; this is the only C# code in the repo.
 
 ## Build
@@ -35,10 +35,17 @@ data: its `v4.8/*.dll` and `v4.8/Facades/*.dll` are copied flat into
 them from `AppContext.BaseDirectory`, never from a Windows reference-assembly
 path or the GAC, so semantic resolution works the same on Linux.
 
+A second profile, `netcore`, serves SDK-style ASP.NET Core projects. The
+`Microsoft.NETCore.App.Ref` and `Microsoft.AspNetCore.App.Ref` packages (both
+pinned to `[8.0.11]`) are DotnetPlatform packages, so the csproj uses
+`PackageDownload` (a `PackageReference` fails with NU1213) and copies
+`ref/net8.0/*.dll` from the NuGet cache (lower-case package folders) flat into
+`refs/netcore/` next to the binary. The SDK's own `packs/` folder is never used.
+
 ## CLI contract
 
 - `roslyn-ir probe` -- parses, compiles and lowers one embedded C# and one
-  embedded VB snippet (no target files), then writes `{"ok":true,"schema":1}` and exits 0. Any failure exits non-zero, including a missing or empty `refs/net48` (stderr says to republish).
+  embedded VB snippet (no target files), plus one ASP.NET Core snippet compiled with the `netcore` profile, then writes `{"ok":true,"schema":2}` and exits 0. Any failure exits non-zero, including a missing or empty `refs/net48` or `refs/netcore` (stderr names the folder and says to republish).
 - `roslyn-ir parse --input <request.json>` -- request:
 
   ```json
@@ -49,6 +56,12 @@ path or the GAC, so semantic resolution works the same on Linux.
   A project may also carry `"imports": ["System.Data.SqlClient", ...]` (VB
   only): extra global imports added to the template defaults, for namespaces a
   `.vbproj` imports project-wide. Invalid entries are skipped.
+
+  A project may also carry `"refs": "net48" | "netcore"` (default `"net48"`;
+  an unknown name falls back to `net48` with a stderr warning) choosing the
+  reference-assembly folder, and `"global_usings": ["Microsoft.AspNetCore.Http", ...]`
+  (C# only): namespaces compiled as `global using` directives, standing in for
+  an SDK project's implicit usings.
 
   Writes JSON Lines to stdout, one object per file, in input order. A file that
   cannot be read or lowered yields `{"path": rel, "error": "<message>"}` and the
@@ -61,7 +74,7 @@ path or the GAC, so semantic resolution works the same on Linux.
 Exit codes: 0 ok (even with per-file errors), 1 fatal (bad request, probe
 failure), 2 usage.
 
-## IR summary (schema 1)
+## IR summary (schema 2)
 
 - FileIR: `path` (relative to `root`, forward slashes), `language` (`cs`|`vb`),
   `project`, `parse_errors` (count of Roslyn error diagnostics), `types`.

@@ -19,7 +19,7 @@ from pathlib import Path
 from checks.dnl.files import iter_dnl_files
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 HELPER_ENV = "CODE_REVIEW_ROSLYN_IR"
 
 DEGRADED_REASON = (

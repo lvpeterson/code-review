@@ -33,16 +33,32 @@ internal sealed class Semantics
 
     // -- compilations ---------------------------------------------------------
 
-    static readonly Lazy<IReadOnlyList<MetadataReference>> Refs = new(LoadRefs);
-
-    /// <summary>Number of reference assemblies that loaded; probe fails when zero.</summary>
-    public static int RefCount => Refs.Value.Count;
-
-    /// <summary>All refs/net48/*.dll beside the binary, loaded once per process
-    /// and shared by every project's compilation.</summary>
-    static IReadOnlyList<MetadataReference> LoadRefs()
+    // One lazily loaded reference set per profile folder under refs/.
+    static readonly Dictionary<string, Lazy<IReadOnlyList<MetadataReference>>> RefSets = new()
     {
-        string dir = Path.Combine(AppContext.BaseDirectory, "refs", "net48");
+        ["net48"] = new(() => LoadRefs("net48")),
+        ["netcore"] = new(() => LoadRefs("netcore")),
+    };
+
+    /// <summary>Unknown profile names fall back to net48 with a warning.</summary>
+    static string Normalize(string? profile)
+    {
+        if (profile is null) return "net48";
+        if (RefSets.ContainsKey(profile)) return profile;
+        Console.Error.WriteLine($"roslyn-ir: warning: unknown refs profile '{profile}'; using net48");
+        return "net48";
+    }
+
+    static IReadOnlyList<MetadataReference> RefsFor(string profile) => RefSets[Normalize(profile)].Value;
+
+    /// <summary>Number of reference assemblies that loaded for a profile; probe fails when zero.</summary>
+    public static int RefCount(string profile) => RefsFor(profile).Count;
+
+    /// <summary>All refs/&lt;profile&gt;/*.dll beside the binary, loaded once per process
+    /// and shared by every project's compilation.</summary>
+    static IReadOnlyList<MetadataReference> LoadRefs(string profile)
+    {
+        string dir = Path.Combine(AppContext.BaseDirectory, "refs", profile);
         var list = new List<MetadataReference>();
         if (!Directory.Exists(dir))
         {
@@ -71,16 +87,18 @@ internal sealed class Semantics
 
     /// <summary>One compilation for a project's parsed trees; null if it cannot be built.</summary>
     public static Compilation? Compile(string language, string project, IReadOnlyList<SyntaxTree> trees,
-        IReadOnlyList<string>? extraImports = null)
+        IReadOnlyList<string>? extraImports = null, string profile = "net48",
+        IReadOnlyList<string>? globalUsings = null)
     {
         try
         {
             string name = string.IsNullOrEmpty(project) ? "project" : project;
+            var refs = RefsFor(profile);
             return language switch
             {
-                "cs" => CS.CSharpCompilation.Create(name, trees.Cast<CS.CSharpSyntaxTree>(), Refs.Value,
+                "cs" => CS.CSharpCompilation.Create(name, WithGlobalUsings(trees, globalUsings), refs,
                     new CS.CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, allowUnsafe: true)),
-                "vb" => VB.VisualBasicCompilation.Create(name, trees.Cast<VB.VisualBasicSyntaxTree>(), Refs.Value,
+                "vb" => VB.VisualBasicCompilation.Create(name, trees.Cast<VB.VisualBasicSyntaxTree>(), refs,
                     new VB.VisualBasicCompilationOptions(OutputKind.DynamicallyLinkedLibrary,
                         globalImports: VbDefaultImports.Concat(extraImports ?? []).Distinct().Select(ParseImport).OfType<VB.GlobalImport>(),
                         optionStrict: VB.OptionStrict.Off, optionInfer: true)),
@@ -92,6 +110,19 @@ internal sealed class Semantics
             Console.Error.WriteLine($"roslyn-ir: {project}: compilation failed, emitting syntax only: {ex.Message}");
             return null;
         }
+    }
+
+    /// <summary>The project's trees plus, when namespaces are given, one extra tree
+    /// declaring them as C# global usings (parsed with the same options).</summary>
+    static IEnumerable<CS.CSharpSyntaxTree> WithGlobalUsings(IReadOnlyList<SyntaxTree> trees, IReadOnlyList<string>? globalUsings)
+    {
+        var all = trees.Cast<CS.CSharpSyntaxTree>().ToList();
+        var ns = (globalUsings ?? []).Where(n => !string.IsNullOrWhiteSpace(n)).Select(n => n.Trim()).Distinct().ToList();
+        if (ns.Count > 0 && all.Count > 0)
+            all.Add((CS.CSharpSyntaxTree)CS.CSharpSyntaxTree.ParseText(
+                string.Concat(ns.Select(n => $"global using global::{n};\n")),
+                (CS.CSharpParseOptions)all[0].Options, "GlobalUsings.g.cs"));
+        return all;
     }
 
     /// <summary>A malformed caller-supplied import is skipped, not fatal.</summary>

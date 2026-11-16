@@ -5,9 +5,11 @@ using Microsoft.CodeAnalysis;
 namespace RoslynIr;
 
 /// <summary>
-/// roslyn-ir CLI (IR schema 1).
-///   roslyn-ir probe                     -> {"ok": true, "schema": 1}
+/// roslyn-ir CLI (IR schema 2).
+///   roslyn-ir probe                     -> {"ok": true, "schema": 2}
 ///   roslyn-ir parse --input req.json    -> one FileIR JSON object per line on stdout
+/// Per-project request keys: refs ("net48" default | "netcore"), global_usings
+/// (C# namespaces), imports (VB global imports); "references" is ignored.
 /// stdout carries only JSON Lines; diagnostics go to stderr.
 /// </summary>
 internal static class Program
@@ -58,20 +60,25 @@ internal static class Program
 
         // A publish without refs/net48 would still "work" but resolve no
         // symbols, silently weakening every rule; make it loud instead.
-        if (Semantics.RefCount == 0)
-        {
-            Console.Error.WriteLine("roslyn-ir: probe failed: no reference assemblies loaded from "
-                + Path.Combine(AppContext.BaseDirectory, "refs", "net48")
-                + "; republish the helper (dotnet publish tools/roslyn-ir/src/RoslynIr.csproj -c Release -o tools/roslyn-ir/bin)");
-            return ExitFatal;
-        }
+        foreach (var prof in new[] { "net48", "netcore" })
+            if (Semantics.RefCount(prof) == 0)
+            {
+                Console.Error.WriteLine("roslyn-ir: probe failed: no reference assemblies loaded from "
+                    + Path.Combine(AppContext.BaseDirectory, "refs", prof)
+                    + "; republish the helper (dotnet publish tools/roslyn-ir/src/RoslynIr.csproj -c Release -o tools/roslyn-ir/bin)");
+                return ExitFatal;
+            }
+
+        const string csCore =
+            "using Microsoft.AspNetCore.Mvc; [ApiController] public class C : ControllerBase " +
+            "{ public IActionResult A() => Ok(); }\n";
 
         // Exercises the full semantic path (reference loading, compilation,
         // annotation) on the snippets; no target files are involved.
-        foreach (var (lang, src) in new[] { ("cs", cs), ("vb", vb) })
+        foreach (var (lang, src, prof) in new[] { ("cs", cs, "net48"), ("vb", vb, "net48"), ("cs", csCore, "netcore") })
         {
             var tree = ParseTree(lang, src, "probe");
-            var compilation = Semantics.Compile(lang, "probe", [tree]);
+            var compilation = Semantics.Compile(lang, "probe", [tree], null, prof);
             var bytes = LowerToBytes(lang, "probe", "probe", tree, Semantics.For(compilation, tree));
             using var doc = JsonDocument.Parse(bytes);
             if (doc.RootElement.GetProperty("types").GetArrayLength() != 1)
@@ -104,6 +111,15 @@ internal static class Program
                 foreach (var i in imps.EnumerateArray())
                     if (i.GetString() is { Length: > 0 } ns) imports.Add(ns);
 
+            // Optional reference profile ("net48" default, or "netcore") and
+            // C# global usings (namespaces) for SDK-style implicit usings.
+            string profile = project.TryGetProperty("refs", out var rf) && rf.ValueKind == JsonValueKind.String
+                ? rf.GetString() ?? "net48" : "net48";
+            var usings = new List<string>();
+            if (project.TryGetProperty("global_usings", out var gus) && gus.ValueKind == JsonValueKind.Array)
+                foreach (var g in gus.EnumerateArray())
+                    if (g.GetString() is { Length: > 0 } gns) usings.Add(gns);
+
             // Pass 1: read and parse every file; a failure costs only that file.
             var files = new List<(string Rel, SyntaxTree? Tree, string? Error)>();
             foreach (var f in project.GetProperty("files").EnumerateArray())
@@ -124,7 +140,7 @@ internal static class Program
 
             // One compilation per project, one SemanticModel per tree.
             var trees = files.Where(x => x.Tree is not null).Select(x => x.Tree!).ToList();
-            var compilation = trees.Count > 0 ? Semantics.Compile(language, name, trees, imports) : null;
+            var compilation = trees.Count > 0 ? Semantics.Compile(language, name, trees, imports, profile, usings) : null;
 
             // Pass 2: lower in request order.
             foreach (var (rel, tree, error) in files)

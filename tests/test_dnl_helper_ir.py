@@ -1,4 +1,4 @@
-"""Drives the built roslyn-ir helper binary end to end (schema 1 IR)."""
+"""Drives the built roslyn-ir helper binary end to end (schema 2 IR)."""
 import json
 import shutil
 import subprocess
@@ -15,12 +15,16 @@ def helper(roslyn_helper):
     return roslyn_helper
 
 
-def run_parse(helper, root, projects, imports=None):
+def run_parse(helper, root, projects, imports=None, refs=None, global_usings=None):
     """projects: [(name, language, [paths])] -> list of decoded JSON Lines.
-    imports: optional {project name: [VB global imports]}."""
+    imports: optional {project name: [VB global imports]}.
+    refs: optional {project name: "net48" | "netcore"}.
+    global_usings: optional {project name: [C# namespaces]}."""
     req = {"root": str(root), "projects": [
         {"name": n, "language": lang, "files": [str(p) for p in files], "references": [],
-         **({"imports": imports[n]} if imports and n in imports else {})}
+         **({"imports": imports[n]} if imports and n in imports else {}),
+         **({"refs": refs[n]} if refs and n in refs else {}),
+         **({"global_usings": global_usings[n]} if global_usings and n in global_usings else {})}
         for n, lang, files in projects]}
     req_path = root / "_request.json"
     req_path.write_text(json.dumps(req), encoding="utf-8")
@@ -44,7 +48,52 @@ def parse_one(helper, root, name, language, text):
 
 def test_probe(helper):
     out = subprocess.run([helper, "probe"], capture_output=True, text=True, check=True).stdout
-    assert json.loads(out) == {"ok": True, "schema": 1}
+    assert json.loads(out) == {"ok": True, "schema": 2}
+
+
+def walk_nodes(o):
+    """Every dict nested anywhere in a decoded IR value."""
+    if isinstance(o, dict):
+        yield o
+        for v in o.values():
+            yield from walk_nodes(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from walk_nodes(v)
+
+
+def parse_profile(helper, root, text, **kw):
+    path = root / "C.cs"
+    path.write_bytes(text.encode("utf-8"))
+    lines = run_parse(helper, root, [("p", "cs", [path])],
+                      refs={"p": kw["refs"]} if "refs" in kw else None,
+                      global_usings={"p": kw["global_usings"]} if "global_usings" in kw else None)
+    assert len(lines) == 1
+    return lines[0]
+
+
+OK_SRC = ("using Microsoft.AspNetCore.Mvc; public class C : ControllerBase "
+          "{ public IActionResult A() { return Ok(); } }")
+
+
+def test_netcore_profile_resolves_aspnetcore_symbols(helper, tmp_path):
+    ir = parse_profile(helper, tmp_path, OK_SRC, refs="netcore")
+    syms = [n.get("sym") for n in walk_nodes(ir) if n.get("k") == "call"]
+    assert "Microsoft.AspNetCore.Mvc.ControllerBase.Ok" in syms
+
+
+def test_net48_default_unchanged(helper, tmp_path):
+    ir = parse_profile(helper, tmp_path, OK_SRC)
+    calls = [n for n in walk_nodes(ir) if n.get("k") == "call"]
+    assert calls and all("sym" not in n for n in calls)
+
+
+def test_global_usings_apply(helper, tmp_path):
+    src = "public class C { void M(HttpContext c) { var q = c.Request.Query[\"x\"]; } }"
+    ir = parse_profile(helper, tmp_path, src, refs="netcore",
+                       global_usings=["Microsoft.AspNetCore.Http"])
+    syms = [n.get("sym") for n in walk_nodes(ir) if n.get("k") == "member" and n.get("name") == "Query"]
+    assert syms == ["Microsoft.AspNetCore.Http.HttpRequest.Query"]
 
 
 def test_csharp_controller_ir(helper, tmp_path):
