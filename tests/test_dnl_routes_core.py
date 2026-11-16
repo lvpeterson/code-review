@@ -336,3 +336,32 @@ def test_dev_only_mapping_notes_unknown(roslyn_helper, tmp_path):
     out = _discover_pages(root)
     assert out and all(r.convention_calls == [] for r in out)
     assert all(any("outside Production" in u for u in r.unknown) for r in out)
+
+
+def test_dev_only_controller_mappings_note_attribute_and_assumed_routes(roslyn_helper, tmp_path):
+    root = _copy(tmp_path)
+    prog = root / "Program.cs"
+    text = prog.read_text().replace(
+        'app.MapControllerRoute("default", "{controller=Home}/{action=Index}/{id?}");', "")
+    prog.write_text(text.replace(
+        "app.MapControllers();", "if (app.Environment.IsDevelopment()) { app.MapControllers(); }"))
+    out = _discover(root)
+    attr = rt(out, "OrdersController.Get")
+    assumed = rt(out, "HomeController.Index")
+    assert assumed.route.meta["route_assumed"] is True
+    for r in (attr, assumed):
+        assert any("outside Production" in u for u in r.unknown), r.route.handler_name
+
+
+def test_differently_chained_page_mappings_keep_shared_prefix_and_note(roslyn_helper, tmp_path):
+    root = _razor_copy(tmp_path)
+    prog = root / "Program.cs"
+    prog.write_text(prog.read_text().replace(
+        "app.MapRazorPages();",
+        "if (app.Configuration[\"x\"] == \"1\") { app.MapRazorPages().RequireAuthorization().WithDisplayName(\"a\"); }"
+        " else { app.MapRazorPages().RequireAuthorization(); }"))
+    out = _discover_pages(root)
+    assert out
+    for r in out:
+        assert _names(r.convention_calls) == ["RequireAuthorization"]
+        assert any("chained differently" in u for u in r.unknown)

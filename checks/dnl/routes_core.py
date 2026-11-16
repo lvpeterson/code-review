@@ -386,6 +386,9 @@ def _controller_routes(model: ProjectModel, t: TypeIR, decls: list[TypeIR], chai
                 links, note = attr_links, attr_note
             elif mapping:
                 links, note = _common_tail([mapping.call])
+            elif maps and all(x.call.runs_in("Production") is False for x in maps):
+                # An assumed route leans on whatever mapping exists; none of it runs in Production.
+                links, note = [], "the mapping call only runs outside Production; its conventions were not applied"
             else:
                 links, note = [], None
             refs.append(CoreRouteRef(route, t, m, proj, style="controller", convention_calls=list(links),
