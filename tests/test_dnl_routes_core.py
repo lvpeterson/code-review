@@ -736,21 +736,53 @@ app.Run();""")
     assert any("RequireAuthorization applied to the result of MapIdentityApi could not be traced" in u for u in r.unknown)
 
 
-def test_unmodelled_map_extension_is_noted_on_model_and_group(roslyn_helper, tmp_path):
+@pytest.mark.parametrize("degraded", [False, True])
+def test_unmodelled_map_extension_is_noted_on_model_and_group(roslyn_helper, tmp_path, monkeypatch, degraded):
     root = _copy_minimal(tmp_path)
     _edit(root, "Program.cs", "app.Run();", """app.MapGroup("/account").MapIdentityApi<IdentityUser>();
 var ag = app.MapGroup("/acct2");
 ag.MapGet("/me", () => 1);
 ag.MapIdentityApi<IdentityUser>();
 app.Run();""")
+    if degraded:
+        _degraded(monkeypatch)
     project._CACHE.clear()
-    project.prepare(root, False)
+    project.prepare(root, degraded)
     model = project.get_model(root, "dotnet")
     out = discover_endpoints(model)
     assert any("MapIdentityApi" in n and "Program.cs:" in n and "review them manually" in n for n in model.notes)
     # called on a group local: routes on that group, registered before or after, carry the note
     assert any("MapIdentityApi registers endpoints" in u for u in ep(out, "/acct2/me").unknown)
     assert ep(out, "/").unknown == []
+    # solution extension methods are followed, never reported as unmodelled
+    assert not any("MapUserEndpoints" in n or "MapAuditEndpoints" in n for n in model.notes)
+
+
+@pytest.mark.parametrize("degraded", [False, True])
+def test_unmodelled_map_in_unwalked_branch_is_noted(roslyn_helper, tmp_path, monkeypatch, degraded):
+    root = _copy_minimal(tmp_path)
+    _edit(root, "Program.cs", "app.Run();",
+          "app.MapWhen(c => true, b => { b.MapIdentityApi<IdentityUser>(); });" + chr(10) + "app.Run();")
+    if degraded:
+        _degraded(monkeypatch)
+    project._CACHE.clear()
+    project.prepare(root, degraded)
+    model = project.get_model(root, "dotnet")
+    discover_endpoints(model)
+    assert any("MapIdentityApi" in n and "Program.cs:" in n for n in model.notes)
+
+
+def test_two_untraced_hops_still_note_the_group(roslyn_helper, tmp_path):
+    root = _copy_minimal(tmp_path)
+    _edit(root, "Program.cs", "app.Run();", """var hg = app.MapGroup("/h2");
+hg.MapGet("/x", () => 1);
+hg.MapIdentityApi<IdentityUser>().Foo().RequireAuthorization();
+hg.MapIdentityApi<IdentityUser>().WithTags("x").RequireAuthorization();
+app.Run();""")
+    r = ep(_discover_eps(root), "/h2/x")
+    assert not any("RequireAuthorization" in _names(g.calls) for g in r.groups)
+    assert any("RequireAuthorization applied to the result of Foo could not be traced" in u for u in r.unknown)
+    assert any("RequireAuthorization applied to the result of MapIdentityApi could not be traced" in u for u in r.unknown)
 
 
 def test_dev_only_swept_registration_is_flagged(roslyn_helper, tmp_path):

@@ -806,6 +806,7 @@ class _Scan:
         self.called_fns: set[int] = set()
         self.fn_stack: set[int] = set()
         self.seen_mw: set[tuple] = set()
+        self.method_names = {m.name for f in model.files.values() for t in f.types for m in t.methods}
         self.consumed: set[int] = set()         # id() of the Map / Use* call nodes already registered
 
     # -- driver ------------------------------------------------------------
@@ -846,6 +847,8 @@ class _Scan:
                     elif self.is_map(link, name, False):
                         entry = self.register(fr, link, name, None, None)
                         entry.ref.unknown[:0] = [_SWEEP_MSG, _SWEEP_ENV_MSG]
+                    elif self.is_unmodelled(link, name, False):
+                        self.unmodelled(fr, link, name, None, None)
 
     def finish(self, e: _Entry) -> CoreRouteRef:
         """Fill in the group chain (outermost first) once every convention has been seen."""
@@ -989,8 +992,7 @@ class _Scan:
             return g
         if not arg and self.is_map(link, name, known):
             return self.register(fr, link, name, node, pc)
-        if (not arg and name.startswith("Map") and name != "MapGroup" and name not in _HANDLED_MAPS
-                and self.is_endpoint_call(link, name, known)):
+        if not arg and self.is_unmodelled(link, name, known):
             self.unmodelled(fr, link, name, pc, node)
         if (not arg and name in ("UseSwagger", "UseSwaggerUI")
                 and self.is_endpoint_call(link, name, known or (pc is not None and pc.kind == "app"))):
@@ -998,9 +1000,21 @@ class _Scan:
             return state
         return self.convention(fr, link, state, name)
 
+    def is_unmodelled(self, link: dict, name: str, known: bool) -> bool:
+        """A Map* call that registers endpoints the engine does not model. With no symbol the name
+        decides (`Map` + capital, called on something, not a solution method)."""
+        if (len(name) < 4 or not name.startswith("Map") or not name[3].isupper() or name == "MapGroup"
+                or name in _HANDLED_MAPS or name in self.method_names):
+            return False
+        if self.is_endpoint_call(link, name, known):
+            return True
+        fn = link.get("fn")
+        return not link.get("sym") and isinstance(fn, dict) and fn.get("k") == "member"
+
     def unmodelled(self, fr: _Frame, link: dict, name: str, pc: PipeCall | None, node: _Node | None) -> None:
         """A Map* extension on a builder (`MapIdentityApi`) registers endpoints this engine cannot
         list: say so on the model, and on the routes of the group it was called on."""
+        self.consumed.add(id(link))
         where = f"{pc.file if pc is not None else fr.type.file}:{link.get('line', 0)}"
         note = f"{name} at {where} registers endpoints the engine cannot list; review them manually"
         if note not in self.model.notes:
@@ -1082,6 +1096,11 @@ class _Scan:
         if state is None:
             return None
         if not self.passes_through(link, name, state):
+            # Two untraced hops in a row (`g.MapX().Foo().RequireAuthorization()`): the origin stays the
+            # first thing that was a group or a route, not the previous untraced result.
+            if isinstance(state, _Result) and not state.traced:
+                return _Result([], False, name, list(state.entries), fr.type.file, link.get("line", 0),
+                               depth=fr.cond, origin=state.origin)
             return _Result([], False, name, [], fr.type.file, link.get("line", 0), depth=fr.cond, origin=state)
         cond_note = f"{name} applied conditionally"
         if isinstance(state, _Entry):
