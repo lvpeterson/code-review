@@ -263,3 +263,20 @@ def test_local_function_closures_and_static_method_conditions(roslyn_helper, mon
     monkeypatch.setattr(helper, "sdk_available", lambda: False)
     deg = _pipe("closures", True)
     assert _truth(deg) == t
+
+
+# -- fix round 4 ------------------------------------------------------------
+
+def test_local_function_bindings_hide_captured_env_locals(roslyn_helper, monkeypatch):
+    p = _pipe("shadow")
+    t = _truth(p)
+    # The callee's own `dev` is not the caller's env-bool: never reported as running in Production.
+    for name in ("UseCors", "UseSession", "UseHsts"):
+        assert t[name][1] is not True and t[name][0] is not True, name
+    assert {c.name for c in p.uncertain()} >= {"UseCors", "UseSession", "UseHsts"}
+    assert not {"UseCors", "UseSession", "UseHsts"} & {c.name for c in p.named()}
+    assert t["UseRouting"] == (True, True)
+    project._CACHE.clear()
+    monkeypatch.setattr(helper, "find_helper", lambda *a: None)
+    monkeypatch.setattr(helper, "sdk_available", lambda: False)
+    assert _truth(_pipe("shadow", True)) == t

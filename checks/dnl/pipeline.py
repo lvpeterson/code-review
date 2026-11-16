@@ -150,17 +150,31 @@ def _env_node(n: dict) -> bool:
     return False
 
 
+def _closure_scope(scope: dict, lam: dict) -> dict:
+    """The caller's scope as a local function sees it: a name the function binds itself
+    (parameter or local) hides the caller's environment fact about that name, so it is
+    unknown rather than the caller's value."""
+    names = {x for x in lam.get("params") or [] if isinstance(x, str)}
+    names |= {n.get("name") for n in walk(lam.get("body")) if n.get("k") == "local" and n.get("name")}
+    out = dict(scope)
+    for n in names:
+        if (_ENV_LOCAL + n) in out or (_TAINT + n) in out:
+            out.pop(_ENV_LOCAL + n, None)
+            out[_TAINT + n] = True
+    return out
+
+
 def _callee_body(ctx: _Ctx, scope: dict, call: dict) -> tuple:
-    """(body, is_local) of the solution method or local function a call goes to; the body is
-    a stmt list, or the expression of an expression-bodied lambda. (None, False) for
+    """(body, scope to read it in) of the solution method or local function a call goes to;
+    the body is a stmt list, or the expression of an expression-bodied lambda. (None, {}) for
     framework / external calls. A local function sees the caller's locals; a method does not."""
     fn = call.get("fn") or {}
     if fn.get("k") == "name":
         lam = scope.get(_LOCAL_FN + (fn.get("id") or ""))
         if isinstance(lam, dict):
-            return lam.get("body"), True
+            return lam.get("body"), _closure_scope(scope, lam)
     t = _find_target(ctx, call)
-    return (t[1].body, False) if t is not None else (None, False)
+    return (t[1].body, {}) if t is not None else (None, {})
 
 
 def _single_return(body):
@@ -180,8 +194,8 @@ def _mentions_env(e, scope: dict, ctx: _Ctx, depth: int = 0) -> bool:
         if _env_node(n) or (n.get("k") == "name" and n.get("id") in locs):
             return True
         if n.get("k") == "call" and depth < 4:
-            body, local = _callee_body(ctx, scope, n)
-            if body is not None and _mentions_env(body, scope if local else {}, ctx, depth + 1):
+            body, sub = _callee_body(ctx, scope, n)
+            if body is not None and _mentions_env(body, sub, ctx, depth + 1):
                 return True
     return False
 
@@ -217,10 +231,10 @@ def _pred(e, scope: dict, ctx: _Ctx, depth: int = 0):
                     if _is_env_name_expr(a) and n:
                         return ("env", n)
         # A solution method / local function: its single returned expression, else unknown.
-        body, local = _callee_body(ctx, scope, e) if depth < 4 else (None, False)
+        body, sub = _callee_body(ctx, scope, e) if depth < 4 else (None, {})
         expr = _single_return(body) if body is not None else None
         if expr is not None:
-            return _pred(expr, scope if local else {}, ctx, depth + 1) or _UNKNOWN
+            return _pred(expr, sub, ctx, depth + 1) or _UNKNOWN
         return _UNKNOWN
     if k == "bin":
         op = e.get("op")
