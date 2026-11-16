@@ -121,3 +121,52 @@ def test_env_guarded_mappings_set_meta_env(roslyn_helper, tmp_path):
     out = _discover(root)
     assert rt(out, "OrdersController.Get").route.meta["env"] == "Development"
     assert rt(out, "HomeController.Index").route.meta["env"] == "Development"
+
+
+def _copy(tmp_path):
+    root = tmp_path / "app"
+    shutil.copytree(FX, root)
+    return root
+
+
+def _split_halves(root, second_extra=""):
+    d = root / "Controllers"
+    (d / "SplitController.Meta.cs").write_text(
+        "using Microsoft.AspNetCore.Authorization;\nusing Microsoft.AspNetCore.Mvc;\n\nnamespace Shop.Controllers;\n\n"
+        '[ApiController]\n[Route("api/split")]\n[AllowAnonymous]\n'
+        "public partial class SplitController : ControllerBase\n{\n}\n")
+    (d / "SplitController.Actions.cs").write_text(
+        "using Microsoft.AspNetCore.Mvc;\n\nnamespace Shop.Controllers;\n\n"
+        f"{second_extra}public partial class SplitController\n{{\n"
+        '    [HttpGet("x")]\n    public IActionResult Get() => Ok();\n}\n')
+
+
+def test_partial_controller_halves_are_merged(roslyn_helper, tmp_path):
+    root = _copy(tmp_path)
+    _split_halves(root)
+    out = _discover(root)
+    r = rt(out, "SplitController.Get")
+    assert (r.route.path, r.route.methods) == ("/api/split/x", ["GET"])
+    assert r.route.meta["api_surface"] is True
+    assert "route_assumed" not in r.route.meta
+    assert r.route.file.replace("\\", "/").endswith("SplitController.Actions.cs")
+    assert "AllowAnonymous" in {a.name.split(".")[-1].removesuffix("Attribute") for a in r.type.attributes}
+    assert len(r.partials) == 2
+
+
+def test_noncontroller_on_one_half_excludes_both(roslyn_helper, tmp_path):
+    root = _copy(tmp_path)
+    _split_halves(root, second_extra="[NonController]\n")
+    out = _discover(root)
+    assert not any(r.route.handler_name.startswith("SplitController") for r in out)
+
+
+def test_defaults_only_conventional_route_is_assumed_and_unknown(roslyn_helper, tmp_path):
+    root = _copy(tmp_path)
+    prog = root / "Program.cs"
+    prog.write_text(prog.read_text().replace(
+        'app.MapControllerRoute("default", "{controller=Home}/{action=Index}/{id?}");',
+        'app.MapControllerRoute("d", "home");'))
+    idx = rt(_discover(root), "HomeController.Index")
+    assert idx.route.meta["route_assumed"] is True
+    assert idx.unknown and any("defaults" in u and "'d'" in u for u in idx.unknown)

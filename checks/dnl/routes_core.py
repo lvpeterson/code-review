@@ -5,11 +5,18 @@ from the conventional templates registered with MapControllerRoute /
 MapDefaultControllerRoute / MapAreaControllerRoute. Auth is not resolved here;
 each route carries the fluent calls chained on the mapping call (convention_calls)
 so the auth pass can see `MapControllers().RequireAuthorization()`.
+
+Partial classes: every declaration of a controller (same full name, same project)
+is merged into one TypeIR before detection, so class attributes, [Route]/[Area], the
+base list and the actions are the union of all halves. CoreRouteRef.type is that
+merged TypeIR (attributes, bases and methods of every half; file/line of the first
+declaration) and CoreRouteRef.partials lists the original declarations. A route's
+route.file/line always point at the half that declares the action.
 """
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from checks.dnl.ir import MethodIR, TypeIR, attr_key, const_str, has_attr, literal_str
 from checks.dnl.pipeline import PipeCall, pipeline_for
@@ -43,17 +50,50 @@ class CoreRouteRef(RouteRef):
     convention_calls: list[dict] = field(default_factory=list)  # chain on MapControllers()/MapControllerRoute()/MapRazorPages()
     caller_unknown: bool = False
     unknown: list[str] = field(default_factory=list)        # discovery-time reasons auth may be incomplete
+    partials: list[TypeIR] = field(default_factory=list)    # every declaration merged into `type`
 
 
 def _simple(name: str) -> str:
     return name.split("<")[0].split(".")[-1].lower()
 
 
+def _declarations(model: ProjectModel, t: TypeIR) -> list[TypeIR]:
+    """All declarations of a (partial) type: same full name, same project."""
+    proj = model.project_of(t.file)
+    out = [d for d in model.find_types(t.name.split(".")[-1])
+           if d.full_name.lower() == t.full_name.lower() and model.project_of(d.file) is proj]
+    return out or [t]
+
+
+def _merged(decls: list[TypeIR]) -> TypeIR:
+    """One TypeIR holding the union of the declarations' modifiers, bases, attributes and members."""
+    if len(decls) == 1:
+        return decls[0]
+    def uniq(xs):
+        return list(dict.fromkeys(xs))
+    first = decls[0]
+    return replace(
+        first,
+        modifiers=uniq(m for d in decls for m in d.modifiers),
+        bases=uniq(b for d in decls for b in d.bases),
+        attributes=[a for d in decls for a in d.attributes],
+        fields=[f for d in decls for f in d.fields],
+        properties=[p for d in decls for p in d.properties],
+        methods=[m for d in decls for m in d.methods],
+        end_line=max(d.end_line for d in decls),
+    )
+
+
 def _chain_types(model: ProjectModel, t: TypeIR) -> list[TypeIR]:
-    """The type then its project base types, nearest first (external bases are not types)."""
+    """The (merged) type then its project base types, nearest first (external bases are not types)."""
     out = [t]
+    seen = {t.full_name.lower()}
     for b in model.base_chain(t):
-        out.extend(bt for bt in model.find_types(b) if all(bt is not o for o in out))
+        for bt in model.find_types(b):
+            if bt.full_name.lower() not in seen:
+                decls = _declarations(model, bt)
+                seen.add(bt.full_name.lower())
+                out.append(_merged(decls))
     return out
 
 
@@ -223,22 +263,29 @@ def _tail(call: PipeCall) -> list[dict]:
 def discover_controllers(model: ProjectModel) -> list[CoreRouteRef]:
     refs: list[CoreRouteRef] = []
     global_maps: list[_Mapping] | None = None
-    for t in model.types():
+    done: set[tuple[str, int]] = set()
+    for first in model.types():
+        proj = model.project_of(first.file)
+        key = (first.full_name.lower(), id(proj))
+        if key in done:
+            continue
+        done.add(key)
+        decls = _declarations(model, first)
+        t = _merged(decls)
         chain = _chain_types(model, t)
         if not _is_controller(model, t, chain):
             continue
-        proj = model.project_of(t.file)
         maps = _mappings(pipeline_for(model, proj).named(*_MAP_NAMES, include_dev=True)) if proj is not None else []
         if not maps:
             # A controllers library is mapped by its host project: fall back to every mapping call in the scan.
             if global_maps is None:
                 global_maps = _mappings(pipeline_for(model, None).named(*_MAP_NAMES, include_dev=True))
             maps = global_maps
-        refs.extend(_controller_routes(model, t, chain, maps))
+        refs.extend(_controller_routes(model, t, decls, chain, maps))
     return refs
 
 
-def _controller_routes(model: ProjectModel, t: TypeIR, chain: list[TypeIR], maps: list[_Mapping]) -> list[CoreRouteRef]:
+def _controller_routes(model: ProjectModel, t: TypeIR, decls: list[TypeIR], chain: list[TypeIR], maps: list[_Mapping]) -> list[CoreRouteRef]:
     controller, area = _controller_name(t), _area(chain)
     api = _api_surface(model, t, chain)
     proj = model.project_of(t.file)
@@ -270,11 +317,15 @@ def _controller_routes(model: ProjectModel, t: TypeIR, chain: list[TypeIR], maps
     by_defaults = [m for m in conv if not ("{controller" in m.template.lower() and "{action" in m.template.lower())]
     conv = [m for m in conv if m not in by_defaults]
     if by_defaults:
-        unknown.append("a conventional route maps controllers through defaults, which are not resolved")
+        names = ", ".join(repr(const_str(_arg(m.call.node, 0, "name")) or m.name) for m in by_defaults)
+        unknown.append(f"conventional route {names} maps controllers through defaults, which are not resolved")
 
     simple = t.name.split(".")[-1]
     refs: list[CoreRouteRef] = []
     for m, decl in action_candidates(model, t):
+        # An own action of a merged partial type is declared in one of its halves.
+        if decl is t:
+            decl = next((d for d in decls if any(x is m for x in d.methods)), decl)
         action = _action_name(m)
         seen: set[tuple[str, tuple[str, ...]]] = set()
 
@@ -293,7 +344,7 @@ def _controller_routes(model: ProjectModel, t: TypeIR, chain: list[TypeIR], maps
                           meta=meta)
             refs.append(CoreRouteRef(route, t, m, proj, style="controller",
                                      convention_calls=_tail(mapping.call) if mapping else [],
-                                     unknown=list(unknown)))
+                                     unknown=list(unknown), partials=list(decls)))
 
         conv_verbs: list[str] | None = None
         conventional = False
