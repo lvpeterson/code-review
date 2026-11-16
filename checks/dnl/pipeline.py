@@ -150,16 +150,17 @@ def _env_node(n: dict) -> bool:
     return False
 
 
-def _callee_body(ctx: _Ctx, scope: dict, call: dict):
-    """Body of the solution method or local function a call goes to (a stmt list, or the
-    expression of an expression-bodied lambda); None for framework / external calls."""
+def _callee_body(ctx: _Ctx, scope: dict, call: dict) -> tuple:
+    """(body, is_local) of the solution method or local function a call goes to; the body is
+    a stmt list, or the expression of an expression-bodied lambda. (None, False) for
+    framework / external calls. A local function sees the caller's locals; a method does not."""
     fn = call.get("fn") or {}
     if fn.get("k") == "name":
         lam = scope.get(_LOCAL_FN + (fn.get("id") or ""))
         if isinstance(lam, dict):
-            return lam.get("body")
+            return lam.get("body"), True
     t = _find_target(ctx, call)
-    return t[1].body if t is not None else None
+    return (t[1].body, False) if t is not None else (None, False)
 
 
 def _single_return(body):
@@ -179,8 +180,8 @@ def _mentions_env(e, scope: dict, ctx: _Ctx, depth: int = 0) -> bool:
         if _env_node(n) or (n.get("k") == "name" and n.get("id") in locs):
             return True
         if n.get("k") == "call" and depth < 4:
-            body = _callee_body(ctx, scope, n)
-            if body is not None and _mentions_env(body, {}, ctx, depth + 1):
+            body, local = _callee_body(ctx, scope, n)
+            if body is not None and _mentions_env(body, scope if local else {}, ctx, depth + 1):
                 return True
     return False
 
@@ -216,10 +217,10 @@ def _pred(e, scope: dict, ctx: _Ctx, depth: int = 0):
                     if _is_env_name_expr(a) and n:
                         return ("env", n)
         # A solution method / local function: its single returned expression, else unknown.
-        body = _callee_body(ctx, scope, e) if depth < 4 else None
+        body, local = _callee_body(ctx, scope, e) if depth < 4 else (None, False)
         expr = _single_return(body) if body is not None else None
         if expr is not None:
-            return _pred(expr, {}, ctx, depth + 1) or _UNKNOWN
+            return _pred(expr, scope if local else {}, ctx, depth + 1) or _UNKNOWN
         return _UNKNOWN
     if k == "bin":
         op = e.get("op")

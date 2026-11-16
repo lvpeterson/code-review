@@ -240,3 +240,26 @@ def test_early_exits_and_indirect_env_conditions(roslyn_helper, monkeypatch):
     deg = _pipe("exits", True)
     assert _truth(deg) == t
     assert _names(deg) == _names(p)
+
+
+# -- fix round 3 ------------------------------------------------------------
+
+def test_local_function_closures_and_static_method_conditions(roslyn_helper, monkeypatch):
+    p = _pipe("closures")
+    t = _truth(p)
+    # Local function reading a captured env-bool local sees the caller's scope.
+    assert t["UseStaticFiles"] == (True, False)
+    # Captured flag assigned under an env guard: undecidable.
+    assert t["UseCors"][1] is None
+    # Static single-return solution method.
+    assert t["UseSession"] == (True, False)
+    # `break` early exit: the rest of the loop body runs only outside Development.
+    assert t["UseHsts"] == (False, True)
+    assert t["UseRouting"] == (True, True)
+    assert {c.name for c in p.uncertain()} == {"UseCors"}
+    assert "UseStaticFiles" not in {c.name for c in p.named()} and "UseHsts" in {c.name for c in p.named()}
+    project._CACHE.clear()
+    monkeypatch.setattr(helper, "find_helper", lambda *a: None)
+    monkeypatch.setattr(helper, "sdk_available", lambda: False)
+    deg = _pipe("closures", True)
+    assert _truth(deg) == t
