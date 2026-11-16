@@ -264,11 +264,17 @@ def test_switch_sections_and_local_function(tmp_path):
     assert loc["k"] == "local" and loc["name"] == "Loc" and loc["init"]["k"] == "lambda" and loc["init"]["params"] == ["p"]
 
 
+def test_switch_expression_lowers_to_nested_cond(tmp_path):
+    init = body(tmp_path, "var s = k switch { 1 => p, 2 when z => q, _ => r };")[0]["init"]
+    assert init["k"] == "cond" and init["c"]["id"] == "k" and init["t"]["id"] == "p"
+    assert init["f"]["k"] == "cond" and init["f"]["t"]["id"] == "q" and init["f"]["f"]["id"] == "r"
+
+
 def test_deconstruction_and_unknown_nodes_keep_text(tmp_path):
-    out = body(tmp_path, "var (u, v) = z; goto L; var s = x switch { 1 => 2, _ => 3 }; var t = typeof(int);")
+    out = body(tmp_path, "var (u, v) = z; goto L; var s = x with { A = 1 }; var t = typeof(int);")
     assert out[0]["k"] == "assign" and out[0]["target"]["k"] == "unknown" and out[0]["value"]["id"] == "z"
     assert out[1] == {"k": "other", "line": 1, "text": "goto L;"}
-    assert out[2]["init"]["k"] == "unknown" and "switch" in out[2]["init"]["text"]
+    assert out[2]["init"]["k"] == "unknown" and "with" in out[2]["init"]["text"]
     assert out[3]["init"] == {"k": "unknown", "line": 1, "text": "typeof(int)"}
 
 
@@ -584,7 +590,10 @@ IR_DIFFERENT = {"TaintCs/Crypto/Alias.cs", "TaintCs/UsesExtAlias.cs"}
 
 def _strip(o):
     if isinstance(o, dict):
-        return {k: _strip(v) for k, v in o.items() if k not in ("sym", "type_full")}
+        # Besides the semantic keys, drop the schema-2 lambda extras (param_info, end_line):
+        # the tree-sitter frontend does not produce them and no legacy rule reads them.
+        drop = ("sym", "type_full") + (("param_info", "end_line") if o.get("k") == "lambda" else ())
+        return {k: _strip(v) for k, v in o.items() if k not in drop}
     if isinstance(o, list):
         return [_strip(x) for x in o]
     return o

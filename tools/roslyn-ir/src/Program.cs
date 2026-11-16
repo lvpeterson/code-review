@@ -83,6 +83,10 @@ internal static class Program
             using var doc = JsonDocument.Parse(bytes);
             if (doc.RootElement.GetProperty("types").GetArrayLength() != 1)
                 throw new InvalidOperationException($"probe: {lang} snippet lowered to an unexpected shape");
+            // A half-populated refs/netcore would compile but resolve nothing: require the symbol.
+            if (prof == "netcore" && !Encoding.UTF8.GetString(bytes).Contains("\"Microsoft.AspNetCore.Mvc.ControllerBase.Ok\""))
+                throw new InvalidOperationException("probe: netcore snippet did not resolve Microsoft.AspNetCore.Mvc.ControllerBase.Ok; "
+                    + "refs/netcore looks incomplete, republish the helper");
         }
 
         using var stdout = Console.OpenStandardOutput();
@@ -103,7 +107,8 @@ internal static class Program
             string name = project.GetProperty("name").GetString() ?? "";
             string language = project.GetProperty("language").GetString() ?? "";
             // "references" (project-to-project) is accepted but ignored: the
-            // compilation sees only this project's files plus refs/net48.
+            // compilation sees only this project's files plus the selected refs profile
+            // (refs/net48 or refs/netcore).
 
             // Optional extra VB global imports, added to the template defaults.
             var imports = new List<string>();

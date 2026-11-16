@@ -508,3 +508,110 @@ def test_vb_addressof_lowers_to_the_operand(helper, tmp_path):
         'Public Class A\n  Sub M()\n    Dim h As System.EventHandler = AddressOf Go\n  End Sub\n  Sub Go(s As Object, e As System.EventArgs)\n  End Sub\nEnd Class\n')
     init = vb["types"][0]["methods"][0]["body"][0]["init"]
     assert init["k"] == "name" and init["id"] == "Go"
+
+
+# -- modern C# lowering (top-level statements, primary ctors, new expressions) --
+
+CORE_USINGS = ["Microsoft.AspNetCore.Builder", "Microsoft.AspNetCore.Http", "Microsoft.AspNetCore.Mvc"]
+
+TOP_SRC = ('var b = WebApplication.CreateBuilder(args);\nvar app = b.Build();\n'
+           'app.MapGet("/", () => "x");\napp.Run();\nstatic int Helper() => 1;\n')
+
+
+def test_top_level_statements_lowered(helper, tmp_path):
+    ir = parse_profile(helper, tmp_path, TOP_SRC, refs="netcore", global_usings=CORE_USINGS)
+    t = ir["types"][0]
+    assert (t["name"], t["namespace"], t["kind"], t["modifiers"]) == ("Program", "", "class", ["static", "partial"])
+    assert [m["name"] for m in t["methods"]] == ["<Main>$"]
+    body = t["methods"][0]["body"]
+    assert [s["k"] for s in body] == ["local", "local", "expr", "expr", "local"]
+    assert body[4]["name"] == "Helper" and body[4]["init"]["k"] == "lambda"
+    syms = [n.get("sym") for n in walk_nodes(body[2]) if n.get("k") == "call"]
+    assert "Microsoft.AspNetCore.Builder.EndpointRouteBuilderExtensions.MapGet" in syms
+
+
+def test_top_level_with_partial_program(helper, tmp_path):
+    ir = parse_profile(helper, tmp_path, TOP_SRC + "public partial class Program { }\n",
+                       refs="netcore", global_usings=CORE_USINGS)
+    assert [t["name"] for t in ir["types"]] == ["Program", "Program"]
+    assert [m["name"] for m in ir["types"][0]["methods"]] == ["<Main>$"]
+    assert ir["types"][1]["methods"] == []
+
+
+def test_lambda_param_info_and_end_line(helper, tmp_path):
+    src = ('app.MapGet("/o/{id}", ([FromRoute] int id, [FromServices] IStore s) =>\n{\n'
+           ' return s.Get(id);\n});\n')
+    ir = parse_profile(helper, tmp_path, src, refs="netcore", global_usings=CORE_USINGS)
+    lam = next(n for n in walk_nodes(ir) if n.get("k") == "lambda")
+    info = lam["param_info"]
+    assert [p["name"] for p in info] == ["id", "s"]
+    assert [p["type"] for p in info] == ["int", "IStore"]
+    assert [[a["name"] for a in p["attributes"]] for p in info] == [["FromRoute"], ["FromServices"]]
+    assert lam["params"] == ["id", "s"] and lam["end_line"] == 4
+
+
+def test_lambda_without_params_omits_param_info(helper, tmp_path):
+    ir = parse_profile(helper, tmp_path, 'app.MapGet("/", () => "x");', refs="netcore", global_usings=CORE_USINGS)
+    lam = next(n for n in walk_nodes(ir) if n.get("k") == "lambda")
+    assert "param_info" not in lam and "params" not in lam
+
+
+def test_primary_constructor_and_record(helper, tmp_path):
+    src = ("public class Svc(ILogger<Svc> log, IStore store) : Base(store) { }\n"
+           "public record OrderDto([property: Required] string Name, int Qty);\n")
+    ir = parse_profile(helper, tmp_path, src, refs="netcore")
+    svc, dto = ir["types"]
+    ctor = next(m for m in svc["methods"] if m["name"] == ".ctor")
+    assert [p["name"] for p in ctor["params"]] == ["log", "store"]
+    first = ctor["body"][0]
+    assert first["k"] == "expr" and first["expr"]["k"] == "call" and first["expr"]["fn"]["id"] == "base"
+    assert [a["id"] for a in first["expr"]["args"]] == ["store"]
+    assert [p["name"] for p in dto["properties"]] == ["Name", "Qty"]
+    assert [p["type"] for p in dto["properties"]] == ["string", "int"]
+    assert [a["name"] for a in dto["properties"][0]["attributes"]] == ["Required"]
+    assert any(m["name"] == ".ctor" for m in dto["methods"])
+
+
+def test_collection_switch_is_with(helper, tmp_path):
+    src = ("class C { void M(object o, R r) {\n int[] a = [x, ..ys];\n var s = k switch { 1 => p, _ => q };\n"
+           " if (o is string t) {}\n var r2 = r with { Name = n };\n } }\n")
+    ir = parse_profile(helper, tmp_path, src, refs="netcore")
+    body = ir["types"][0]["methods"][0]["body"]
+    coll, sw, ifs, wth = body[0]["init"], body[1]["init"], body[2], body[3]["init"]
+    ids = lambda e: {n["id"] for n in walk_nodes(e) if n.get("k") == "name"}
+
+    assert coll["k"] == "new" and coll["type"] is None and coll["args"] == []
+    assert [e["value"]["id"] for e in coll["init"]] == ["x", "ys"]
+
+    assert sw["k"] == "cond" and sw["c"]["id"] == "k" and sw["t"]["id"] == "p"
+    assert sw["f"]["id"] == "q"
+
+    isx = ifs["cond"]
+    assert isx["k"] == "bin" and isx["op"] == "is" and isx["l"]["id"] == "o"
+    assert isx["r"]["k"] == "unknown" and "string t" in isx["r"]["text"]
+
+    assert wth["k"] == "new" and wth["type"] is None and [a["id"] for a in wth["args"]] == ["r"]
+    assert [(e["name"], e["value"]["id"]) for e in wth["init"]] == [("Name", "n")]
+    assert ids(coll) | ids(sw) | ids(isx) | ids(wth) >= {"x", "ys", "p", "q", "o", "r", "n"}
+
+
+def test_switch_expression_three_arms_nest(helper, tmp_path):
+    src = "class C { void M() { var s = k switch { 1 => p, 2 => q, _ => z }; } }"
+    ir = parse_profile(helper, tmp_path, src, refs="netcore")
+    sw = ir["types"][0]["methods"][0]["body"][0]["init"]
+    assert sw["t"]["id"] == "p" and sw["f"]["k"] == "cond"
+    assert sw["f"]["t"]["id"] == "q" and sw["f"]["f"]["id"] == "z"
+
+
+def test_raw_string_literal(helper, tmp_path):
+    src = 'class C { void M() { var q = """SELECT 1"""; var m = """\n    a\n     b\n    """; } }'
+    ir = parse_profile(helper, tmp_path, src, refs="netcore")
+    body = ir["types"][0]["methods"][0]["body"]
+    assert body[0]["init"]["k"] == "lit" and body[0]["init"]["v"] == "SELECT 1"
+    assert body[1]["init"]["k"] == "lit" and body[1]["init"]["v"] == "a\n b"
+
+
+def test_is_top_level_helper():
+    from checks.dnl.ir import MethodIR, TOP_LEVEL_MAIN, is_top_level
+    assert TOP_LEVEL_MAIN == "<Main>$"
+    assert is_top_level(MethodIR(name="<Main>$")) and not is_top_level(MethodIR(name="Main"))

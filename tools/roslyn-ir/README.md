@@ -66,7 +66,7 @@ pinned to `[8.0.11]`) are DotnetPlatform packages, so the csproj uses
   Writes JSON Lines to stdout, one object per file, in input order. A file that
   cannot be read or lowered yields `{"path": rel, "error": "<message>"}` and the
   run continues. stdout carries only JSON; diagnostics go to stderr.
-  Each project is compiled once (its own files plus `refs/net48`); `references`
+  Each project is compiled once (its own files plus the selected `refs/net48` or `refs/netcore` profile); `references`
   (project-to-project) is accepted but ignored -- cross-project resolution is
   the Python model's job. If semantic lowering of a file throws, it is retried
   syntax-only before falling back to an error record.

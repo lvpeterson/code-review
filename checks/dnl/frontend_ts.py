@@ -773,9 +773,30 @@ class _Lowering:
         if t == "conditional_expression":
             return {"k": "cond", "line": line, "c": self.expr(f("condition")),
                     "t": self.expr(f("consequence")), "f": self.expr(f("alternative"))}
+        if t == "switch_expression":
+            # Same shape as the helper: nested cond, governing expression as `c`, guards dropped.
+            named = e.named_children
+            arms = [c for c in named if c.type == "switch_expression_arm"]
+            if named and arms:
+                return self.switch_arms(named[0], arms, 0)
         if t in ("lambda_expression", "anonymous_method_expression"):
             return self.lambda_expr(e, line)
         return self.unknown(e)
+
+    def switch_arms(self, gov: Node, arms: list[Node], i: int) -> dict:
+        """Arms i.. of a switch expression: t = arm value, f = the remaining arms."""
+        arm = arms[i]
+        val = self.expr(arm.named_children[-1])
+        if i == len(arms) - 1:
+            return val
+        if self.depth >= MAX_DEPTH:
+            return {"k": "unknown", "line": self.line(arm), "text": ", ".join(self.text(a) for a in arms[i:])}
+        self.depth += 1
+        try:
+            return {"k": "cond", "line": self.line(arm), "c": self.expr(gov), "t": val,
+                    "f": self.switch_arms(gov, arms, i + 1)}
+        finally:
+            self.depth -= 1
 
     def unary(self, op: str, operand: Node, line: int, whole: Node) -> dict:
         if op in ("!", "-", "~", "++", "--"):

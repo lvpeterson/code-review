@@ -11,6 +11,8 @@
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <!-- Framework-dependent publish: the host needs the .NET 8 runtime. -->
     <SelfContained>false</SelfContained>
+    <!-- One pin for both reference packs of the netcore profile. -->
+    <NetCoreRefVersion>8.0.11</NetCoreRefVersion>
   </PropertyGroup>
 
   <ItemGroup>
@@ -26,8 +28,8 @@
          Both are DotnetPlatform packages: PackageReference fails (NU1213), so
          they are only downloaded; the ref folders are read from the NuGet
          cache below. Pinned to exact 8.0.x versions, never the SDK packs/. -->
-    <PackageDownload Include="Microsoft.NETCore.App.Ref" Version="[8.0.11]" />
-    <PackageDownload Include="Microsoft.AspNetCore.App.Ref" Version="[8.0.11]" />
+    <PackageDownload Include="Microsoft.NETCore.App.Ref" Version="[$(NetCoreRefVersion)]" />
+    <PackageDownload Include="Microsoft.AspNetCore.App.Ref" Version="[$(NetCoreRefVersion)]" />
     <!-- CodePagesEncodingProvider (cp1252 fallback) ships in the net8.0 shared
          framework as System.Text.Encoding.CodePages, so no package is needed. -->
   </ItemGroup>
@@ -50,8 +52,8 @@
        and Microsoft.AspNetCore.App reference assemblies (flat). Lower-case package
        folder names keep this working on case-sensitive file systems. -->
   <PropertyGroup>
-    <NetCoreRefDir>$(NuGetPackageRoot)microsoft.netcore.app.ref/8.0.11/ref/net8.0</NetCoreRefDir>
-    <AspNetCoreRefDir>$(NuGetPackageRoot)microsoft.aspnetcore.app.ref/8.0.11/ref/net8.0</AspNetCoreRefDir>
+    <NetCoreRefDir>$(NuGetPackageRoot)microsoft.netcore.app.ref/$(NetCoreRefVersion)/ref/net8.0</NetCoreRefDir>
+    <AspNetCoreRefDir>$(NuGetPackageRoot)microsoft.aspnetcore.app.ref/$(NetCoreRefVersion)/ref/net8.0</AspNetCoreRefDir>
   </PropertyGroup>
   <ItemGroup>
     <None Include="$(NetCoreRefDir)/*.dll;$(AspNetCoreRefDir)/*.dll"

@@ -1,4 +1,4 @@
-"""Python mirror of the roslyn-ir schema 1 plus small helpers for walking it.
+"""Python mirror of the roslyn-ir schema 2 plus small helpers for walking it.
 
 Types, methods and members are dataclasses; statements and expressions stay
 plain dicts (`{"k": kind, "line": n, ...}`) because they are deeply nested and
@@ -8,6 +8,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Iterator
+
+
+# Method name the helper gives the synthetic top-level-statements entry point.
+TOP_LEVEL_MAIN = "<Main>$"
+
+
+def is_top_level(m: "MethodIR") -> bool:
+    """True for the synthetic method holding a file's top-level statements."""
+    return m.name == TOP_LEVEL_MAIN
 
 
 @dataclass
