@@ -39,7 +39,7 @@ from pathlib import Path
 from checks.dnl.files import iter_dnl_files, read_source
 from checks.dnl.ir import (Attr, MethodIR, ParamIR, TypeIR, attr_key, call_chain, call_name, const_str,
                            has_attr, literal_str, receiver_text, walk)
-from checks.dnl.pipeline import PipeCall, _is_ext, _is_member_call, pipeline_for
+from checks.dnl.pipeline import _FRAMEWORK_CALLS, PipeCall, _is_ext, _is_member_call, pipeline_for
 from checks.dnl.project import ProjectModel
 from checks.dnl.routes import RouteRef, action_candidates, strip_constraints
 from core.models import Route
@@ -670,8 +670,16 @@ _OTHER_MAPS = ("MapMethods", "Map", "MapHub", "MapGrpcService", "MapRazorCompone
                "MapHealthChecks", "MapOpenApi", "MapSwagger")
 _SWAGGER_PATHS = ("/swagger/{documentName}/swagger.json", "/swagger")
 # Parameter types that make an unreached method worth scanning.
-_BUILDER_PARAMS = {"iendpointroutebuilder", "routegroupbuilder", "webapplication"}
-_ROOT_TYPES = _BUILDER_PARAMS | {"iapplicationbuilder"}
+_ROOT_TYPES = {"iendpointroutebuilder", "routegroupbuilder", "webapplication", "iapplicationbuilder"}
+_BUILDER_PARAMS = _ROOT_TYPES
+# Calls that hand the receiver back (a convention or middleware link) when no symbol says so.
+_CONVENTION_NAMES = frozenset("""
+RequireAuthorization AllowAnonymous WithTags WithName WithOpenApi WithMetadata WithDisplayName WithGroupName
+WithSummary WithDescription Produces ProducesProblem ProducesValidationProblem Accepts RequireCors
+RequireRateLimiting RequireHost DisableAntiforgery AddEndpointFilter AddEndpointFilterFactory
+ExcludeFromDescription DisableRateLimiting CacheOutput WithRequestTimeout
+""".split())
+_SWEEP_MSG = "registration not reached by the pipeline walk"
 
 
 @dataclass(eq=False)
@@ -683,12 +691,14 @@ class _Node:
     extras: list[Group] = field(default_factory=list)   # conventions a caller applied to the group
     notes: list[str] = field(default_factory=list)
     traced: bool = True                 # False: a builder whose group context is not known
+    depth: int = 0                      # conditional depth of the code that created it
 
 
 @dataclass(eq=False)
 class _Entry:
     ref: CoreRouteRef
     leaf: _Node
+    depth: int = 0
 
 
 @dataclass(eq=False)
@@ -701,6 +711,7 @@ class _Result:
     file: str
     line: int
     group: Group | None = None
+    depth: int = 0
 
 
 @dataclass
@@ -714,10 +725,11 @@ class _Frame:
     lenient: bool = False   # local-function body: no PipeCalls of its own, the call site's env applies
     env_pc: PipeCall | None = None
     returns: list = field(default_factory=list)
+    cond: int = 0           # nesting of branches / loops / catches the code runs under
 
 
 def _simple_type(t: str | None) -> str:
-    return (t or "").split("<")[0].strip().split(".")[-1].lower()
+    return (t or "").split("<")[0].strip().rstrip("?").split(".")[-1].lower()
 
 
 def _merge_scopes(base: dict, branches: list[dict]) -> dict:
@@ -742,7 +754,9 @@ def _lambda_method(lam: dict, name: str | None = None) -> MethodIR:
                       i.get("modifiers") or []) for i in infos]
     body = lam.get("body")
     stmts = body if isinstance(body, list) else [{"k": "return", "line": line, "value": body}]
-    return MethodIR(name=name or f"<lambda@{line}>", params=params, body=stmts, line=line,
+    attrs = [Attr(a.get("name", ""), a.get("args") or [], a.get("named") or {}, a.get("line", 0))
+             for a in lam.get("attributes") or []]
+    return MethodIR(name=name or f"<lambda@{line}>", params=params, attributes=attrs, body=stmts, line=line,
                     end_line=lam.get("end_line", line))
 
 
@@ -788,6 +802,7 @@ class _Scan:
         self.called_fns: set[int] = set()
         self.fn_stack: set[int] = set()
         self.seen_mw: set[tuple] = set()
+        self.consumed: set[int] = set()         # id() of the Map / Use* call nodes already registered
 
     # -- driver ------------------------------------------------------------
     def run(self) -> list[CoreRouteRef]:
@@ -805,7 +820,25 @@ class _Scan:
             if id(lam) not in self.called_fns and any(_simple_type(p.type) in _BUILDER_PARAMS for p in m.params):
                 self.called_fns.add(id(lam))
                 self.walk_body(t, m, self.param_scope(m, True), (), False, True)
+        self.sweep(types)
         return [self.finish(e) for e in self.entries]
+
+    def sweep(self, types: list[TypeIR]) -> None:
+        """Registrations the walk never consumed: Map calls inside lambdas the pipeline does not
+        walk (host-builder callbacks, `MapWhen`/`UseWhen` branches, startup filters), in methods
+        with no builder parameter (a field, `this`), in dead code, or in call arguments."""
+        for t in types:
+            for m in t.methods:
+                fr = _Frame(t, m, {}, {}, (), False, True)
+                for link in walk(m.body):
+                    name = call_name(link) if link.get("k") == "call" else None
+                    if not name or id(link) in self.consumed:
+                        continue
+                    if name in ("UseSwagger", "UseSwaggerUI") and self.is_endpoint_call(link, name, True):
+                        self.middleware(fr, link, name, None)
+                    elif self.is_map(link, name, False):
+                        entry = self.register(fr, link, name, None, None)
+                        entry.ref.unknown.insert(0, _SWEEP_MSG)
 
     def finish(self, e: _Entry) -> CoreRouteRef:
         """Fill in the group chain (outermost first) once every convention has been seen."""
@@ -833,12 +866,12 @@ class _Scan:
         return scope
 
     # -- methods and statements ---------------------------------------------
-    def walk_method(self, t: TypeIR, m: MethodIR, scope: dict, via: tuple, reached: bool) -> list:
+    def walk_method(self, t: TypeIR, m: MethodIR, scope: dict, via: tuple, reached: bool, cond: int = 0) -> list:
         self.visited.add(id(m))
-        return self.walk_body(t, m, scope, via, reached)
+        return self.walk_body(t, m, scope, via, reached, cond=cond)
 
-    def walk_body(self, t, m, scope, via, reached, lenient=False, env_pc=None, fns=None) -> list:
-        fr = _Frame(t, m, scope, dict(fns or {}), via, reached, lenient, env_pc)
+    def walk_body(self, t, m, scope, via, reached, lenient=False, env_pc=None, fns=None, cond=0) -> list:
+        fr = _Frame(t, m, scope, dict(fns or {}), via, reached, lenient, env_pc, cond=cond)
         self.stmts(fr, m.body)
         return fr.returns
 
@@ -856,10 +889,12 @@ class _Scan:
         """Run alternative bodies on copies of the scope and keep what they agree on."""
         base = fr.scope
         results = []
+        fr.cond += 1
         for b in bodies:
             fr.scope = dict(base)
             self.stmts(fr, b)
             results.append(fr.scope)
+        fr.cond -= 1
         fr.scope = _merge_scopes(base, results + ([base] if len(bodies) == 1 else []))
 
     def stmt(self, fr: _Frame, s) -> None:
@@ -932,12 +967,14 @@ class _Scan:
         known = node is not None
         if name in ("Build", "Create") and state is None and pc is not None and pc.kind == "app":
             return _Node(None)      # WebApplication.CreateBuilder(..).Build() / WebApplication.Create(..)
-        if name == "MapGroup" and self.is_endpoint_call(link, name, known):
+        if name == "MapGroup" and (self.is_endpoint_call(link, name, known)
+                                   or (not link.get("sym") and self.shaped(link, name))):
             if node is None:
-                node = _Node(None, None, "group", notes=["the receiver of MapGroup could not be traced"], traced=False)
+                node = _Node(None, None, "group", notes=["the receiver of MapGroup could not be traced"], traced=False,
+                             depth=fr.cond)
             args = link.get("args") or []
             prefix = const_str(args[0]) if args else ""
-            g = _Node(Group(prefix or "", [], fr.type.file, link.get("line", 0)), node, "group")
+            g = _Node(Group(prefix or "", [], fr.type.file, link.get("line", 0)), node, "group", depth=fr.cond)
             if prefix is None:
                 g.notes.append("a MapGroup prefix is not a literal")
             return g
@@ -976,22 +1013,65 @@ class _Scan:
             return False
         if name == "Map" and not link.get("sym") and _is_branch_lambda(self.handler_arg(link, name)):
             return False
-        return self.is_endpoint_call(link, name, known)
+        if self.is_endpoint_call(link, name, known):
+            return True
+        return not link.get("sym") and self.shaped(link, name)
+
+    def shaped(self, link: dict, name: str) -> bool:
+        """With no symbol and a receiver the value model does not know (a factory-returned app, a
+        field, `this`): a call shaped like a registration still counts -- a spurious route costs
+        less than a missing one."""
+        if name in _VERB_CALLS or name in ("Map", "MapMethods", "MapGroup"):
+            p = _arg(link, 0, "pattern", "prefix")
+            if not (const_str(p) is not None or (isinstance(p, dict) and p.get("k") in ("name", "member"))):
+                return False
+            if name == "MapGroup":
+                return True
+            h = self.handler_arg(link, name)
+            return isinstance(h, dict) and h.get("k") in ("lambda", "name", "member")
+        targs = (link.get("fn") or {}).get("targs") or []
+        if name in ("MapHub", "MapGrpcService", "MapRazorComponents"):
+            return bool(targs)
+        if name == "MapHealthChecks":
+            return const_str(_arg(link, 0, "pattern")) is not None
+        return False
 
     @staticmethod
     def handler_arg(link: dict, name: str):
         return _arg(link, 2 if name == "MapMethods" else 1, "handler", "requestdelegate")
 
+    def passes_through(self, link: dict, name: str, state) -> bool:
+        """Whether a non-Map call hands its receiver back: ASP.NET Core calls by symbol, and with no
+        symbol the known convention / middleware names (never a Map* call). Anything else (a solution call that was not
+        followed, an external extension such as MapIdentityApi) returns something we cannot trace."""
+        if name.startswith("Map"):
+            return False        # an endpoint registration returns the builder of its own endpoints
+        sym = link.get("sym")
+        if sym:
+            return sym.rsplit(".", 1)[0].startswith("Microsoft.AspNetCore.")
+        if name in _CONVENTION_NAMES or name in _FRAMEWORK_CALLS:
+            return True
+        return isinstance(state, _Node) and state.kind == "root" and name.startswith(("Use", "Add"))
+
     def convention(self, fr: _Frame, link: dict, state, name: str):
         """A non-Map call chained on a builder, a route, or a followed call's result."""
+        if state is None:
+            return None
+        if not self.passes_through(link, name, state):
+            return _Result([], False, name, [], fr.type.file, link.get("line", 0), depth=fr.cond)
+        cond_note = f"{name} applied conditionally"
         if isinstance(state, _Entry):
             state.ref.endpoint_calls.append(link)
+            if fr.cond > state.depth and cond_note not in state.ref.unknown:
+                state.ref.unknown.append(cond_note)
         elif isinstance(state, _Node):
             if state.kind == "group":
                 if state.group is not None:
                     state.group.calls.append(link)
                 else:
                     state.extras.append(Group("", [link], fr.type.file, link.get("line", 0)))
+                if fr.cond > state.depth and cond_note not in state.notes:
+                    state.notes.append(cond_note)
         elif isinstance(state, _Result):
             if not state.traced:
                 msg = f"{name} applied to the result of {state.label} could not be traced"
@@ -1010,6 +1090,13 @@ class _Scan:
                 for t in state.targets:
                     if isinstance(t, _Entry):
                         t.ref.endpoint_calls.append(link)
+                if fr.cond > state.depth:
+                    for t in state.targets:
+                        if isinstance(t, _Node):
+                            if cond_note not in t.notes:
+                                t.notes.append(cond_note)
+                        elif cond_note not in t.ref.unknown:
+                            t.ref.unknown.append(cond_note)
         return state
 
     # -- following calls ---------------------------------------------------------
@@ -1017,7 +1104,7 @@ class _Scan:
         t, m = pc.target
         scope = self.bind(fr, link, t, m, recv)
         start = len(self.entries)
-        rets = self.walk_method(t, m, scope, fr.via + (id(link),), True)
+        rets = self.walk_method(t, m, scope, fr.via + (id(link),), True, fr.cond)
         return self.result(rets, m.name, start, fr, link)
 
     def follow_local(self, fr: _Frame, link: dict, name: str, pc: PipeCall | None):
@@ -1031,7 +1118,7 @@ class _Scan:
         scope.update(self.bind(fr, link, fr.type, m, None, False))
         start = len(self.entries)
         self.fn_stack.add(id(lam))
-        rets = self.walk_body(fr.type, m, scope, fr.via, fr.reached, True, pc or fr.env_pc, fr.fns)
+        rets = self.walk_body(fr.type, m, scope, fr.via, fr.reached, True, pc or fr.env_pc, fr.fns, fr.cond)
         self.fn_stack.discard(id(lam))
         return self.result(rets, name, start, fr, link)
 
@@ -1068,7 +1155,8 @@ class _Scan:
                 targets.append(r)
             else:
                 traced = False
-        return _Result(targets, traced, label, self.entries[start:], fr.type.file, link.get("line", 0))
+        return _Result(targets, traced, label, self.entries[start:], fr.type.file, link.get("line", 0),
+                       depth=fr.cond)
 
     def use_endpoints(self, fr: _Frame, link: dict, state):
         """`UseEndpoints(e => ..)`: the lambda body runs with its parameter bound to the root builder."""
@@ -1076,7 +1164,8 @@ class _Scan:
             if not (isinstance(a, dict) and a.get("k") == "lambda"):
                 continue
             params = a.get("params") or []
-            inner = _Frame(fr.type, fr.method, dict(fr.scope), dict(fr.fns), fr.via, fr.reached, fr.lenient, fr.env_pc)
+            inner = _Frame(fr.type, fr.method, dict(fr.scope), dict(fr.fns), fr.via, fr.reached, fr.lenient,
+                           fr.env_pc, cond=fr.cond)
             if params:
                 inner.scope[params[0]] = state if isinstance(state, _Node) else _Node(None)
             body = a.get("body")
@@ -1104,6 +1193,7 @@ class _Scan:
         meta: dict = {"kind": "minimalapi", "api_surface": True}
         style, methods, handler, htype, hmeth = "minimalapi", ["ANY"], None, None, None
         start = end = line
+        src_file = None
         pattern = const_str(_arg(link, 0, "pattern"))
         targs = (link.get("fn") or {}).get("targs") or []
         t_text = targs[0] if targs else None
@@ -1120,8 +1210,14 @@ class _Scan:
             htype, hmeth, handler, hnote = self.resolve_handler(fr, harg)
             if hnote:
                 notes.append(hnote)
-            if isinstance(harg, dict) and harg.get("k") == "lambda":
-                start, end = min(line, hmeth.line), max(line, hmeth.end_line)
+            if hmeth is not None:
+                if isinstance(harg, dict) and harg.get("k") == "lambda":
+                    start, end = min(line, hmeth.line), max(line, hmeth.end_line)
+                else:
+                    # A method group or local function: the range is the handler's own code, in
+                    # the file that declares it (a local function lives in the Map call's file).
+                    start, end = hmeth.line, hmeth.end_line
+                    src_file = htype.file if htype is not None and any(x is hmeth for x in htype.methods) else file
         else:
             style = "endpoint"
             meta["api_surface"] = False
@@ -1154,10 +1250,11 @@ class _Scan:
         if env_pc is not None and env_pc.runs_in("Production") is not True and env_pc.env:
             meta["env"] = env_pc.env
         route = Route(path=path, methods=methods, handler_name=handler or name, file=file, line=line,
-                      source_start_line=start, source_end_line=end, meta=meta)
+                      source_file=src_file, source_start_line=start, source_end_line=end, meta=meta)
         ref = CoreRouteRef(route, htype, hmeth, self.proj, style=style, caller_unknown=not fr.reached, unknown=notes)
-        entry = _Entry(ref, node)
+        entry = _Entry(ref, node, fr.cond)
         self.entries.append(entry)
+        self.consumed.add(id(link))
         return entry
 
     def middleware(self, fr: _Frame, link: dict, name: str, pc: PipeCall | None) -> None:
@@ -1165,6 +1262,7 @@ class _Scan:
         env_pc = pc or fr.env_pc
         env = env_pc.env if env_pc is not None and env_pc.runs_in("Production") is not True else None
         line = link.get("line", 0)
+        self.consumed.add(id(link))
         for path in _SWAGGER_PATHS:
             if (path, env) in self.seen_mw:
                 continue

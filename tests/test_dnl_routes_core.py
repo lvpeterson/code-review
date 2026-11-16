@@ -607,3 +607,129 @@ def test_extension_methods_nobody_calls_are_all_caller_unknown(roslyn_helper, tm
     out = _discover_eps(root)
     assert {r.route.path for r in out} == {"/orphan", "/users", "/audit/a", "/audit/b"}
     assert all(r.caller_unknown for r in out)
+
+
+# -- fix round 1 -----------------------------------------------------------------
+
+def _degraded(monkeypatch):
+    monkeypatch.setattr("checks.dnl.helper.find_helper", lambda *a, **k: None)
+    monkeypatch.setattr("checks.dnl.helper.sdk_available", lambda *a, **k: False)
+
+
+def test_map_in_unwalked_branch_lambda_is_swept(roslyn_helper, tmp_path):
+    root = _copy_minimal(tmp_path)
+    _edit(root, "Program.cs", "app.Run();",
+          'app.MapWhen(c => true, b => { b.UseEndpoints(e => e.MapGet("/branch", () => 1)); });\napp.Run();')
+    r = ep(_discover_eps(root), "/branch")
+    assert r.caller_unknown is True and r.route.methods == ["GET"]
+    assert any("not reached by the pipeline walk" in u for u in r.unknown)
+    assert sum(1 for x in _discover_eps(root) if x.route.path == "/") == 1   # nothing registered twice
+
+
+def test_unreached_application_builder_and_nullable_builder_methods(roslyn_helper, tmp_path):
+    root = _copy_minimal(tmp_path)
+    (root / "Late.cs").write_text(
+        "public static class Late {" + chr(10)
+        + '  public static void Wire(IApplicationBuilder app) { app.UseEndpoints(e => { e.MapGet("/late", () => 1); }); }' + chr(10)
+        + '  public static void Wire2(IEndpointRouteBuilder? e) { e.MapGet("/nullable", () => 1); }' + chr(10)
+        + '  public static void Wire3(WebApplication? a) { a.MapGet("/nullapp", () => 1); }' + chr(10) + "}" + chr(10))
+    out = _discover_eps(root)
+    for path in ("/late", "/nullable", "/nullapp"):
+        assert ep(out, path).caller_unknown is True, path
+
+
+FACTORY = """var app = AppFactory.Make(args);
+var g = args.Length > 0 ? app.MapGroup("/a") : app.MapGroup("/b");
+g.MapGet("/t", () => 1);
+foreach (var grp in new[] { g }) { grp.MapGet("/each", () => 3); }
+app.MapGet("/f", () => 2);
+public static class AppFactory { public static WebApplication Make(string[] a) => WebApplication.CreateBuilder(a).Build(); }
+"""
+
+
+def _factory_app(tmp_path):
+    root = _copy_minimal(tmp_path)
+    (root / "Program.cs").write_text(FACTORY)
+    return root
+
+
+def test_unknown_receivers_still_register_with_and_without_helper(roslyn_helper, tmp_path, monkeypatch):
+    root = _factory_app(tmp_path)
+    full = _discover_eps(root)
+    got = pm(full)
+    assert {("/f", ("GET",)), ("/t", ("GET",)), ("/each", ("GET",))} <= got
+    assert any("could not be traced" in u for u in ep(full, "/t").unknown)
+    _degraded(monkeypatch)
+    deg = _discover_eps(root, True)
+    assert {("/f", ("GET",)), ("/t", ("GET",)), ("/each", ("GET",))} <= pm(deg)
+    assert any("could not be traced" in u for u in ep(deg, "/t").unknown)
+
+
+def test_conditional_conventions_are_not_trusted(roslyn_helper, tmp_path):
+    root = _copy_minimal(tmp_path)
+    _edit(root, "Program.cs", "app.Run();", """var cg = app.MapGroup("/cg");
+if (args.Length > 0) cg.RequireAuthorization();
+cg.MapGet("/c", () => 1);
+var ce = app.MapGet("/ce", () => 2);
+if (args.Length > 1) { ce.RequireAuthorization(); }
+var lg = app.MapGroup("/lg");
+foreach (var x in args) { lg.RequireAuthorization(); }
+lg.MapGet("/l", () => 1);
+app.Run();""")
+    out = _discover_eps(root)
+    for path in ("/cg/c", "/ce", "/lg/l"):
+        r = ep(out, path)
+        assert any("RequireAuthorization applied conditionally" in u for u in r.unknown), path
+    assert ep(out, "/").unknown == [] and ep(out, "/api/orders").unknown == []
+
+
+def test_handler_source_ranges(roslyn_helper, tmp_path):
+    root = _copy_minimal(tmp_path)
+    (root / "Handlers.cs").write_text("public static class Handlers" + chr(10) + "{" + chr(10)
+                                      + '    public static string One()' + chr(10) + "    {" + chr(10)
+                                      + '        return "1";' + chr(10) + "    }" + chr(10) + "}" + chr(10))
+    _edit(root, "Program.cs", "app.Run();", 'app.MapGet("/h", Handlers.One);\napp.Run();')
+    out = _discover_eps(root)
+    h = ep(out, "/h")
+    assert h.route.source_file.replace("\\", "/").endswith("Handlers.cs")
+    assert (h.route.source_start_line, h.route.source_end_line) == (h.method.line, h.method.end_line) == (3, 6)
+    assert h.route.file.replace("\\", "/").endswith("Program.cs")
+    o = ep(out, "/api/orders")
+    assert o.route.source_file.replace("\\", "/").endswith("Program.cs")
+    assert (o.route.source_start_line, o.route.source_end_line) == (o.method.line, o.method.end_line)
+    assert ep(out, "/").route.source_file is None
+
+
+ATTRS = """app.MapGet("/attr", [Authorize] () => 1);
+app.MapGet("/anon", [AllowAnonymous] static (int id) => id);
+[Authorize(Roles = "x")] static int Loc() => 1;
+app.MapGet("/loc", Loc);
+app.MapGet("/plain", () => 1);
+"""
+
+
+def _attr_names(r):
+    return [a.name for a in r.method.attributes]
+
+
+def test_lambda_and_local_function_attributes_reach_the_handler(roslyn_helper, tmp_path, monkeypatch):
+    root = _copy_minimal(tmp_path)
+    _edit(root, "Program.cs", "app.Run();", ATTRS + "app.Run();")
+    for degraded in (False, True):
+        if degraded:
+            _degraded(monkeypatch)
+        out = _discover_eps(root, degraded)
+        assert _attr_names(ep(out, "/attr")) == ["Authorize"]
+        assert _attr_names(ep(out, "/anon")) == ["AllowAnonymous"]
+        assert _attr_names(ep(out, "/loc")) == ["Authorize"]
+        assert ep(out, "/plain").method.attributes == []
+
+
+def test_external_call_in_chain_does_not_pass_conventions_through(roslyn_helper, tmp_path):
+    root = _copy_minimal(tmp_path)
+    _edit(root, "Program.cs", "app.Run();", """var rg = app.MapGroup("/r");
+rg.MapIdentityApi<IdentityUser>().RequireAuthorization();
+rg.MapGet("/r1", () => 1);
+app.Run();""")
+    r = ep(_discover_eps(root), "/r/r1")
+    assert not any("RequireAuthorization" in _names(g.calls) for g in r.groups)
