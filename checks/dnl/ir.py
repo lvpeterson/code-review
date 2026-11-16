@@ -231,3 +231,24 @@ def has_attr(attrs: list[Attr], *names: str) -> Attr | None:
     namespace qualifier and `Attribute` suffix."""
     wanted = {attr_key(n) for n in names}
     return next((a for a in attrs if attr_key(a.name) in wanted), None)
+
+
+def call_chain(expr: dict) -> tuple[dict | None, list[dict]]:
+    """Split a fluent chain: `a.B(x).C().D(y)` -> (`name a` node, [call B, call C, call D]),
+    innermost first (execution order). The root is the innermost receiver, whatever its
+    kind (`builder.Services.AddX()` roots at the `builder.Services` member); a bare
+    `F()` call has root None. A non-call expression is returned as is with no calls."""
+    calls: list[dict] = []
+    node: Any = expr
+    while isinstance(node, dict) and node.get("k") == "call":
+        calls.append(node)
+        fn = node.get("fn")
+        if isinstance(fn, dict) and fn.get("k") == "member":
+            node = fn.get("obj")
+        else:
+            node = None
+            break
+    if not calls:
+        return expr, []
+    calls.reverse()
+    return node, calls
