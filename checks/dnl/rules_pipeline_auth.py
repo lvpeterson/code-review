@@ -718,7 +718,9 @@ def _without_config_sections(node: dict) -> dict:
         if not isinstance(a, dict) or a.get("k") in ("lambda", "new", "lit"):
             return False
         return any((n.get("k") == "call" and call_name(n) == "GetSection")
-                   or "config" in str(n.get("id") or n.get("name") or "").lower() for n in walk(a))
+                   or (n.get("k") == "member" and n.get("name") == "Configuration")
+                   or (n.get("k") == "name" and str(n.get("id") or "").lower() in ("configuration", "config"))
+                   for n in walk(a))
     out = dict(node)
     out["args"] = [a for a in node.get("args") or [] if not is_section(a)]
     out["named"] = {k: v for k, v in (node.get("named") or {}).items() if not is_section(v)}
@@ -773,6 +775,8 @@ def _resolve_local(ctx: Ctx, c: PipeCall, node: dict, name: str) -> tuple[list[O
                    or (not init.get("type") and simple == _TVP)))
     if not is_tvp:
         return None, f"{name} is not a plain new {_TVP}"
+    if init.get("args"):
+        return None, f"{name} is built with constructor arguments (a copy of another {_TVP}?)"
     ok: set = set()
     out = list(assignments(init))
     for n, cond in walk_conditional(root):
@@ -810,6 +814,9 @@ def _tvp_settings(ctx: Ctx, c: PipeCall, node: dict, opts: list[Opt]) -> tuple[l
             t = str(v.get("type") or "").split(".")[-1]
             if t not in ("", _TVP):
                 unreadable.append((f"it is built as {v.get('type')}, a type this code does not read", o.line))
+            elif v.get("args"):
+                unreadable.append(("it is built with constructor arguments (a copy of another "
+                                   f"{_TVP}?), whose settings are not read", o.line))
         elif isinstance(v, dict) and v.get("k") == "name":
             extra, why = _resolve_local(ctx, c, node, v.get("id") or "")
             if extra is None:
@@ -850,6 +857,8 @@ def _signature_kind(o: Opt) -> str:
         return "custom"
     params = [p for p in v.get("params") or [] if isinstance(p, str)]
     body = v.get("body")
+    if isinstance(body, list) and not all(isinstance(x, dict) and x.get("k") == "return" for x in body):
+        return "custom"      # a block that does anything besides return may verify the token first
     rets = [body] if isinstance(body, dict) else [n.get("value") for n in walk(body) if n.get("k") == "return"]
     if not params or not rets:
         return "custom"
@@ -1005,70 +1014,87 @@ def _is_literal_key(text: str) -> bool:
     return not (PLACEHOLDER.match(t) or re.fullmatch(r"<[^>]*>|\{[^}]*\}", t))
 
 
-def _local_literal(body, name: str) -> str | None:
-    """The literal a local is initialised with, when every declaration of it is a literal and nothing
-    reassigns it to anything else."""
-    vals = []
+def _local_literal(body, name: str) -> tuple[str | None, bool]:
+    """(literal, reassigned): the literal a local is initialised with, when every declaration of it is a
+    literal; `reassigned` when something also assigns it a non-literal (the key may come from elsewhere)."""
+    vals, reassigned = [], False
     for n in walk(body):
         if n.get("k") == "local" and n.get("name") == name:
             vals.append(const_str(n.get("init")))
         elif (n.get("k") == "assign" and isinstance(n.get("target"), dict) and n["target"].get("k") == "name"
               and n["target"].get("id") == name and const_str(n.get("value")) is None):
-            return None
-    return vals[0] if vals and all(v is not None for v in vals) else None
+            reassigned = True
+    return (vals[0], reassigned) if vals and all(v is not None for v in vals) else (None, False)
 
 
-def _field_literal(t, name: str) -> str | None:
-    """The literal a field of type `t` is initialised with, unless a method of the type assigns it something
-    else (the IR does not say `readonly`, so a reassignment is the only sign it is not constant)."""
+def _assigned_elsewhere(model, t, name: str) -> bool:
+    """True when a non-literal is assigned to the field `name` of `t`: a bare `name = v` in a method,
+    constructor or accessor of the type, or any `x.name = v` member assignment in the solution. (The IR
+    does not say `readonly`, so a reassignment is the only sign the field is not constant.)"""
+    own = t.name.split(".")[-1]
+    for f in model.files.values():
+        for ot in f.types:
+            bodies = [m.body for m in ot.methods]
+            for p in ot.properties:
+                bodies += [b for b in (p.get, p.set) if b]
+            for body in bodies:
+                for n in walk(body):
+                    if n.get("k") != "assign" or n.get("op") != "=" or const_str(n.get("value")) is not None:
+                        continue
+                    tgt = n.get("target")
+                    if not isinstance(tgt, dict):
+                        continue
+                    if tgt.get("k") == "member" and tgt.get("name") == name:
+                        return True
+                    if tgt.get("k") == "name" and tgt.get("id") == name and ot.name.split(".")[-1] == own:
+                        return True
+    return False
+
+
+def _field_literal(model, t, name: str) -> tuple[str | None, bool]:
+    """(literal, reassigned) for a field of type `t` initialised with a literal."""
     f = next((x for x in t.fields if x.name == name), None)
     lit = const_str(f.init) if f is not None else None
     if lit is None:
-        return None
-    for m in t.methods:
-        for n in walk(m.body):
-            if n.get("k") == "assign" and n.get("op") == "=":
-                tgt = n.get("target")
-                if (isinstance(tgt, dict) and (tgt.get("id") == name or tgt.get("name") == name)
-                        and const_str(n.get("value")) is None):
-                    return None
-    return lit
+        return None, False
+    return lit, _assigned_elsewhere(model, t, name)
 
 
-def _literal_of(model, t, body, e) -> str | None:
-    """The string literal an expression stands for, resolved one level: a literal, a local or field of the
-    enclosing type, or `Type.Member`."""
+def _literal_of(model, t, body, e) -> tuple[str | None, bool]:
+    """(literal, maybe-not-constant) an expression stands for, resolved one level: a literal, a local or
+    field of the enclosing type, or `Type.Member`. (None, False) when it is not a literal source."""
     lit = const_str(e)
     if lit is not None or not isinstance(e, dict):
-        return lit
+        return lit, False
     if e.get("k") == "name":
         got = _local_literal(body, e.get("id") or "")
-        return got if got is not None else _field_literal(t, e.get("id") or "")
+        return got if got[0] is not None else _field_literal(model, t, e.get("id") or "")
     if e.get("k") == "member":
         parts = receiver_text(e).split(".")
         if len(parts) >= 2:
             owner = t.name.split(".")[-1] if parts[-2] == "this" else parts[-2]
             for ot in ([t] if owner == t.name.split(".")[-1] else []) + list(model.find_types(owner)):
-                got = _field_literal(ot, parts[-1])
-                if got is not None:
+                got = _field_literal(model, ot, parts[-1])
+                if got[0] is not None:
                     return got
-    return None
+    return None, False
 
 
-def _key_literal(model, t, body, new: dict) -> str | None:
-    """The literal behind `new SymmetricSecurityKey(<bytes>)`: Encoding.*.GetBytes(x), Convert.FromBase64String(x)
-    and the like. None for any other source (configuration, environment, Key Vault, a parameter)."""
+def _key_literal(model, t, body, new: dict) -> tuple[str | None, bool]:
+    """(literal, maybe-not-constant) behind `new SymmetricSecurityKey(<bytes>)`: Encoding.*.GetBytes(x),
+    Convert.FromBase64String(x) and the like. (None, False) for any other source (configuration,
+    environment, Key Vault, a parameter)."""
     args = new.get("args") or []
     if len(args) != 1 or not isinstance(args[0], dict) or args[0].get("k") != "call":
-        return None
+        return None, False
     call = args[0]
     kind = _BYTE_SOURCES.get((call_name(call) or "").lower())
     fn = call.get("fn") if isinstance(call.get("fn"), dict) else {}
     recv = receiver_text(fn.get("obj")) or str((fn.get("obj") or {}).get("type") or "")
     if kind is None or not call.get("args"):
-        return None
+        return None, False
     if (kind == "encoding" and "Encoding" not in recv) or (kind == "convert" and not recv.endswith("Convert")):
-        return None
+        return None, False
     return _literal_of(model, t, body, call["args"][0])
 
 
@@ -1107,7 +1133,7 @@ def _signing_keys(ctx: Ctx) -> None:
             roots += [(fl.init, []) for fl in t.fields if fl.init is not None]
             for root, body in roots:
                 for new, state in _symmetric_news(root):
-                    lit = _key_literal(ctx.model, t, body, new)
+                    lit, maybe = _key_literal(ctx.model, t, body, new)
                     key = (t.file, new.get("line"))
                     if lit is None or not _is_literal_key(lit) or state == "skip" or key in seen:
                         continue
@@ -1117,8 +1143,11 @@ def _signing_keys(ctx: Ctx) -> None:
                             "from configuration, an environment variable or a key vault.")
                     if state == "review":
                         desc += " The code sits under an environment condition that could not be parsed."
+                    if maybe:
+                        desc += (" The string is also assigned a non-literal value elsewhere, so the key may be "
+                                 "loaded from configuration at run time; confirm which value is used.")
                     ctx.add("DNL-SEC-004", "high", _SEC004_TITLE, desc, t.file, new.get("line") or t.line,
-                            confidence="REVIEW" if state == "review" else None)
+                            confidence="REVIEW" if state == "review" or maybe else None)
 
 
 def check_tokens(ctx: Ctx) -> None:

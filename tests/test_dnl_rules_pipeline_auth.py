@@ -753,10 +753,10 @@ def test_symmetric_key_from_config_is_silent(tmp_path, mode):
         assert not tok(f, "DNL-SEC-004"), src
 
 
-def test_symmetric_key_reassigned_local_is_silent(tmp_path, mode):
+def test_symmetric_key_reassigned_local_is_review(tmp_path, mode):
     files = prog('var s = "super-secret-signing-key-123456";\ns = config["Jwt:Key"];\n'
                  "var k = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(s));")
-    assert not tok(scan(tmp_path, files, mode), "DNL-SEC-004")
+    assert tok(scan(tmp_path, files, mode), "DNL-SEC-004") == {("DNL-SEC-004", "high", "REVIEW")}
 
 
 def test_symmetric_key_environment_guards(tmp_path, mode):
@@ -772,3 +772,45 @@ def test_microsoft_identity_web_api_config_section_is_not_opaque(tmp_path, mode)
     files = prog("builder.Services.AddAuthentication().AddMicrosoftIdentityWebApi("
                  'builder.Configuration.GetSection("AzureAd"));')
     assert not tok(scan(tmp_path, files, mode), "DNL-SESS-010", "DNL-CFG-012")
+
+
+def test_tvp_constructor_arguments_are_review(tmp_path, mode):
+    f = scan(tmp_path / "a", jwt("o.TokenValidationParameters = new TokenValidationParameters(source);"), mode)
+    assert ("DNL-SESS-010", "medium", "REVIEW") in tok(f, "DNL-SESS-010")
+    assert ("DNL-SESS-011", "low", "REVIEW") in tok(f, "DNL-SESS-011")
+    f = scan(tmp_path / "b", jwt("var p = new TokenValidationParameters(source);\no.TokenValidationParameters = p;"), mode)
+    assert ("DNL-SESS-010", "medium", "REVIEW") in tok(f, "DNL-SESS-010")
+    f = scan(tmp_path / "c", jwt("o.TokenValidationParameters = new TokenValidationParameters();"), mode)
+    assert not tok(f, "DNL-SESS-010", "DNL-SESS-011")
+    f = scan(tmp_path / "d", jwt("o.TokenValidationParameters = source.Clone();"), mode)
+    assert ("DNL-SESS-010", "medium", "REVIEW") in tok(f, "DNL-SESS-010")
+
+
+def test_block_signature_validator_with_checks_is_review(tmp_path, mode):
+    body = "SignatureValidator = (t, p) => { Verify(t); return new JwtSecurityToken(t); }"
+    f = scan(tmp_path / "a", tvp(body), mode)
+    assert tok(f, "DNL-SESS-010") == {("DNL-SESS-010", "high", "REVIEW")}
+    f = scan(tmp_path / "b", tvp("SignatureValidator = (t, p) => { return new JwtSecurityToken(t); }"), mode)
+    assert tok(f, "DNL-SESS-010") == {("DNL-SESS-010", "high", None)}
+
+
+def test_symmetric_key_field_reassigned_elsewhere_is_review(tmp_path, mode):
+    keys = 'public static class Keys { public static string Jwt = "super-secret-signing-key-123456"; }\n'
+    maker = "public class Maker { public object Make() => new SymmetricSecurityKey(Encoding.UTF8.GetBytes(Keys.Jwt)); }\n"
+    other = 'public class Boot { public void Load(IConfiguration c) { Keys.Jwt = c["Jwt:Key"]; } }\n'
+    f = scan(tmp_path / "a", {"Keys.cs": keys, "Maker.cs": maker, "Boot.cs": other}, mode)
+    assert tok(f, "DNL-SEC-004") == {("DNL-SEC-004", "high", "REVIEW")}
+    f = scan(tmp_path / "b", {"Keys.cs": keys, "Maker.cs": maker}, mode)
+    assert tok(f, "DNL-SEC-004") == {("DNL-SEC-004", "high", None)}
+    ctor = ('public class Maker { private static string K = "super-secret-signing-key-123456";\n'
+            'public Maker(IConfiguration c) { K = c["Jwt:Key"]; }\n'
+            "public object Make() => new SymmetricSecurityKey(Encoding.UTF8.GetBytes(K)); }\n")
+    f = scan(tmp_path / "c", {"Maker.cs": ctor}, mode)
+    assert tok(f, "DNL-SEC-004") == {("DNL-SEC-004", "high", "REVIEW")}
+
+
+def test_ms_identity_method_group_named_like_config_is_opaque(tmp_path, mode):
+    for i, arg in enumerate(("ConfigureJwt", "configureJwt")):
+        files = prog(f"builder.Services.AddAuthentication().AddMicrosoftIdentityWebApi({arg});")
+        f = scan(tmp_path / str(i), files, mode)
+        assert ("DNL-SESS-010", "medium", "REVIEW") in tok(f, "DNL-SESS-010"), arg
