@@ -66,7 +66,7 @@ def test_version_in_unparsable_is_not_a_match():
 
 def test_data_schema():
     data = json.loads(DATA.read_text(encoding="utf-8"))
-    assert set(data) == {"nuget", "js"}
+    assert {"nuget", "js"} <= set(data)   # extra keys (`eol`, `eol_as_of`) serve ASP.NET Core
     for kind, key in (("nuget", "id"), ("js", "library")):
         assert data[kind]
         for e in data[kind]:

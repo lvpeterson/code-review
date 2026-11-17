@@ -109,7 +109,7 @@ _add(["DNL-RES-002", "DNL-RES-003"], "A06", "A04", "API4")
 _add(["DNL-INV-002"], "A02", "A05", "API9", "always")
 _add(["DNL-CONSUME-001", "DNL-CONSUME-002"], "A08", "A08", "API10", "always")
 # Offline SCA rules (Plan 4).
-_add(["DNL-SCA-001", "DNL-SCA-002", "DNL-SCA-004"], "A03", "A06", None)
+_add(["DNL-SCA-001", "DNL-SCA-002", "DNL-SCA-004", "DNL-SCA-006"], "A03", "A06", None)
 _add(["DNL-SCA-003"], "A03", "A06", "API9", "always")
 _add(["DNL-SCA-005"], "A03", "A08", None)
 

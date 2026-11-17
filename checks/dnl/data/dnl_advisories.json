@@ -116,6 +116,105 @@
    "affected": ">=2.18.0 <2.29.4",
    "severity": "high",
    "summary": "Moment.js vulnerable to Inefficient Regular Expression Complexity"
+  },
+  {
+   "id": "Microsoft.AspNetCore.Server.Kestrel.Core",
+   "advisory": "GHSA-242j-2gm6-5rwx",
+   "cve": "CVE-2021-1723",
+   "url": "https://github.com/advisories/GHSA-242j-2gm6-5rwx",
+   "affected": "<2.1.25",
+   "severity": "high",
+   "summary": "ASP.NET Core and Visual Studio Denial of Service Vulnerability"
+  },
+  {
+   "id": "Microsoft.AspNetCore.Http.Connections",
+   "advisory": "GHSA-655q-9gvg-q4cm",
+   "cve": "CVE-2020-0603",
+   "url": "https://github.com/advisories/GHSA-655q-9gvg-q4cm",
+   "affected": ">=1.0.0 <1.0.15",
+   "severity": "high",
+   "summary": "Remote code execution in ASP.NET Core"
+  },
+  {
+   "id": "Microsoft.AspNetCore.Http",
+   "advisory": "GHSA-hxrm-9w7p-39cc",
+   "cve": "CVE-2020-1045",
+   "url": "https://github.com/advisories/GHSA-hxrm-9w7p-39cc",
+   "affected": "<2.1.22",
+   "severity": "high",
+   "summary": "Cookie parsing failure"
+  },
+  {
+   "id": "Microsoft.AspNetCore.Authentication.JwtBearer",
+   "advisory": "GHSA-q7cg-43mg-qp69",
+   "cve": "CVE-2021-34532",
+   "url": "https://github.com/advisories/GHSA-q7cg-43mg-qp69",
+   "affected": ">=2.1.0 <2.1.29 || >=3.0.0 <3.1.18 || >=5.0.0 <5.0.9",
+   "severity": "medium",
+   "summary": "ASP.NET Core Information Disclosure Vulnerability"
+  },
+  {
+   "id": "System.Text.Json",
+   "advisory": "GHSA-8g4q-xg66-9fp4",
+   "cve": "CVE-2024-43485",
+   "url": "https://github.com/advisories/GHSA-8g4q-xg66-9fp4",
+   "affected": ">=6.0.0 <6.0.10 || >=8.0.0 <8.0.5",
+   "severity": "high",
+   "summary": "Microsoft Security Advisory CVE-2024-43485 | .NET Denial of Service Vulnerability"
+  },
+  {
+   "id": "System.Text.Json",
+   "advisory": "GHSA-hh2w-p6rv-4g7w",
+   "cve": "CVE-2024-30105",
+   "url": "https://github.com/advisories/GHSA-hh2w-p6rv-4g7w",
+   "affected": ">=7.0.0 <8.0.4",
+   "severity": "high",
+   "summary": "Microsoft Security Advisory CVE-2024-30105 | .NET Denial of Service Vulnerability"
+  },
+  {
+   "id": "System.IdentityModel.Tokens.Jwt",
+   "advisory": "GHSA-59j7-ghrg-fj52",
+   "cve": "CVE-2024-21319",
+   "url": "https://github.com/advisories/GHSA-59j7-ghrg-fj52",
+   "affected": "<5.7.0 || >=6.5.0 <6.34.0 || >=7.0.0-preview <7.1.2",
+   "severity": "medium",
+   "summary": "Microsoft ASP.NET Core project templates vulnerable to denial of service"
+  },
+  {
+   "id": "Microsoft.IdentityModel.JsonWebTokens",
+   "advisory": "GHSA-59j7-ghrg-fj52",
+   "cve": "CVE-2024-21319",
+   "url": "https://github.com/advisories/GHSA-59j7-ghrg-fj52",
+   "affected": "<5.7.0 || >=6.5.0 <6.34.0 || >=7.0.0-preview <7.1.2",
+   "severity": "medium",
+   "summary": "Microsoft ASP.NET Core project templates vulnerable to denial of service"
+  },
+  {
+   "id": "Microsoft.Data.SqlClient",
+   "advisory": "GHSA-98g6-xh36-x2p7",
+   "cve": "CVE-2024-0056",
+   "url": "https://github.com/advisories/GHSA-98g6-xh36-x2p7",
+   "affected": "<2.1.7 || >=3.0.0 <3.1.5 || >=4.0.0 <4.0.5 || >=5.0.0 <5.1.3",
+   "severity": "high",
+   "summary": "Microsoft.Data.SqlClient and System.Data.SqlClient vulnerable to SQL Data Provider Security Feature Bypass"
+  },
+  {
+   "id": "System.Net.Http",
+   "advisory": "GHSA-7jgj-8wvc-jh57",
+   "cve": "CVE-2018-8292",
+   "url": "https://github.com/advisories/GHSA-7jgj-8wvc-jh57",
+   "affected": "<4.3.4",
+   "severity": "high",
+   "summary": ".NET Core Information Disclosure"
+  },
+  {
+   "id": "System.Text.RegularExpressions",
+   "advisory": "GHSA-cmhx-cq75-c4mj",
+   "cve": "CVE-2019-0820",
+   "url": "https://github.com/advisories/GHSA-cmhx-cq75-c4mj",
+   "affected": ">=4.3.0 <4.3.1",
+   "severity": "high",
+   "summary": "Regular Expression Denial of Service in System.Text.RegularExpressions"
   }
  ],
  "js": [
@@ -253,6 +352,74 @@
    "affected": "<4.17.21",
    "severity": "high",
    "summary": "Command Injection in lodash"
+  }
+ ],
+ "eol_as_of": "2026-11-16",
+ "eol": [
+  {
+   "tfm": "netcoreapp1.0",
+   "eol": "2019-06-27",
+   "source": "https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core"
+  },
+  {
+   "tfm": "netcoreapp1.1",
+   "eol": "2019-06-27",
+   "source": "https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core"
+  },
+  {
+   "tfm": "netcoreapp2.0",
+   "eol": "2018-10-01",
+   "source": "https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core"
+  },
+  {
+   "tfm": "netcoreapp2.1",
+   "eol": "2021-08-21",
+   "source": "https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core"
+  },
+  {
+   "tfm": "netcoreapp2.2",
+   "eol": "2019-12-23",
+   "source": "https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core"
+  },
+  {
+   "tfm": "netcoreapp3.0",
+   "eol": "2020-03-03",
+   "source": "https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core"
+  },
+  {
+   "tfm": "netcoreapp3.1",
+   "eol": "2022-12-13",
+   "source": "https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core"
+  },
+  {
+   "tfm": "net5.0",
+   "eol": "2022-05-10",
+   "source": "https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core"
+  },
+  {
+   "tfm": "net6.0",
+   "eol": "2024-11-12",
+   "source": "https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core"
+  },
+  {
+   "tfm": "net7.0",
+   "eol": "2024-05-14",
+   "source": "https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core"
+  },
+  {
+   "tfm": "net8.0",
+   "eol": "2026-11-10",
+   "source": "https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core"
+  },
+  {
+   "tfm": "net9.0",
+   "eol": "2026-11-10",
+   "source": "https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core"
+  },
+  {
+   "tfm": "net10.0",
+   "eol": "2028-11-14",
+   "source": "https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core"
   }
  ]
 }
