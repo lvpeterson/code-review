@@ -91,6 +91,14 @@ def test_const():
     assert const(member(name("CookieSecurePolicy"), "None")) == "CookieSecurePolicy.None"
     q = member(member(name("Microsoft"), "CookieSecurePolicy"), "Always")
     assert const(q) == "CookieSecurePolicy.Always"
+    assert const(member(member(member(name("Microsoft"), "AspNetCore"), "CookieSecurePolicy"), "None")) \
+        == "CookieSecurePolicy.None"
+    assert const(member(name("SameSiteMode"), "None")) == "SameSiteMode.None"
+    # A variable, field or `this` member is a runtime value, never an enum member.
+    assert const(member(name("settings"), "Policy")) is UNKNOWN
+    assert const(member(name("_policy"), "Value")) is UNKNOWN
+    assert const(member({"k": "this", "line": 1}, "X")) is UNKNOWN
+    assert const(member(name("this"), "X")) is UNKNOWN
     assert const(call(name("cfg"), "GetValue")) is UNKNOWN
     assert const(name("flag")) is UNKNOWN
     assert const(None) is UNKNOWN

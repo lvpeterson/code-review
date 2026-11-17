@@ -196,7 +196,9 @@ def const(expr: dict | None):
     if k == "member" and expr.get("name"):
         text = receiver_text(expr)
         # Only a member of a plain name chain: `a.b().C` has no text and stays unknown.
-        if text and "." in text:
+        # and only when it starts like a type name (PascalCase, or a PascalCase namespace): a variable,
+        # field or `this` member (`settings.Policy`, `_p.Value`) is a runtime value, not an enum member.
+        if text and "." in text and text[0].isupper():
             return ".".join(text.split(".")[-2:])
     return UNKNOWN
 
