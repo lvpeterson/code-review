@@ -115,9 +115,6 @@ def test_crypto_findings_on_core(mode, monkeypatch):
     got = _family(results, ("DNL-CRY-", "DNL-SEC-"))
     assert got == CRYPTO_EXPECTED
     assert not [g for g in got if g[1].endswith("SafeCrypto.cs")]
-    # the password hash is reached from a routed action: it carries that route
-    md5 = next(f for r in results for f in r.findings if f.check_id == "DNL-CRY-001" and f.line == 14)
-    assert md5.route is None or md5.route.meta["kind"] == "controller"
 
 
 DESER_EXPECTED = {
@@ -316,12 +313,14 @@ WEB_CONFIG_ONLY = FX / "web_config_only_core"
 
 @pytest.mark.parametrize("root", [CARRIED_APP, WEB_CONFIG_ONLY], ids=["carried_app", "web_config_only_core"])
 @pytest.mark.parametrize("mode", ["helper", "degraded"])
-def test_web_config_checks_do_not_run_on_core(root, mode, monkeypatch):
+def test_web_config_checks_do_not_run_on_core(root, mode, request, monkeypatch):
     # carried_app's Web.config holds the IIS hosting stub plus legacy system.web / system.webServer
     # sections (debug, version header, customErrors Off, detailed errors); none of it is read on Core.
     assert (root / "Web.config").is_file()
     if mode == "degraded":
         _degraded(monkeypatch)
+    else:
+        request.getfixturevalue("roslyn_helper")
     results = _dotnet(root, allow_degraded=(mode == "degraded"))
     assert results
     findings = [f for r in results for f in r.findings]

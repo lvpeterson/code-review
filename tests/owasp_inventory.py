@@ -51,7 +51,16 @@ NOT_RULE_IDS: frozenset[str] = frozenset()
 # never emits POL-* itself. rules_crypto borrows rules_config's regexes for
 # hardcoded credentials but never emits the Web.config rules (DNL-CFG-*);
 # rules_logging borrows its package / config-file regexes the same way.
-EXCLUDED_EDGES = {("aws_lambda", "tf_graph"), ("rules_crypto", "rules_config"), ("rules_logging", "rules_config")}
+# ASP.NET Core runs no taint or object rules yet (CORE_RUNS_TAINT = False): rules_deser_xml imports
+# rules_taint lazily and rules_resources imports rules_object, neither of which Core emits. Delete
+# both edges when Plan 2 wires taint / object into Core. flowutil only borrows a helper from rules_object.
+EXCLUDED_EDGES = {("aws_lambda", "tf_graph"), ("rules_crypto", "rules_config"), ("rules_logging", "rules_config"),
+                  ("rules_deser_xml", "rules_taint"), ("rules_resources", "rules_object"),
+                  ("flowutil", "rules_object")}
+
+# Ids inside modules Core does run that can never fire on an SDK project (see
+# languages/dotnet/CARRIED_RULES.md): they must not count towards the dotnet row.
+CORE_NEVER_EMITTED = {"DNL-INT-004", "DNL-XXE-002", "DNL-SESS-006", "DNL-SESS-007", "DNL-LOG-002"}
 
 # Families whose analyzers can mark a finding as sitting on an API surface
 # (see core.owasp_web.api_surface_for); the rest only get API tags from
@@ -171,7 +180,7 @@ def dnl_ids_for_dotnet() -> set[str]:
                    if m.group(1).startswith("DNL-") and ID_SHAPE.match(m.group(1)))
         todo.extend(m for m in _dnl_imports(available[mod])
                     if m in available and m != mod and (mod, m) not in EXCLUDED_EDGES)
-    return ids
+    return ids - CORE_NEVER_EMITTED
 
 
 def _lang_of(rel: str) -> str | None:

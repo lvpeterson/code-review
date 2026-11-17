@@ -1,6 +1,6 @@
 """Analyzer registrations for the ASP.NET Core (modern .NET) package.
 
-Four analyzers share one ProjectModel view (the `dotnet` projects of the scan, prepared once by the
+Five analyzers share one ProjectModel view (the `dotnet` projects of the scan, prepared once by the
 enumerator so the Roslyn helper runs once for both .NET packages): controllers, razorpages and
 minimalapi split the routes and auth findings by route kind, config reports the route-less findings
 (never-denying handlers / policies / filters, middleware order). Route discovery and auth resolution

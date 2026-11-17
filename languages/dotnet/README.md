@@ -10,8 +10,9 @@ keeps .NET Framework apps. In a mixed solution each package takes its own
 projects and the helper runs once for both. The earlier tree-sitter analyzer
 (`aspnet`) is retired; `--framework aspnet` is no longer valid.
 
-Plan 1 (this foundation) covers route discovery and authorization. Taint,
-config and dependency rules for Core come later.
+Route discovery and authorization, offline dependency (SCA) rules and the carried-over rule families
+(see `CARRIED_RULES.md`) run on Core. Taint and config rules for Core come later. Forcing
+`--framework deps` alone drops the route-level findings: they go to the `config` analyzer, which then does not run.
 
 ## Frameworks reported as separate results
 
