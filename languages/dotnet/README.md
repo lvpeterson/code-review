@@ -83,8 +83,9 @@ dotnet_legacy table.
   exclusions. DTOs, `[AsParameters]` types and files are tainted. In Razor
   Pages and controllers a `[BindProperty]` property (or every settable
   property under `[BindProperties]`) is input for non-GET handlers, and for GET
-  only with `SupportsGet = true`. Minimal-API lambdas are analysed as the
-  route handler, including the helpers they call.
+  only when `SupportsGet` is not literally `false` (a constant or expression
+  counts as true). Minimal-API lambdas are analysed as the route handler,
+  including the helpers they call.
 - **Sinks**: SQL (`FromSqlRaw`, `ExecuteSqlRaw`, ADO.NET commands), command
   and path APIs, redirects (including `Location` headers), SSRF
   (`HttpClient`, `HttpClientJson*`, `HttpRequestMessage`), deserialization,
@@ -96,12 +97,12 @@ dotnet_legacy table.
   that renders it; HTML encoders cleanse, `Html.Raw` and `HtmlString` do not.
 - **Object rules**: DNL-AUTHZ-005 (IDOR: a record looked up by a request id
   with no ownership or `AuthorizeAsync` check that can reject), DNL-AUTHZ-006
-  (over-posting: a bound entity or model with sensitive members reaching the context without a `[Bind]` allow-list),
+  (over-posting: a bound entity or model with sensitive
+  members reaching the context without a `[Bind]` allow-list),
   DNL-AUTHZ-007 (an entity with a sensitive-looking member returned directly).
 
 Findings without proof are REVIEW. Degraded mode (`--allow-degraded`) finds
-the same proven findings on the bundled controller, Razor Pages and
-minimal-API samples; it matches framework types by name instead of symbol.
+the same proven findings on controllers, Razor Pages and minimal APIs; it matches framework types by name instead of symbol.
 
 ## Requirements and degraded mode
 
