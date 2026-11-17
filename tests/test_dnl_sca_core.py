@@ -240,3 +240,49 @@ def test_eol_table_invalid_rows_dropped(tmp_path):
 
 def test_rule_registered():
     assert RULES["DNL-SCA-006"][1:] == RULES["DNL-SCA-001"][1:]
+
+
+# -- lock file attachment and fallbacks -------------------------------------
+
+def _copy(tmp_path) -> Path:
+    root = tmp_path / "app"
+    shutil.copytree(FX, root, ignore=shutil.ignore_patterns("bin"))
+    return root
+
+
+def test_stray_nested_lock_is_ignored(tmp_path):
+    root = _copy(tmp_path)
+    stray = root / "samples" / "vendored"
+    stray.mkdir(parents=True)
+    # A deeper lock must neither replace the real one nor be reported itself.
+    (stray / "packages.lock.json").write_text(json.dumps({"version": 1, "dependencies": {"net8.0": {
+        "System.Text.RegularExpressions": {"type": "Direct", "resolved": "9.9.9"},
+        "System.Net.Http": {"type": "Transitive", "resolved": "4.1.0"}}}}), encoding="utf-8")
+    findings, _ = _run(root)
+    assert not _pkg(findings, "System.IdentityModel.Tokens.Jwt")          # real lock (6.34.0) still wins
+    assert len(_pkg(findings, "System.Text.RegularExpressions")) == 1
+    assert [f.file for f in _pkg(findings, "System.Net.Http")] == ["packages.lock.json"]
+    assert not any("samples" in f.file for f in findings)
+
+
+def test_unresolvable_spec_with_lock_entry_is_not_review(tmp_path):
+    root = _copy(tmp_path)
+    lock = json.loads((root / "packages.lock.json").read_text(encoding="utf-8"))
+    lock["dependencies"]["net8.0"]["Serilog"] = {"type": "Direct", "requested": "[1.*, )", "resolved": "1.5.14"}
+    (root / "packages.lock.json").write_text(json.dumps(lock), encoding="utf-8")
+    findings, _ = _run(root)
+    review = " ".join(f.title for f in _by(findings, "DNL-SCA-006"))
+    assert "Serilog " not in review + " " and len(_by(findings, "DNL-SCA-006")) == 2
+
+
+def test_package_without_textual_reference_falls_back_to_line_1(tmp_path):
+    (tmp_path / "Directory.Build.props").write_text(
+        '<Project><ItemGroup><PackageReference Include="System.Net.Http" Version="4.3.0" /></ItemGroup></Project>',
+        encoding="utf-8")
+    (tmp_path / "A.csproj").write_text(
+        '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework>'
+        "</PropertyGroup></Project>", encoding="utf-8")
+    findings, _ = _run(tmp_path)
+    # No textual reference: the id is only known lower-cased (Project.packages keys).
+    hits = _by(findings, "DNL-SCA-001")
+    assert len(hits) == 1 and "system.net.http 4.3.0" in hits[0].title and hits[0].file == "A.csproj" and hits[0].line == 1

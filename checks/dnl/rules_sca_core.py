@@ -73,19 +73,19 @@ def eol_tfms(today: datetime.date | None = None) -> set[str]:
 # -- packages.lock.json -----------------------------------------------------
 
 def _read_locks(model: ProjectModel, projects: list[Project], notes: list[str]) -> dict[Path, dict]:
-    """{project dir -> lock facts} for each packages.lock.json next to (or above) an SDK project.
-    A lock file belongs to the project whose directory is the deepest one holding it; one that
+    """{project dir -> lock facts} for each packages.lock.json that sits in an SDK project's own
+    directory (next to the csproj, where NuGet writes it). A lock file anywhere else (a sample or
+    vendored tree below the project) is ignored, so it can never replace the real one; one that
     is malformed or of an unknown format version adds a note and is ignored."""
-    dirs = [(p, p.dir.resolve()) for p in projects]
+    dirs = {p.dir.resolve() for p in projects}
     out: dict[Path, dict] = {}
     for path in model.iter_files((".json",)):
         if path.name.lower() != _LOCK_NAME:
             continue
         here = path.parent.resolve()
-        hits = [d for _p, d in dirs if here == d or here.is_relative_to(d)]
-        if not hits:
+        if here not in dirs:
             continue
-        owner = max(hits, key=lambda d: len(d.parts))
+        owner = here
         rel = model.rel(path)
         text = sca._safe_read(path, notes)
         try:
