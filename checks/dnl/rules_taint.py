@@ -143,6 +143,10 @@ def check(model, refs: list) -> list[Finding]:
                 sev = "low"
                 conf = {"confidence": "REVIEW"}
                 text += "; only the path is attacker-controlled (the URL starts with an untainted prefix)"
+            if rule == "DNL-SSRF-001" and model.is_core_test_file(file):
+                # Test projects stand up fake endpoints; a flow there is rarely deployed: one lower, REVIEW.
+                sev = _LOWER[sev]
+                conf = {"confidence": "REVIEW"}
             out.append(dnl_finding(rule, sev, _LABEL[r.hit.kind], text, file, line, route=route,
                                    api_surface=bool(route.meta.get("api_surface", False)) if route else False,
                                    **conf))

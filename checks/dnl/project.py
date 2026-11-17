@@ -65,6 +65,9 @@ class Project:
         return self.path is not None and not self.is_legacy
 
 
+_TEST_NAME = re.compile(r"(?i)(?:^|\.)(?:unit|integration|functional|e2e)?tests?$")
+
+
 @dataclass
 class ProjectModel:
     root: Path
@@ -187,6 +190,23 @@ class ProjectModel:
             self._rel_proj = m
         return self._rel_proj.get(rel)
 
+    def is_core_file(self, rel: str) -> bool:
+        """True when rel belongs to an ASP.NET Core / modern .NET project (never for legacy code)."""
+        proj = self.project_of(rel)
+        return proj is not None and proj.owner == "dotnet"
+
+    def is_core_test_file(self, rel: str) -> bool:
+        """A modern .NET file of a test project: the project name ends with .Tests / .Test /
+        .UnitTests / .IntegrationTests (or `Tests` / `Test`), or a folder of the path (below the
+        scan root) is named tests / test or ends with .Tests / .Test."""
+        proj = self.project_of(rel)
+        if proj is None or proj.owner != "dotnet":
+            return False
+        if _TEST_NAME.search(proj.name or ""):
+            return True
+        return any(seg.lower() in ("tests", "test") or _TEST_NAME.search(seg)
+                   for seg in rel.replace("\\", "/").split("/")[:-1])
+
 
 # -- project loading ------------------------------------------------------
 
@@ -280,6 +300,48 @@ class _Facts:
     usings: list[str] = field(default_factory=list)
 
 
+def _props_layers(start: Path, root: Path) -> list:
+    """Parsed Directory.*.props files from the scan root down to start (farthest first, nearest
+    last; within one folder Directory.Build.props, then the others by name). A literal
+    `<Import Project="x.props">` is followed (relative to its file) and applies before its importer."""
+    out: list = []
+    seen: set[Path] = set()
+
+    def load(f: Path, depth: int) -> None:
+        f = f.resolve()
+        if f in seen or depth > 5:
+            return
+        seen.add(f)
+        t = _parse_xml(f)
+        if t is None:
+            return
+        for el in t.iter():
+            ref = el.get("Project") if _local(el.tag) == "Import" else None
+            if ref and "$(" not in ref and "*" not in ref:
+                load(f.parent / ref.replace("\\", "/"), depth + 1)
+        out.append(t)
+
+    cur = start.resolve()
+    root = root.resolve()
+    dirs: list[Path] = []
+    while True:
+        dirs.append(cur)
+        if cur == root or not cur.is_relative_to(root) or cur.parent == cur:
+            break
+        cur = cur.parent
+    for d in reversed(dirs):
+        if not d.is_dir():
+            continue
+        try:
+            names = [c for c in d.iterdir() if c.is_file() and c.name.lower().startswith("directory.")
+                     and c.name.lower().endswith(".props")]
+        except OSError:
+            continue
+        for f in sorted(names, key=lambda c: (c.name.lower() != "directory.build.props", c.name.lower())):
+            load(f, 0)
+    return out
+
+
 def _sdk_facts(path: Path, tree, root: Path) -> _Facts:
     """Properties, packages and usings of an SDK project: Directory.Build.props files
     from the scan root down (nearest wins), then the project file itself; central
@@ -288,7 +350,7 @@ def _sdk_facts(path: Path, tree, root: Path) -> _Facts:
     refs: list[tuple[str, str | None, str | None]] = []
     usings: list[tuple[str, str]] = []
     fw: set[str] = set()
-    for src in [*(_parse_xml(f) for f in _props_chain(path.parent, root, "Directory.Build.props")), tree]:
+    for src in [*_props_layers(path.parent, root), tree]:
         if src is None:
             continue
         for pg in (e for e in src.iter() if _local(e.tag) == "PropertyGroup"):
@@ -443,7 +505,7 @@ def _load_project(path: Path, notes: list[str], root: Path | None = None) -> Pro
             proj.profile = profile_for(facts.tfms)
         else:
             proj.profile = "netcore"
-            notes.append(f"{path.name}: no TargetFramework found (project file or Directory.Build.props); "
+            notes.append(f"{path.name}: no TargetFramework found (project file or Directory.*.props); "
                          "assuming modern .NET")
         if proj.profile == "netcore":
             proj.global_usings = facts.usings

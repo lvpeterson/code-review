@@ -198,6 +198,7 @@ class _Auth:
     such a method (two levels)."""
 
     def __init__(self, model):
+        self.model = model
         self.by_name: dict = {}
         self.owner: dict = {}
         for t in model.types():
@@ -206,7 +207,15 @@ class _Auth:
                 self.owner[id(m)] = t
         self._memo: dict = {}
 
-    def _targets(self, call: dict):
+    def _scope(self, owner) -> set:
+        """Full names of the owner type and its base types found in the solution."""
+        names = {owner.full_name.lower()}
+        for b in self.model.base_chain(owner):
+            for bt in self.model.find_types(b.split(".")[-1]):
+                names.add(bt.full_name.lower())
+        return names
+
+    def _targets(self, call: dict, owner=None):
         nm = (call_name(call) or "").lower()
         fn = call.get("fn") or {}
         cands = self.by_name.get(nm, ())
@@ -217,10 +226,15 @@ class _Auth:
         obj = fn.get("obj") if fn.get("k") == "member" else None
         if obj is None or (isinstance(obj, dict) and obj.get("k") == "name"
                            and (obj.get("id") or "").lower() in ("this", "me", "base", "mybase", "myclass")):
+            if owner is not None:
+                # Without a resolved symbol an unqualified call belongs to the enclosing type (or a base);
+                # a same-named method of an unrelated type is not what runs.
+                scope = self._scope(owner)
+                return [m for t, m in cands if t.full_name.lower() in scope]
             return [m for _t, m in cands]
         return []
 
-    def decides(self, stmts, depth: int = 2, seen: frozenset = frozenset()) -> bool:
+    def decides(self, stmts, depth: int = 2, seen: frozenset = frozenset(), owner=None) -> bool:
         for n in walk(stmts):
             if _is_marker(n):
                 return True
@@ -228,13 +242,14 @@ class _Auth:
             return False
         for n in walk(stmts):
             if n.get("k") == "call":
-                for m in self._targets(n):
+                for m in self._targets(n, owner):
                     if id(m) in seen:
                         continue
-                    key = (id(m), depth)
+                    key = (id(m), depth, owner is not None)
                     if key not in self._memo:
                         self._memo[key] = (bool(_DECISION_NAME.search(m.name))
-                                           or self.decides(m.body, depth - 1, seen | {id(m)}))
+                                           or self.decides(m.body, depth - 1, seen | {id(m)},
+                                                           self.owner[id(m)] if owner is not None else None))
                     if self._memo[key]:
                         return True
         return False
@@ -689,6 +704,7 @@ def check(model, refs=()) -> list:
     for t in model.types():
         if t.kind == "enum":
             continue
+        core = model.is_core_file(t.file)
         for label, m, body, _scope in iter_bodies(t):
             bool_like = m is None or (m.return_type or "").replace(" ", "").lower() in _BOOLS
             truth = _Truth(ctx.auth, t, body)
@@ -697,7 +713,8 @@ def check(model, refs=()) -> list:
                 truth.skip = {id(n) for n in walk(tr.get("body"))}
                 known = label.lower() in _KNOWN_DECISION
                 named = bool(_DECISION_NAME.search(label)) and bool_like
-                decision = known or named or ctx.auth.decides(tr.get("body"))
+                # Core only: legacy keeps the solution-wide bare-name resolution.
+                decision = known or named or ctx.auth.decides(tr.get("body"), owner=t if core else None)
                 lines = ctx.catch_lines(t.file, tr)
                 after = _tail(body, tr)
                 for c, line in zip(tr["catches"], lines):

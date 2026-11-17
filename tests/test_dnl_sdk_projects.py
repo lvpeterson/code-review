@@ -231,3 +231,53 @@ def test_core_project_side_files_never_reach_legacy(roslyn_helper, tmp_path):
     view = project.get_model(root, "dotnet_legacy")
     assert not view.owns(modern / "web.config") and not view.owns(modern / "Page.aspx")
     assert project.get_model(root, "dotnet").owns(modern / "web.config")
+
+
+def _sdk_csproj(d, body=""):
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "App.csproj").write_text(f'<Project Sdk="Microsoft.NET.Sdk">{body}</Project>')
+    (d / "A.cs").write_text("class A {}")
+
+
+def test_tfm_from_directory_packages_props(tmp_path):
+    (tmp_path / "Directory.Packages.props").write_text(
+        "<Project><PropertyGroup><TargetFramework>net6.0</TargetFramework>"
+        "<ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally></PropertyGroup></Project>")
+    _sdk_csproj(tmp_path / "src" / "App")
+    notes: list[str] = []
+    app = _by_name(load_projects(tmp_path, notes), "App")
+    assert app.target_frameworks == ["net6.0"] and app.profile == "netcore"
+    assert not any("assuming modern" in n for n in notes)
+
+
+def test_tfm_from_other_directory_props_nearest_wins(tmp_path):
+    (tmp_path / "Directory.Build.props").write_text(
+        "<Project><PropertyGroup><TargetFramework>net6.0</TargetFramework></PropertyGroup></Project>")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "Directory.Packages.props").write_text(
+        "<Project><PropertyGroup><TargetFrameworks>net7.0;net8.0</TargetFrameworks></PropertyGroup></Project>")
+    _sdk_csproj(tmp_path / "src" / "App")
+    app = _by_name(load_projects(tmp_path), "App")
+    assert app.target_frameworks == ["net7.0", "net8.0"]
+    # the project file still overrides every props file
+    _sdk_csproj(tmp_path / "src" / "App", "<PropertyGroup><TargetFramework>net9.0</TargetFramework></PropertyGroup>")
+    app = _by_name(load_projects(tmp_path), "App")
+    assert app.target_frameworks == ["net9.0"]
+
+
+def test_tfm_from_imported_props_and_framework_override(tmp_path):
+    (tmp_path / "build").mkdir()
+    (tmp_path / "build" / "common.props").write_text(
+        "<Project><PropertyGroup><TargetFramework>net472</TargetFramework></PropertyGroup></Project>")
+    (tmp_path / "Directory.Build.props").write_text('<Project><Import Project="build/common.props" /></Project>')
+    _sdk_csproj(tmp_path / "App")
+    app = _by_name(load_projects(tmp_path), "App")
+    assert app.target_frameworks == ["net472"] and app.profile == "net48"
+
+
+def test_no_tfm_anywhere_keeps_note(tmp_path):
+    (tmp_path / "Directory.Packages.props").write_text("<Project><PropertyGroup/></Project>")
+    _sdk_csproj(tmp_path / "App")
+    notes: list[str] = []
+    app = _by_name(load_projects(tmp_path, notes), "App")
+    assert app.profile == "netcore" and any("assuming modern" in n for n in notes)
