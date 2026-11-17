@@ -18,6 +18,8 @@ Razor Pages: a .cshtml under Pages/ or Areas/<A>/Pages/ with @page first is a pa
 PageModel is found by @model name (page namespace, then @using, via _ViewImports) and each
 On<Verb><Handler> method is one route. A page whose model is missing is one GET route with
 unknown set. meta["page"] is the page name conventions use (/Admin/Index), not the routed path.
+meta["page_attributes"] (when present) lists the raw `@attribute` directive texts of the page and its
+_ViewImports chain, e.g. "[AllowAnonymous]"; they are class-level attributes of the generated page.
 
 Endpoints (discover_endpoints): `Map{Get,Post,..}`, `MapMethods`, `Map` and the other Map*/Use* calls
 that register endpoints. The walk follows what the pipeline follows (entry points, solution methods
@@ -433,6 +435,8 @@ _PAGE_DIRECTIVE = re.compile(r'^@page\b\s*(?:@?"((?:[^"\\]|\\.)*)")?')
 _USING = re.compile(r"^@using\s+(?!static\b)(?:\w+\s*=\s*)?([\w.]+)\s*;?\s*$", re.MULTILINE)
 _NAMESPACE = re.compile(r"^@namespace\s+([\w.]+)\s*;?\s*$", re.MULTILINE)
 _MODEL = re.compile(r"^@model\s+([^\s;]+)", re.MULTILINE)
+# `@attribute [AllowAnonymous]` on a page or in a _ViewImports it inherits: class-level attributes of the generated page.
+_ATTRIBUTE = re.compile(r"^[ 	]*@attribute\s+(.+?)\s*$", re.MULTILINE)
 _FUNCTIONS = re.compile(r"^\s*@functions\b", re.MULTILINE)
 
 
@@ -447,6 +451,7 @@ class _Page:
     namespaces: list[str]      # candidate namespaces, innermost first
     functions: bool
     lines: int
+    attributes: list[str] = field(default_factory=list)   # raw `@attribute` directive texts, page first then _ViewImports
 
 
 def _razor_text(path: Path) -> str:
@@ -526,9 +531,12 @@ def _find_pages(model: ProjectModel) -> list[tuple[_Page, object]]:
             if pm is None:
                 continue
             m = _MODEL.search(text)
+            attrs = [x.group(1) for x in _ATTRIBUTE.finditer(text)]
+            for imp in _import_chain(f, pdir):
+                attrs.extend(x.group(1) for x in _ATTRIBUTE.finditer(_razor_text(imp)))
             found.append((_Page(f, model.rel(f), area, list(below[:-1]), pm.group(1), m.group(1) if m else None,
                                 _page_namespaces(f, proj, text, rel_parts[:-1]),
-                                bool(_FUNCTIONS.search(text)), len(text.splitlines()) or 1), proj))
+                                bool(_FUNCTIONS.search(text)), len(text.splitlines()) or 1, attrs), proj))
     return found
 
 
@@ -620,6 +628,9 @@ def discover_pages(model: ProjectModel) -> list[CoreRouteRef]:
         meta: dict = {"kind": "razorpage", "api_surface": False, "page": name}
         if page.area:
             meta["area"] = page.area
+        if page.attributes:
+            # Raw `@attribute` texts (e.g. "[AllowAnonymous]"); the auth pass parses them as class attributes.
+            meta["page_attributes"] = list(page.attributes)
         if env is not None:
             meta["env"] = env
 
@@ -1096,6 +1107,14 @@ class _Scan:
         if state is None:
             return None
         if not self.passes_through(link, name, state):
+            # A call this engine cannot follow, made on a route or a group: whatever it applies (an
+            # anonymous opt-out, say) is unknown, noted now because nothing may be chained after it.
+            if not name.startswith("Map"):
+                msg = f"{name} is not analysed and may change this endpoint's metadata"
+                if isinstance(state, _Entry) and msg not in state.ref.unknown:
+                    state.ref.unknown.append(msg)
+                elif isinstance(state, _Node) and state.kind == "group" and msg not in state.notes:
+                    state.notes.append(msg)
             # Two untraced hops in a row (`g.MapX().Foo().RequireAuthorization()`): the origin stays the
             # first thing that was a group or a route, not the previous untraced result.
             if isinstance(state, _Result) and not state.traced:

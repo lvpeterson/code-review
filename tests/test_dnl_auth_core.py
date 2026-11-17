@@ -159,15 +159,20 @@ def test_default_policy_never_denies_makes_plain_authorize_unprotected(roslyn_he
     assert app("OrdersController.Delete").state == PROTECTED
 
 
-def test_policy_provider_makes_named_policies_unknown(roslyn_helper, tmp_path):
+def test_policy_provider_makes_policies_unknown(roslyn_helper, tmp_path):
+    # Fix round 1 (I9, controller ruling R22): a custom provider also supplies the default and fallback
+    # policy, so plain [Authorize] and the policy-named routes are UNKNOWN too.
     root = copy(CONTROLLERS, tmp_path,
                 {"Program.cs": ("var app = builder.Build();",
                                 "builder.Services.AddSingleton<IAuthorizationPolicyProvider, MyProvider>();\nvar app = builder.Build();")},
                 {"MyProvider.cs": "public class MyProvider { }\n"})
     app = App(root)
-    assert app("OrdersController.Delete").state == PROTECTED
+    for h in ("OrdersController.Delete", "OrdersController.Get"):
+        d = app(h)
+        assert d.state == UNKNOWN and any("IAuthorizationPolicyProvider" in r for r in d.reasons), h
     a = app("AuditController.Log")
     assert a.state == UNKNOWN and any("IAuthorizationPolicyProvider" in r for r in a.reasons)
+    assert app("HealthController.Get").state == UNKNOWN
 
 
 def test_unresolved_extension_is_unknown_for_unprotected_routes(roslyn_helper, tmp_path):
@@ -241,7 +246,9 @@ def test_mvc_conventions_add_is_unknown(roslyn_helper, tmp_path):
     app = App(root)
     h = app("HealthController.Get")
     assert h.state == UNKNOWN and any("Conventions.Add" in r for r in h.reasons)
-    assert app("OrdersController.Get").state == PROTECTED
+    # Fix round 1 (C5): an unanalysed convention could add an anonymous opt-out, so it blocks PROTECTED.
+    o = app("OrdersController.Get")
+    assert o.state == UNKNOWN and any("Conventions.Add" in r for r in o.reasons)
 
 
 def test_map_controllers_require_authorization(roslyn_helper, tmp_path):
@@ -271,7 +278,9 @@ def test_orphan_page_folder_convention_and_unknown(roslyn_helper, tmp_path):
     app = App(root)
     refs = [r for r in app.refs if r.route.meta.get("page") in ("/Orphan", "/Admin/Orphan")]
     got = {r.route.meta["page"]: resolve(app.model, r, app.pipe(r)) for r in refs}
-    assert got["/Admin/Orphan"].state == PROTECTED and got["/Admin/Orphan"].source == "convention:AuthorizeFolder(/Admin)"
+    # Fix round 1 (R21): the unseen page model could carry [AllowAnonymous], so the folder convention
+    # alone does not make the page PROTECTED.
+    assert got["/Admin/Orphan"].state == UNKNOWN and any("not found" in r for r in got["/Admin/Orphan"].reasons)
     assert got["/Orphan"].state == UNKNOWN and any("not found" in r for r in got["/Orphan"].reasons)
 
 
@@ -302,7 +311,8 @@ def test_razor_conventions_add_is_unknown(roslyn_helper, tmp_path):
                                                  'o.Conventions.AllowAnonymousToPage("/Admin/Login");\n    o.Conventions.Add(new MyPageConvention());')})
     app = App(root)
     assert app("IndexModel.OnGet").state == UNKNOWN
-    assert app("UsersModel.OnGet").state == PROTECTED
+    # Fix round 1 (C5): an unanalysed page convention could opt the folder out, so it blocks PROTECTED.
+    assert app("UsersModel.OnGet").state == UNKNOWN
 
 
 # -- minimal_api ---------------------------------------------------------------------------------
@@ -330,15 +340,16 @@ def _minimal_with(tmp_path, line):
     return copy(MINIMAL, tmp_path, {"Program.cs": ("var app = builder.Build();", f"{line}\nvar app = builder.Build();")})
 
 
-def test_orphan_protected_by_fallback(roslyn_helper, tmp_path):
+def test_orphan_with_fallback_is_unknown(roslyn_helper, tmp_path):
     root = copy(MINIMAL, tmp_path, {"Program.cs": (
         "builder.Services.AddSignalR();",
         f"builder.Services.AddAuthorization(o => {{ {FALLBACK_AUTHED} }});\nbuilder.Services.AddSignalR();")})
     app = App(root)
+    # Fix round 1 (R21): a caller that is not visible can carry .AllowAnonymous(), so the fallback
+    # policy alone does not make /orphan and /audit/a PROTECTED.
     for path in ("/orphan", "/audit/a"):
         a = app(path)
-        assert (a.state, a.source) == (PROTECTED, "fallback policy"), path
-        assert a.notes
+        assert a.state == UNKNOWN and a.reasons, path
     assert app("/").state == PROTECTED
 
 
@@ -440,3 +451,167 @@ def test_degraded_auth_matches(roslyn_helper, monkeypatch):
     monkeypatch.setattr(helper, "sdk_available", lambda *a, **k: False)
     for n, root in (("ctrl", CONTROLLERS), ("razor", RAZOR), ("minimal", MINIMAL)):
         assert App(root, True).states() == full[n], n
+
+
+# -- fix round 1 -----------------------------------------------------------------------------------
+
+STARTUP = FX / "pipelines" / "startup"
+PLAIN_CONTROLLER = ("using Microsoft.AspNetCore.Mvc;\n\n[Route(\"plain\")]\npublic class PlainController : ControllerBase\n"
+                    "{\n    [HttpGet]\n    public IActionResult Get() => Ok();\n}\n")
+SECURE_CONTROLLER = ("using Microsoft.AspNetCore.Authorization;\nusing Microsoft.AspNetCore.Mvc;\n\n[Authorize]\n[Route(\"secure\")]\n"
+                     "public class SecureController : ControllerBase\n{\n    [HttpGet]\n    public IActionResult Get() => Ok();\n}\n")
+SUPPRESS = "services.Configure<RouteOptions>(o => o.SuppressCheckForUnhandledSecurityMetadata = true);"
+
+
+def test_c1_fallback_only_route_with_unresolved_extension_is_unknown(roslyn_helper, tmp_path):
+    root = copy(CONTROLLERS, tmp_path, {"Program.cs": ("o.AddPolicy(\"Admin\"", f"{FALLBACK_AUTHED}\n    o.AddPolicy(\"Admin\"")})
+    assert App(root)("HealthController.Get").state == PROTECTED
+    root2 = copy(CONTROLLERS, tmp_path / "b", {"Program.cs": (
+        "o.AddPolicy(\"Admin\"", f"{FALLBACK_AUTHED}\n    o.AddPolicy(\"Admin\""),
+        })
+    prog = root2 / "Program.cs"
+    prog.write_text(prog.read_text().replace("var app = builder.Build();", "builder.Services.AddCompanyAuth();\nvar app = builder.Build();"))
+    a = App(root2)("HealthController.Get")
+    assert a.state == UNKNOWN and any("AddCompanyAuth" in r for r in a.reasons)
+
+
+def test_c1_fallback_with_method_group_options_and_provider_is_unknown(roslyn_helper, tmp_path):
+    root = copy(CONTROLLERS, tmp_path, {"Program.cs": ("AddControllers();", "AddControllers(ConfigureMvc);")})
+    prog = root / "Program.cs"
+    prog.write_text(prog.read_text().replace("o.AddPolicy(\"Admin\"", f"{FALLBACK_AUTHED}\n    o.AddPolicy(\"Admin\""))
+    a = App(root)("HealthController.Get")
+    assert a.state == UNKNOWN and any("ConfigureMvc" in r for r in a.reasons)
+    root2 = copy(CONTROLLERS, tmp_path / "b", {"Program.cs": ("var app = builder.Build();",
+                 "builder.Services.AddSingleton<IAuthorizationPolicyProvider, MyProvider>();\nvar app = builder.Build();")},
+                 {"MyProvider.cs": "public class MyProvider { }\n"})
+    prog = root2 / "Program.cs"
+    prog.write_text(prog.read_text().replace("o.AddPolicy(\"Admin\"", f"{FALLBACK_AUTHED}\n    o.AddPolicy(\"Admin\""))
+    assert App(root2)("HealthController.Get").state == UNKNOWN
+
+
+def test_c2_razor_attribute_directives(roslyn_helper, tmp_path):
+    root = copy(RAZOR, tmp_path)
+    users = root / "Pages" / "Admin" / "Users.cshtml"
+    users.write_text(users.read_text().replace("@model UsersModel", "@model UsersModel\n@attribute [AllowAnonymous]"))
+    priv = root / "Pages" / "Privacy.cshtml"
+    priv.write_text(priv.read_text().replace("@model PrivacyModel", "@model PrivacyModel\n@attribute [Authorize]"))
+    app = App(root)
+    u = app("UsersModel.OnGet")
+    assert u.state == ANONYMOUS and "AllowAnonymous" in u.source
+    p = app("PrivacyModel")
+    assert p.state == PROTECTED and "Authorize" in p.source
+
+
+def test_c2_view_imports_attribute_and_unparseable_directive(roslyn_helper, tmp_path):
+    root = copy(RAZOR, tmp_path)
+    imp = root / "Pages" / "Admin" / "_ViewImports.cshtml"
+    imp.write_text("@attribute [AllowAnonymous]\n")
+    app = App(root)
+    assert app("UsersModel.OnGet").state == ANONYMOUS
+    root2 = copy(RAZOR, tmp_path / "b")
+    users = root2 / "Pages" / "Admin" / "Users.cshtml"
+    users.write_text(users.read_text().replace("@model UsersModel", "@model UsersModel\n@attribute Policies.Unreadable"))
+    u = App(root2)("UsersModel.OnGet")
+    assert u.state == UNKNOWN and any("@attribute" in r for r in u.reasons)
+
+
+def test_c3_null_guard_throw_does_not_make_a_filter_protective(roslyn_helper, tmp_path):
+    filt = ("using Microsoft.AspNetCore.Mvc.Filters;\n\npublic class GuardAttribute : System.Attribute, IAuthorizationFilter\n{\n"
+            "    public void OnAuthorization(AuthorizationFilterContext context)\n    {\n"
+            "        if (context == null) throw new System.ArgumentNullException(nameof(context));\n    }\n}\n")
+    root = copy(CONTROLLERS, tmp_path,
+                {"Controllers/HomeController.cs": ("public IActionResult Index", "[Guard]\n    public IActionResult Index")},
+                {"Filters.cs": filt})
+    a = App(root)("HomeController.Index")
+    assert a.state == UNPROTECTED and any("never sets context.Result" in n for n in a.notes)
+
+
+def test_c4_project_authorize_attribute_is_analysed(roslyn_helper, tmp_path):
+    attr = "public class AuthorizeAttribute : Microsoft.AspNetCore.Mvc.Filters.ActionFilterAttribute\n{\n}\n"
+    root = copy(CONTROLLERS, tmp_path,
+                {"Controllers/HealthController.cs": ("[HttpGet]\n    public IActionResult Get", "[HttpGet]\n    [Authorize]\n    public IActionResult Get")},
+                {"MyAuthorize.cs": attr})
+    a = App(root)("HealthController.Get")
+    assert a.state != PROTECTED
+
+
+def test_c5_unresolved_convention_after_require_authorization_blocks_protection(roslyn_helper, tmp_path):
+    root = copy(MINIMAL, tmp_path, {"Program.cs": ('app.MapGet("/", () => "hello");',
+                                                   'app.MapGet("/", () => "hello");\napp.MapGet("/p", () => 1).RequireAuthorization().AllowPublic();')})
+    a = App(root)("/p")
+    assert a.state == UNKNOWN and any("AllowPublic" in r for r in a.reasons)
+
+
+def test_c6_iallowanonymous_attribute_and_anonymous_like_names(roslyn_helper, tmp_path):
+    attrs = ("public class OpenAttribute : System.Attribute, Microsoft.AspNetCore.Authorization.IAllowAnonymous { }\n")
+    root = copy(CONTROLLERS, tmp_path,
+                {"Controllers/OrdersController.cs": ("[HttpGet(\"{id:int}\")]", "[HttpGet(\"{id:int}\")]\n    [Open]")},
+                {"Open.cs": attrs})
+    assert App(root)("OrdersController.Get").state == ANONYMOUS
+    root2 = copy(CONTROLLERS, tmp_path / "b",
+                 {"Controllers/OrdersController.cs": ("[HttpGet(\"{id:int}\")]", "[HttpGet(\"{id:int}\")]\n    [AllowPublic]")})
+    a = App(root2)("OrdersController.Get")
+    assert a.state == UNKNOWN and any("AllowPublic" in r for r in a.reasons)
+
+
+def _startup_with(tmp_path, services_extra="", configure_edit=None, drop_company=True):
+    edits = {"Startup.Services.cs": ("services.AddCompanyAuth();", services_extra if drop_company else "services.AddCompanyAuth();\n" + services_extra)}
+    if configure_edit:
+        edits["Startup.Pipeline.cs"] = configure_edit
+    return copy(STARTUP, tmp_path, edits, {"PlainController.cs": PLAIN_CONTROLLER, "SecureController.cs": SECURE_CONTROLLER})
+
+
+def test_i7_fallback_without_authorization_middleware_is_not_enforced(roslyn_helper, tmp_path):
+    root = _startup_with(tmp_path, f"services.AddAuthorization(o => {{ {FALLBACK_AUTHED} }});")
+    app = App(root)
+    a = app("PlainController.Get")
+    assert a.state == UNPROTECTED and any("not enforced" in n for n in a.notes)
+    # An [Authorize] route in the same broken pipeline fails closed (500), it is not exposed.
+    assert app("SecureController.Get").state == PROTECTED
+
+
+def test_i8_handler_shapes(roslyn_helper, tmp_path):
+    def handler(body):
+        return ("using Microsoft.AspNetCore.Authorization;\n\npublic class AuditRequirement : IAuthorizationRequirement { }\n\n"
+                "public class AuditHandler : AuthorizationHandler<AuditRequirement>\n{\n"
+                "    protected override Task HandleRequirementAsync(AuthorizationHandlerContext context, AuditRequirement requirement)\n    {\n"
+                f"{body}\n        return Task.CompletedTask;\n    }}\n}}\n")
+    cases = {
+        "try { context.Succeed(requirement); } catch { }": UNKNOWN,
+        "Helpers.Approve(context);": UNKNOWN,
+        "if (context.User.IsInRole(\"Auditor\")) context.Succeed(requirement);": PROTECTED,
+        "context.Fail();": PROTECTED,
+        "context.Succeed(requirement);": UNPROTECTED,
+    }
+    for i, (body, want) in enumerate(cases.items()):
+        root = copy(CONTROLLERS, tmp_path / f"c{i}", None, {"Auth/AuditHandler.cs": handler(body)})
+        assert App(root)("AuditController.Log").state == want, body
+
+
+def test_i10_uncertain_use_authorization_with_certain_suppress_is_unknown(roslyn_helper, tmp_path):
+    root = _startup_with(tmp_path, SUPPRESS, ("app.UseAuthorization();", "if (app.Environment.IsEnvironment(Settings.Env)) { app.UseAuthorization(); }"))
+    a = App(root)("SecureController.Get")
+    assert a.state == UNKNOWN and a.reasons
+
+
+def test_r23_statement_kinds_and_ternary_and_policy_case(roslyn_helper):
+    from checks.dnl.auth_core import _expr_events, _stmt_events
+    call = lambda n: {"k": "call", "fn": {"k": "member", "obj": {"k": "name", "id": "o"}, "name": n}, "args": []}
+    tern = {"k": "cond", "c": {"k": "name", "id": "x"}, "a": call("First"), "b": call("Second")}
+    assert [c["fn"]["name"] for kind, c, _g, _r in _expr_events(tern, ()) if kind == "call"] == ["First", "Second"]
+    opaque = {"k": "other", "text": "o.Conventions.AllowAnonymousToFolder(\"/\")"}
+    assert [kind for kind, *_ in _stmt_events([opaque], ())] == ["opaque"]
+    assert list(_stmt_events([{"k": "other", "text": "goto done;"}], ())) == []
+
+
+def test_r23_policy_names_are_case_insensitive(roslyn_helper, tmp_path):
+    root = copy(CONTROLLERS, tmp_path, {"Controllers/OrdersController.cs": ('Policy = "Admin"', 'Policy = "ADMIN"')})
+    d = App(root)("OrdersController.Delete")
+    assert d.state == PROTECTED and d.roles == ["Admin"]
+
+
+def test_r23_opaque_statement_blocks_protection(roslyn_helper, tmp_path):
+    # A statement the lowering keeps as text and that mentions an anonymous opt-out cannot be read.
+    root = copy(RAZOR, tmp_path, {"Program.cs": ('o.Conventions.AllowAnonymousToPage("/Admin/Login");',
+                                                 'o.Conventions.AllowAnonymousToPage("/Admin/Login");\n    switch (Mode) { case 1: o.Conventions.AllowAnonymousToFolder("/Admin"); break; }')})
+    assert App(root)("UsersModel.OnGet").state == UNKNOWN

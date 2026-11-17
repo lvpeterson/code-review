@@ -66,7 +66,9 @@ _ROUTE_CONVENTIONS = frozenset("""
 AddPageRoute AddAreaPageRoute AddPageRouteModelConvention AddFolderRouteModelConvention
 AddAreaPageRouteModelConvention AddAreaFolderRouteModelConvention
 """.split())
-_AUTHZ_NAMED = re.compile(r"authoriz|permission|role|scope|claim|polic", re.IGNORECASE)
+_AUTHZ_NAMED = re.compile(r"authoriz|permission|role|scope|claim|polic|anonymous|public", re.IGNORECASE)
+# Names that suggest an anonymous opt-out: unresolved ones also block PROTECTED.
+_ANON_NAMED = re.compile(r"anonymous|public", re.IGNORECASE)
 _OPTION_CALLS = frozenset("""
 AddAuthorization AddAuthorizationCore AddControllers AddControllersWithViews AddMvc AddMvcCore AddRazorPages
 AddRazorPagesOptions AddMvcOptions Configure PostConfigure ConfigureOptions
@@ -191,12 +193,24 @@ def _expr_events(e, guards: tuple):
         for c in calls:
             yield ("call", c, guards, root)
     elif k == "cond":
-        # A ternary: either branch may run.
+        # A ternary: either branch may run; every call and assignment inside is collected.
         g = guards + ((_UNK, True),)
+        seen: set[int] = set()
         for n in walk(e):
-            if n is not e and n.get("k") in ("call", "assign"):
+            if n is not e and n.get("k") in ("call", "assign") and id(n) not in seen:
+                for sub in walk(n):
+                    seen.add(id(sub))
                 yield from _expr_events(n, g)
-                break
+
+
+# Names whose presence in a statement this module cannot lower makes the statement a reason / a blocker.
+_RELEVANT = ("AllowAnonymousTo", "AuthorizePage", "AuthorizeFolder", "AuthorizeArea", "FallbackPolicy", "DefaultPolicy",
+             "AddPolicy", "Filters", "Conventions", _SUPPRESS)
+
+
+def _opaque_mentions(s: dict) -> bool:
+    text = str(s)
+    return any(r in text for r in _RELEVANT)
 
 
 def _stmt_events(stmts, guards: tuple):
@@ -235,6 +249,10 @@ def _stmt_events(stmts, guards: tuple):
             for c in s.get("catches") or []:
                 yield from _stmt_events(c.get("body"), guards + ((_UNK, True),))
             yield from _stmt_events(s.get("finally"), guards)
+        elif k != "break" and _opaque_mentions(s):
+            # A statement kind the lowering keeps as text (or one not handled here) that mentions an
+            # authorization registration: its effect is unknown.
+            yield ("opaque", s, guards + ((_UNK, True),), None)
 
 
 def _lambda_events(lam: dict, guards: tuple = ()):
@@ -279,9 +297,33 @@ def _calls_fail(bodies: list[list]) -> bool:
     return any(n.get("k") == "call" and call_name(n) == "Fail" for b in bodies for n in walk(b))
 
 
+def _succeeds_conditionally(method: MethodIR) -> str:
+    """"cond" when Succeed is visibly conditional (only inside top-level `if` statements, after an early
+    return, or never called with the context kept local), else "unknown" (Succeed inside try / using /
+    a lambda, the context handed to another method, ...)."""
+    p = method.params[0].name if method.params else None
+    succeed = [n for n in walk(method.body) if n.get("k") == "call" and call_name(n) == "Succeed"]
+    handed = any(n.get("k") == "call" and any(isinstance(a, dict) and a.get("k") == "name" and a.get("id") == p
+                                              for a in n.get("args") or []) for n in walk(method.body))
+    if not succeed:
+        return "unknown" if handed else "cond"
+    for s in method.body or []:
+        if not isinstance(s, dict):
+            continue
+        k = s.get("k")
+        if k in ("return", "throw") or (k == "if" and any(n.get("k") in ("return", "throw") for n in walk(s))):
+            return "cond"
+        if k != "if" and any(call_name(n) == "Succeed" for n in walk(s) if n.get("k") == "call"):
+            return "unknown"
+    in_if = sum(1 for s in method.body or [] if isinstance(s, dict) and s.get("k") == "if"
+                for n in walk(s) if n.get("k") == "call" and call_name(n) == "Succeed")
+    return "cond" if in_if == len(succeed) else "unknown"
+
+
 def _handler_facts(model: ProjectModel) -> dict:
-    """Per handler type: the requirement it is bound to (None: any), whether it always succeeds and
-    whether any of its code can Fail. Cached on the model."""
+    """Per handler type: the requirement it is bound to (None: any), whether it always succeeds,
+    whether any of its code can Fail, whether Succeed is visibly conditional ("cond") and whether its
+    shape could not be read ("unknown"). Cached on the model."""
     cached = model.cache.get("auth_core_handlers")
     if cached is not None:
         return cached
@@ -299,8 +341,12 @@ def _handler_facts(model: ProjectModel) -> dict:
             if m.name.lower() == "handlerequirementasync" and len(m.params) >= 2:
                 bound = _simple(m.params[1].type)
         bodies = [m.body for m in methods]
-        out[id(t)] = {"type": t, "req": bound, "always": any(_succeeds_always(b) for b in bodies),
-                      "fails": _calls_fail(bodies)}
+        always = any(_succeeds_always(b) for b in bodies)
+        fails = _calls_fail(bodies)
+        shapes = [_succeeds_conditionally(m) for m in methods if not _succeeds_always(m.body)]
+        out[id(t)] = {"type": t, "req": bound, "always": always, "fails": fails,
+                      "cond": not always and bool(shapes) and all(x == "cond" for x in shapes),
+                      "unknown": not always and not fails and "unknown" in shapes}
     model.cache["auth_core_handlers"] = out
     return out
 
@@ -311,7 +357,9 @@ def never_denying_handlers(model: ProjectModel) -> list[TypeIR]:
 
 
 def _requirement_verdict(model: ProjectModel, name: str) -> tuple[str, str]:
-    """("deny" | "never" | "unknown", detail) for `new <name>(...)` used as a policy requirement."""
+    """("deny" | "never" | "unknown", detail) for `new <name>(...)` used as a policy requirement.
+    "deny" needs a visible denying path (a Fail call, or Succeed only on a conditional path in every
+    handler); an unrecognised handler shape is unknown."""
     if name in _KNOWN_DENY_REQS:
         return "deny", name
     types = [t for t in model.find_types(name) if t.kind == "class"]
@@ -324,10 +372,10 @@ def _requirement_verdict(model: ProjectModel, name: str) -> tuple[str, str]:
     good = [h for h in bound if h["always"]]
     if good and not any(h["fails"] for h in bound):
         return "never", f"handler {good[0]['type'].name.split('.')[-1]} always succeeds for {name}"
-    return "deny", name
+    if any(h["fails"] for h in bound) or all(h["cond"] for h in bound):
+        return "deny", name
+    return "unknown", f"the handler of requirement {name} has a shape that could not be analysed"
 
-
-# -- policies ---------------------------------------------------------------------------
 
 @dataclass
 class _Pol:
@@ -455,12 +503,19 @@ class _Settings:
     provider: _Fact | None = None
     # (reason, styles it applies to; None = every route)
     reasons: list[tuple[str, tuple | None]] = field(default_factory=list)
+    # Unanalysed registrations that could add an anonymous opt-out or otherwise weaken protection:
+    # they block PROTECTED (-> UNKNOWN), not only UNPROTECTED.
+    blockers: list[tuple[str, tuple | None]] = field(default_factory=list)
     issue: tuple | None = None
     suppress_certain: bool = False
     suppress_uncertain: bool = False
+    mw_uncertain: bool = False          # UseAuthorization only under an unparseable environment condition
 
     def reasons_for(self, style: str) -> list[str]:
         return _dedup(r for r, st in self.reasons if st is None or style in st)
+
+    def blockers_for(self, style: str) -> list[str]:
+        return _dedup(r for r, st in self.blockers if st is None or style in st)
 
 
 _MVC_STYLES = ("controller", "razorpage")
@@ -485,6 +540,8 @@ def _option_events(pipe: Pipeline, member: str):
                     runs = _both(base, _runs(guards))
                     if runs is not False:
                         yield node.get("value"), runs, c.file, node.get("line") or c.line
+                elif kind == "opaque" and member in str(node):
+                    yield None, None, c.file, node.get("line") or c.line
 
 
 def _lambda_args(call: dict):
@@ -510,19 +567,32 @@ def _tfm_major(tfm: str | None) -> int | None:
     return int(m.group(1)) if m else (0 if tfm else None)
 
 
-def middleware_issue(pipe: Pipeline) -> tuple[str, str, int, bool] | None:
-    """(message, file, line, suppressed) when UseAuthorization is missing or misordered in an app with
-    explicit routing (Startup style, or minimal hosting below net7.0); None otherwise. Minimal hosting
-    on net7.0+ adds the middleware itself."""
+def _explicit_routing(pipe: Pipeline) -> bool:
+    """The pipeline wires routing and authorization by hand (Startup style, or minimal hosting below
+    net7.0) and maps at least one endpoint."""
     if pipe.style == "startup":
         pass
     elif pipe.style == "minimal":
         major = _tfm_major(pipe.target_framework)
         if major is None or major >= 7:
-            return None
+            return False
     else:
-        return None
-    if not any(c.kind == "endpoints" or c.name == "UseEndpoints" for c in pipe.calls if c.runs_in("Production") is not False):
+        return False
+    return any(c.kind == "endpoints" or c.name == "UseEndpoints" for c in pipe.calls if c.runs_in("Production") is not False)
+
+
+def _auth_mw_uncertain(pipe: Pipeline) -> bool:
+    """UseAuthorization appears only under an environment condition that could not be parsed."""
+    return (_explicit_routing(pipe) and not pipe.named("UseAuthorization", kinds=("app",))
+            and any(c.name == "UseAuthorization" for c in pipe.uncertain()))
+
+
+def middleware_issue(pipe: Pipeline) -> tuple[str, str, int, bool] | None:
+    """(message, file, line, suppressed) when UseAuthorization is missing or misordered in an app with
+    explicit routing (Startup style, or minimal hosting below net7.0); None otherwise. Minimal hosting
+    on net7.0+ adds the middleware itself. A UseAuthorization that only exists under an unparseable
+    environment condition is not reported here (see _auth_mw_uncertain)."""
+    if not _explicit_routing(pipe):
         return None
     if any(c.name == "UseAuthorization" for c in pipe.uncertain()):
         return None
@@ -557,7 +627,15 @@ def _build_settings(model: ProjectModel, pipe: Pipeline) -> _Settings:
     S = _Settings()
     S.issue = middleware_issue(pipe)
     S.suppress_certain, S.suppress_uncertain = _suppress_state(pipe)
+    S.mw_uncertain = _auth_mw_uncertain(pipe)
     defs: dict[str, list[tuple]] = {}
+    names: dict[str, str] = {}      # policy names compare case-insensitively (the runtime does)
+
+    def def_key(pname):
+        if not pname:
+            return ""
+        names[pname.lower()] = pname
+        return pname.lower()
 
     def policy_fact(e, base, runs_inner, file, line, bucket):
         runs = _both(base, runs_inner)
@@ -599,7 +677,7 @@ def _build_settings(model: ProjectModel, pipe: Pipeline) -> _Settings:
             if c.name in _POLICY_DEFS:
                 pname = _const(model, args[0]) if args else None
                 pexpr = args[1] if len(args) > 1 else None
-                defs.setdefault(pname or "", []).append((pexpr, base, file, line))
+                defs.setdefault(def_key(pname), []).append((pexpr, base, file, line))
                 bucket = S.default if c.name == "AddDefaultPolicy" else S.fallback if c.name == "AddFallbackPolicy" else None
                 if bucket is not None:
                     policy_fact(pexpr, base, True, file, line, bucket)
@@ -615,6 +693,12 @@ def _build_settings(model: ProjectModel, pipe: Pipeline) -> _Settings:
                 runs_inner = _runs(guards)
                 if runs_inner is False:
                     continue
+                if kind == "opaque":
+                    msg = (f"a statement at {file}:{ev.get('line') or line} mentions an authorization registration "
+                           "but could not be analysed")
+                    S.reasons.append((msg, None))
+                    S.blockers.append((msg, None))
+                    continue
                 if kind == "assign":
                     tn = _target_name(ev.get("target"))
                     if tn in ("FallbackPolicy", "DefaultPolicy"):
@@ -629,7 +713,7 @@ def _build_settings(model: ProjectModel, pipe: Pipeline) -> _Settings:
                     args = ev.get("args") or []
                     pname = _const(model, args[0]) if args else None
                     pexpr = args[1] if len(args) > 1 else None
-                    defs.setdefault(pname or "", []).append((pexpr, runs, file, eline))
+                    defs.setdefault(def_key(pname), []).append((pexpr, runs, file, eline))
                 elif recv.endswith("Filters") and name in ("Add", "AddService", "AddFilter"):
                     S.filters.append(_Fact({"call": ev}, runs is True, file, eline))
                 elif recv.endswith("Conventions"):
@@ -643,22 +727,25 @@ def _build_settings(model: ProjectModel, pipe: Pipeline) -> _Settings:
                                                      for a in node.get("args") or [])):
             what = opaque or next(receiver_text(a) or "a method group" for a in node.get("args") or []
                                   if isinstance(a, dict) and a.get("k") in ("name", "member"))
-            S.reasons.append((f"{c.name} options are configured by {what} at {file}:{line}, which is not analysed", None))
+            msg = f"{c.name} options are configured by {what} at {file}:{line}, which is not analysed"
+            S.reasons.append((msg, None))
+            S.blockers.append((msg, None))
 
     # Policy definitions: the last certain one wins; an uncertain or unreadable one makes the name unknown.
-    for pname, lst in defs.items():
+    for key, lst in defs.items():
+        pname = names.get(key, "")
         if not pname:
             S.reasons.append(("a policy is defined with a name that is not a literal", None))
             continue
         for pexpr, runs, file, line in lst:
             if runs is not True:
-                S.policy_unknown[pname] = f"policy \"{pname}\" is defined under a condition that could not be evaluated"
+                S.policy_unknown[key] = f"policy \"{pname}\" is defined under a condition that could not be evaluated"
         certain = [x for x in lst if x[1] is True]
         if not certain:
             continue
         pexpr, _r, file, line = certain[-1]
         pol = _policy_expr(model, pexpr)
-        S.pols[pname] = pol
+        S.pols[key] = pol
         S.policies[pname] = PolicyInfo(pname, file, line, _dedup(pol.roles), pol.never_denies, list(pol.unknown))
 
     # Conventions this module cannot read (reasons), for the routes they could affect.
@@ -666,8 +753,9 @@ def _build_settings(model: ProjectModel, pipe: Pipeline) -> _Settings:
         name = f.data["name"]
         if name in _ROUTE_CONVENTIONS or name.startswith(("Authorize", "AllowAnonymousTo")):
             continue
-        S.reasons.append((f"Conventions.{name} at {f.file}:{f.line} may change authorization and is not analysed",
-                          _MVC_STYLES))
+        msg = f"Conventions.{name} at {f.file}:{f.line} may change authorization and is not analysed"
+        S.reasons.append((msg, _MVC_STYLES))
+        S.blockers.append((msg, _MVC_STYLES))
     return S
 
 
@@ -686,9 +774,9 @@ def _named(S: _Settings, name: str) -> tuple[str, _Pol | None, list[str]]:
     if S.provider is not None:
         return UNK, None, [f"a custom IAuthorizationPolicyProvider is registered at {S.provider.file}:{S.provider.line}; "
                            f"policy \"{name}\" cannot be resolved"]
-    if name in S.policy_unknown:
-        return UNK, None, [S.policy_unknown[name]]
-    pol = S.pols.get(name)
+    if name.lower() in S.policy_unknown:
+        return UNK, None, [S.policy_unknown[name.lower()]]
+    pol = S.pols.get(name.lower())
     if pol is None:
         return UNK, None, [f"policy \"{name}\" is not defined in the solution"]
     v = _pol_verdict(pol)
@@ -739,6 +827,7 @@ class _Item:
     conditional: bool = False
     names: list[str] = field(default_factory=list)   # several policy names (RequireAuthorization("a", "b"))
     notes: list[str] = field(default_factory=list)
+    block: list[str] = field(default_factory=list)   # reasons this item may hide an anonymous opt-out
 
 
 def _base_keys(model: ProjectModel, t: TypeIR) -> set[str]:
@@ -765,17 +854,19 @@ def _filter_verdict(model: ProjectModel, t: TypeIR) -> tuple[str, str]:
     tn = t.name.split(".")[-1]
     if not methods:
         return UNK, f"filter {tn} has no OnAuthorization method in the solution"
+    # Only a decision counts: an assignment to context.Result (or a Forbid / Challenge / Fail call). A
+    # `throw` is usually a null guard and does not make the filter an authorization check.
     for m in methods:
         for n in walk(m.body):
-            if n.get("k") == "throw":
-                return PROT, tn
             if n.get("k") == "assign" and _target_name(n.get("target")) == "Result":
+                return PROT, tn
+            if n.get("k") == "call" and call_name(n) in ("Forbid", "ForbidAsync", "Challenge", "ChallengeAsync", "Fail"):
                 return PROT, tn
     for m in methods:
         p = m.params[0].name if m.params else None
         for n in walk(m.body):
-            if n.get("k") == "call" and any(isinstance(a, dict) and a.get("k") == "name" and a.get("id") == p
-                                            for a in n.get("args") or []):
+            if (n.get("k") == "call" and call_name(n) != "nameof"
+                    and any(isinstance(a, dict) and a.get("k") == "name" and a.get("id") == p for a in n.get("args") or [])):
                 return UNK, f"filter {tn} hands its context to {call_name(n)}, which is not analysed"
     return NEVER, f"filter {tn} never sets context.Result"
 
@@ -815,11 +906,14 @@ def _attr_items(model: ProjectModel, attrs: list[Attr], source_for, file: str | 
         if key == "allowanonymous":
             out.append(_Item(src, file, line, step, anon=True))
             continue
-        t = None if key == "authorize" else _find_class(model, key)
-        if key == "authorize" or (t is not None and "authorize" in _base_keys(model, t)):
+        t = _find_class(model, key)
+        # The framework attribute, unless the solution defines a class of that name (then it is analysed
+        # like any project attribute: a framework one only when it derives from it).
+        framework = key == "authorize" and t is None
+        if framework or (t is not None and "authorize" in _base_keys(model, t)):
             item = _Item(src, file, line, step)
-            pol = a.named.get("Policy") if key == "authorize" else None
-            if key == "authorize":
+            pol = a.named.get("Policy") if framework else None
+            if framework:
                 first = a.args[0] if a.args else None
                 for k, v in a.named.items():
                     if k == "Roles":
@@ -860,13 +954,15 @@ def _attr_items(model: ProjectModel, attrs: list[Attr], source_for, file: str | 
             v, detail = _filter_verdict(model, t)
             out.append(_Item(src, file, line, step, verdict=(v, detail)))
             continue
-        if t is not None and "allowanonymous" in _base_keys(model, t):
+        if t is not None and {"allowanonymous", "iallowanonymous"} & _base_keys(model, t):
             out.append(_Item(src, file, line, step, anon=True))
             continue
         if _AUTHZ_NAMED.search(key):
             why = ("is a custom attribute whose enforcement could not be traced" if t is not None
                    else "is not defined in the solution")
-            out.append(_Item(src, file, line, step, unknown=[f"attribute {attr_simple(a.name)} {why}"]))
+            msg = f"attribute {attr_simple(a.name)} {why}"
+            out.append(_Item(src, file, line, step, unknown=[msg],
+                             block=[msg] if _ANON_NAMED.search(key) else []))
     return out
 
 
@@ -1097,6 +1193,11 @@ def _eval_item(S: _Settings, it: _Item) -> tuple[str, list[str], list[str], list
         v, pol, fact, rs = _global_policy(S.default, "DefaultPolicy")
         if v == "none":
             v = PROT
+        if S.provider is not None:
+            # A custom provider may supply a different default policy at runtime.
+            v = UNK
+            rs = rs + [f"a custom IAuthorizationPolicyProvider is registered at {S.provider.file}:{S.provider.line}; "
+                       "it may supply the default policy"]
         verdicts.append(v)
         reasons += rs
         if v == NEVER:
@@ -1106,6 +1207,63 @@ def _eval_item(S: _Settings, it: _Item) -> tuple[str, list[str], list[str], list
     if UNK in verdicts:
         return UNK, policies, _dedup(roles), notes, _dedup(reasons)
     return NEVER, policies, _dedup(roles), notes, []
+
+
+def _split_top(text: str) -> list[str]:
+    """Split on commas outside parentheses and string literals."""
+    out, depth, cur, quote = [], 0, "", False
+    for ch in text:
+        if ch == '"':
+            quote = not quote
+        if not quote and ch == "(":
+            depth += 1
+        elif not quote and ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0 and not quote:
+            out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    out.append(cur)
+    return [x.strip() for x in out if x.strip()]
+
+
+def _value_expr(text: str) -> dict:
+    m = re.fullmatch(r'"((?:[^"\\]|\\.)*)"', text.strip())
+    if m:
+        return {"k": "lit", "v": m.group(1), "t": "string"}
+    return {"k": "name", "id": text.strip()}
+
+
+def _page_attr_items(model: ProjectModel, ref: CoreRouteRef) -> tuple[list[_Item], list[str]]:
+    """Class-level attributes written as `@attribute [...]` in the page or its _ViewImports
+    (route.meta["page_attributes"], raw texts). Unparseable ones, and any that could hide an anonymous
+    opt-out, are returned as reasons that block PROTECTED."""
+    items: list[_Item] = []
+    block: list[str] = []
+    for raw in ref.route.meta.get("page_attributes") or []:
+        m = re.fullmatch(r"\[\s*(.*?)\s*\]\s*;?", raw.strip(), re.DOTALL)
+        if not m:
+            block.append(f"@attribute {raw} could not be parsed")
+            continue
+        attrs: list[Attr] = []
+        for part in _split_top(m.group(1)):
+            pm = re.fullmatch(r"([\w.]+)\s*(?:\((.*)\))?", part, re.DOTALL)
+            if not pm:
+                block.append(f"@attribute {raw} could not be parsed")
+                continue
+            args, named = [], {}
+            for a in _split_top(pm.group(2) or ""):
+                nm = re.fullmatch(r"(\w+)\s*=\s*(.+)", a, re.DOTALL)
+                if nm:
+                    named[nm.group(1)] = _value_expr(nm.group(2))
+                else:
+                    args.append(_value_expr(a))
+            attrs.append(Attr(pm.group(1), args, named, 0))
+        for it in _attr_items(model, attrs, lambda n: f"attribute:{n} (@attribute)", ref.route.file):
+            items.append(it)
+            block += it.unknown + it.block
+    return items, block
 
 
 def _attr_file(ref: CoreRouteRef, ct: TypeIR, a: Attr) -> str:
@@ -1157,6 +1315,9 @@ def _route_items(model: ProjectModel, S: _Settings, pipe: Pipeline, ref: CoreRou
     if ref.style in _MVC_STYLES:
         items += _filter_items(model, S, ref)
     if ref.style == "razorpage":
+        its, blk = _page_attr_items(model, ref)
+        items += its
+        block += blk
         its, blk = _page_items(model, S, ref)
         items += its
         block += blk
@@ -1197,25 +1358,29 @@ def resolve(model: ProjectModel, ref: CoreRouteRef, pipe: Pipeline) -> CoreAuth:
     def prot(step: int):
         return next(((it, e) for it, e in evals if it.step == step and e[0] == PROT and not it.conditional), None)
 
+    # Anything that could add an anonymous opt-out the engine did not see blocks PROTECTED: unanalysed
+    # conventions and options, untraced notes, a caller or page model that is not visible, unreadable
+    # @attribute directives and anonymous-looking attributes. Conditional-note handling stays separate.
+    untraced = [r for r in ref.unknown if not r.endswith("applied conditionally")]
+    blk = _dedup(block + S.blockers_for(ref.style) + [b for it in items for b in it.block] + untraced + route_reasons
+                 + (["the method registering this route has no traced caller"] if ref.caller_unknown else []))
+    mw_unsure = ((S.issue is not None and S.suppress_uncertain) or (S.mw_uncertain and S.suppress_certain))
+    unsure_reason = ["SuppressCheckForUnhandledSecurityMetadata or UseAuthorization is under a condition that could "
+                     "not be evaluated" + (f" ({S.issue[0]})" if S.issue is not None else "")]
+
     p2, p3 = prot(2), prot(3)
     downgraded = False
-    chosen = None
+    chosen = p2 or p3
     if p2 is not None:
-        chosen = p2
-        if S.issue is not None and S.suppress_certain:
-            downgraded = True
-        elif S.issue is not None and S.suppress_uncertain:
-            return CoreAuth(UNKNOWN, "none", policies=pnames, roles=roles,
-                            reasons=["SuppressCheckForUnhandledSecurityMetadata is set under a condition that could not "
-                                     f"be evaluated, and {S.issue[0]}"], notes=notes)
-        if p3 is not None and downgraded:
-            chosen, downgraded = p3, False
-    elif p3 is not None:
-        chosen = p3
+        downgraded = S.issue is not None and S.suppress_certain
+        if (downgraded or mw_unsure) and p3 is not None:
+            chosen, downgraded, mw_unsure = p3, False, False
+        elif mw_unsure and not downgraded:
+            return CoreAuth(UNKNOWN, "none", policies=pnames, roles=roles, reasons=unsure_reason, notes=notes)
     if chosen is not None and not downgraded:
         it, e = chosen
-        if block:
-            return CoreAuth(UNKNOWN, "none", policies=pnames, roles=roles, reasons=block, notes=notes)
+        if blk:
+            return CoreAuth(UNKNOWN, "none", policies=pnames, roles=roles, reasons=blk, notes=notes)
         return CoreAuth(PROTECTED, it.source, roles, pnames, it.file, it.line, notes=notes)
     if downgraded:
         it, _e = chosen
@@ -1238,24 +1403,26 @@ def resolve(model: ProjectModel, ref: CoreRouteRef, pipe: Pipeline) -> CoreAuth:
     fb_note = None
     if not has_meta:
         v, pol, fact, rs = _global_policy(S.fallback, "FallbackPolicy")
+        if S.provider is not None:
+            reasons.append(f"a custom IAuthorizationPolicyProvider is registered at {S.provider.file}:{S.provider.line}; "
+                           "it may supply a fallback policy")
         if v == PROT:
-            if S.issue is not None and S.suppress_certain:
-                notes.append("fallback policy is not enforced: " + S.issue[0] + " and "
-                             "SuppressCheckForUnhandledSecurityMetadata is true")
-                return CoreAuth(UNPROTECTED, "none", file=fact.file, line=fact.line, notes=notes)
-            if S.issue is not None and S.suppress_uncertain:
-                return CoreAuth(UNKNOWN, "none", reasons=["SuppressCheckForUnhandledSecurityMetadata is set under a "
-                                                          "condition that could not be evaluated, and " + S.issue[0]],
-                                notes=notes)
-            if block:
-                return CoreAuth(UNKNOWN, "none", reasons=block, notes=notes)
-            if ref.caller_unknown:
-                notes.append("registered by a method with no traced caller; a convention applied by the caller "
-                             "would not be seen")
-            if ref.unknown:
-                notes.append("conventions that could not be traced may apply to this route: " + "; ".join(ref.unknown))
-            return CoreAuth(PROTECTED, "fallback policy", roles, pnames, fact.file, fact.line, notes=notes)
-        if v == NEVER:
+            if S.issue is not None and "UseAuthentication" not in S.issue[0]:
+                # No authorization middleware sees the endpoint: with no IAuthorizeData nothing throws and
+                # the fallback policy is simply not enforced.
+                notes.append("fallback policy is not enforced: " + S.issue[0])
+            else:
+                if S.mw_uncertain:
+                    reasons.append("UseAuthorization is under a condition that could not be evaluated")
+                elif S.issue is not None and S.suppress_certain:
+                    notes.append("fallback policy is not enforced: " + S.issue[0] + " and "
+                                 "SuppressCheckForUnhandledSecurityMetadata is true")
+                    return CoreAuth(UNPROTECTED, "none", file=fact.file, line=fact.line, notes=notes)
+                blocking = _dedup(blk + S.reasons_for(ref.style) + reasons)
+                if blocking:
+                    return CoreAuth(UNKNOWN, "none", roles, pnames, reasons=blocking, notes=notes)
+                return CoreAuth(PROTECTED, "fallback policy", roles, pnames, fact.file, fact.line, notes=notes)
+        elif v == NEVER:
             fb_note = f"fallback policy never denies: {pol.why()}"
             notes.append(fb_note)
         elif v == UNK:
