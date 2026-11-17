@@ -51,6 +51,10 @@ def test_constant_paths_are_clean(findings):
     assert not hits(findings, "ArchiveController.Fixed")
 
 
+def test_project_entries_collection_is_not_an_archive(findings):
+    assert not hits(findings, "ArchiveController.OwnEntries")
+
+
 def test_zip_slip_sources(findings):
     for action in ("SlipBody", "SlipDisk", "SlipName", "SlipItem", "SlipTyped"):
         got = hits(findings, f"ArchiveController.{action}", "DNL-PATH-001")
@@ -103,7 +107,7 @@ def test_is_local_url_cleanses_member_paths(findings, handler):
 
 @pytest.mark.parametrize("handler", ["RedirectController.Unguarded", "RedirectController.OtherMember",
                                      "LoginModel.OnPostOther", "RedirectController.NoExit",
-                                     "RedirectController.Reassign"])
+                                     "RedirectController.Reassign", "RedirectController.LoopShadow"])
 def test_unguarded_redirects_still_flag(findings, handler):
     assert len(hits(findings, handler, "DNL-REDIR-001")) == 1, handler
 

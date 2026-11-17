@@ -60,4 +60,16 @@ public class RedirectController : ControllerBase
         model = m2;
         return Redirect(model.ReturnUrl);
     }
+
+    // Control: a guard on an earlier, separate `item` must not cleanse a later loop variable of the same name.
+    [HttpPost("loopshadow")]
+    public IActionResult LoopShadow([FromQuery] ReturnModel m2, [FromQuery] List<ReturnModel> xs)
+    {
+        {
+            var item = m2;
+            if (!Url.IsLocalUrl(item.ReturnUrl)) { return BadRequest(); }
+        }
+        foreach (var item in xs) { return Redirect(item.ReturnUrl); }
+        return Ok();
+    }
 }

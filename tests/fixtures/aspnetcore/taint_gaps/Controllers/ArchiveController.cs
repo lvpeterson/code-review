@@ -72,4 +72,27 @@ public class ArchiveController : ControllerBase
         }
         return Ok();
     }
+
+    // Negative control: a project collection that happens to be called Entries is not an archive.
+    [HttpPost("own-entries")]
+    public IActionResult OwnEntries()
+    {
+        var catalog = new Catalog();
+        foreach (var v in catalog.Entries)
+        {
+            System.IO.File.WriteAllText(Path.Combine("/data", v.Name), "x");
+        }
+        return Ok();
+    }
+}
+
+public class CatalogItem
+{
+    public string Name { get; set; } = "";
+    public string FullName { get; set; } = "";
+}
+
+public class Catalog
+{
+    public List<CatalogItem> Entries { get; } = new();
 }

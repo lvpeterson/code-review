@@ -150,8 +150,8 @@ _SYNC_CALLBACKS = re.compile(r"(?i)^(foreach|select|selectmany|where|any|all|fir
 _STATIC_SEQ_TYPES = {"enumerable", "queryable", "parallel", "parallelenumerable"}
 
 
-# A literal that is only a scheme and / or slashes (`"https://"`, `"//"`, `"/"`, ""): the host is still the request's.
 _ZIP_ENTRY_DECL_RE = re.compile(r"^\s*(?:var\s+)?(?:[\w.]*\.)?ZipArchiveEntry\s+(\w+)\s*$")
+# A literal that is only a scheme and / or slashes (`"https://"`, `"//"`, `"/"`, ""): the host is still the request's.
 _SCHEME_ONLY_RE = re.compile(r"(?i)\s*([a-z][a-z0-9+.\-]*:)?/{0,2}\s*")
 # Marker in `Taint.cleansed`: the value starts with an untainted prefix (SSRF: only the path is controlled).
 # It survives a merge only when every merged value has it, so a fully tainted contribution removes it.
@@ -565,6 +565,8 @@ class _Analysis:
             if sym:
                 return sym.startswith(("System.", "Microsoft."))     # a project method of that name is no stream factory
             recv = self._recv(fn) if fn.get("k") == "member" else None
+            if (self._text(recv) or "").split(".")[-1].lower() == "zipfile":
+                return False                            # ZipFile.OpenRead returns a ZipArchive
             return not self._targets(e, fn, recv)
         return False
 
@@ -1139,6 +1141,7 @@ class _Analysis:
             elif a.get("k") in ("unknown", "other") and a.get("text"):
                 nm = a["text"].split()[-1]
             if nm:
+                self._drop_paths(self.key(nm))
                 self.env[self.key(nm)] = cleanse(src, ["*"]) if clean else src
                 self.locals.add(self.key(nm))
 
@@ -1666,22 +1669,34 @@ class _Analysis:
         for k in [k for k in self.env if k.startswith(pre)]:
             del self.env[k]
 
+    def _is_entries(self, coll: Any) -> bool:
+        """`<x>.Entries` where x is a ZipArchive: by sym / declared type when known, by the name alone otherwise."""
+        if not isinstance(coll, dict) or coll.get("k") != "member" or coll.get("name") != "Entries":
+            return False
+        sym = coll.get("sym")
+        if sym:
+            return sym.startswith("System.IO.Compression.ZipArchive.")
+        tn = self.type_of(self._recv(coll))
+        return not tn or _simple(tn) == "ziparchive"
+
     def _st_loop(self, s: dict) -> bool:
         header = s.get("header") or []
         # foreach: [loop variable, collection]; `for` / `while` headers hold expressions only.
         tup = _TUPLE_DECL_RE.match(header[0].get("text") or "") if len(header) == 2 and isinstance(header[0], dict) \
             and header[0].get("k") == "unknown" else None
-        if len(header) == 2 and isinstance(header[0], dict) and header[0].get("k") == "name" \
-                and (header[1] or {}).get("k") != "unary":
+        decl = _ZIP_ENTRY_DECL_RE.match(header[0].get("text") or "") if len(header) == 2             and isinstance(header[0], dict) and header[0].get("k") == "unknown" else None
+        if len(header) == 2 and isinstance(header[0], dict) and header[0].get("k") == "name"                 and (header[1] or {}).get("k") != "unary":
             lv = self.key(header[0].get("id") or "")
+            self._drop_paths(lv)
             self.env[lv] = self.ev(header[1])
             self.locals.add(lv)
-            if (header[1].get("name") if header[1].get("k") == "member" else "") == "Entries":
+            if self._is_entries(header[1]):
                 self.types[lv] = "ZipArchiveEntry"      # `foreach (var e in archive.Entries)`
             else:
                 self.types.pop(lv, None)
-        elif len(header) == 2 and isinstance(header[0], dict) and header[0].get("k") == "unknown"                 and _ZIP_ENTRY_DECL_RE.match(header[0].get("text") or ""):
-            lv = self.key(_ZIP_ENTRY_DECL_RE.match(header[0]["text"]).group(1))
+        elif decl is not None:
+            lv = self.key(decl.group(1))
+            self._drop_paths(lv)
             self.env[lv] = self.ev(header[1])
             self.locals.add(lv)
             self.types[lv] = "ZipArchiveEntry"
@@ -1691,6 +1706,7 @@ class _Analysis:
             for piece in tup.group(1).split(","):
                 words = _IDENT_RE.findall(piece)
                 if words and words[-1] != "_":
+                    self._drop_paths(self.key(words[-1]))
                     self.env[self.key(words[-1])] = v
                     self.locals.add(self.key(words[-1]))
         else:
@@ -1710,6 +1726,7 @@ class _Analysis:
         for c in s.get("catches") or []:
             self.env = self._merge_envs(pre, after_body)
             if c.get("name"):
+                self._drop_paths(self.key(c["name"]))
                 self.env[self.key(c["name"])] = None
                 self.locals.add(self.key(c["name"]))
             self.block(c.get("body"))
