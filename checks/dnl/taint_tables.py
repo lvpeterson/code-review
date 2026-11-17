@@ -83,6 +83,10 @@ SOURCES: tuple[Source, ...] = (
                           r"^Microsoft\.AspNetCore\.(Http|Routing)\.RoutingHttpContextExtensions\.GetRouteValue$",
            rf"(?i)^{_CORE_CTX}request\.routevalues$|(^|\.)(http)?context\.getroutevalue$|"
            r"(^|\.)ctx\.getroutevalue$", True),
+    # Zip slip: an entry name is attacker-controlled whatever opened the archive (an upload saved earlier and
+    # reopened from disk included), so it is a source on its own. Without a sym the receiver variable name decides.
+    Source("archive entry name", r"^System\.IO\.Compression\.ZipArchiveEntry\.(FullName|Name)$",
+           r"(?i)(^|\.)(entry|zipentry|ziparchiveentry|archiveentry|zentry)\.(fullname|name)$", True),
     Source("IFormFile", r"^Microsoft\.AspNetCore\.Http\.IFormFile\.(FileName|Name|ContentType|OpenReadStream|"
                                   r"Length|ContentDisposition|Headers)$", None),
 )
@@ -140,6 +144,7 @@ _RESP_TEXT = r"(?i)^((this|me)\.)?((httpcontext\.current|context|page)\.)?respon
 _CTRL = ("System.Web.Mvc.Controller", "System.Web.Mvc.ControllerBase")
 _API = ("System.Web.Http.ApiController",)
 _FILE = "System.IO.File"
+_ZIP = "System.IO.Compression."
 _LOG = ("log4net.ILog",)
 
 # -- ASP.NET Core rows. EF Core, Microsoft.Data.SqlClient, Npgsql, Microsoft.Data.Sqlite and MySql* come from
@@ -253,6 +258,23 @@ SINKS: tuple[Sink, ...] = tuple(
     + _each("path", "File", (_FILE,), "ReadAllText|ReadAllBytes|ReadAllLines|WriteAllText|WriteAllBytes|"
                                       "AppendAllText|Open|OpenRead|OpenWrite|OpenText|Delete", args=(0,))
     + _each("path", "File", (_FILE,), "Copy|Move", args=(0, 1))
+    # the rest of System.IO.File / Directory and System.IO.Compression: framework types, so they resolve
+    + _each("path", "File", (_FILE,), "Create|CreateText|AppendText|AppendAllLines|AppendAllLinesAsync|ReadLines|"
+                                      "ReadAllTextAsync|ReadAllBytesAsync|ReadAllLinesAsync|WriteAllTextAsync|"
+                                      "WriteAllBytesAsync|WriteAllLinesAsync|AppendAllTextAsync", args=(0,))
+    + _each("path", "File", (_FILE,), "Replace", args=(0, 1, 2))
+    + _each("path", "Directory", ("System.IO.Directory",), "EnumerateFiles|EnumerateDirectories|"
+                                                           "EnumerateFileSystemEntries|GetDirectories|"
+                                                           "GetFileSystemEntries", args=(0,))
+    + _each("path", "Directory", ("System.IO.Directory",), "Move", args=(0, 1))
+    + _each("path", "ZipFile", (_ZIP + "ZipFile",), "ExtractToDirectory|CreateFromDirectory", args=(0, 1))
+    + _each("path", "ZipFile", (_ZIP + "ZipFile",), "Open|OpenRead", args=(0,))
+    # `entry.ExtractToFile(dest)` / `archive.ExtractToDirectory(dest)` extension forms; `ZipFileExtensions.X(entry, dest)`
+    # shifts the argument. The member names are distinctive enough to match without a resolved receiver type.
+    + _each("path", "ZipFileExtensions", (_ZIP + "ZipFileExtensions",), "ExtractToFile|ExtractToDirectory",
+            args=(0,), static_args=(1,), unresolved_ok=True)
+    + _each("path", "ZipFileExtensions", (_ZIP + "ZipFileExtensions",), "CreateEntryFromFile", args=(0,),
+            static_args=(1,), unresolved_ok=True)
     + _each("path", "FileStream", ("System.IO.FileStream", "System.IO.StreamReader", "System.IO.StreamWriter",
                                     "System.IO.FileInfo"), ".ctor", args=(0,))
     + _each("path", "HttpServerUtility", ("System.Web.HttpServerUtility", "System.Web.HttpServerUtilityBase"),

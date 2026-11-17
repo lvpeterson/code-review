@@ -11,6 +11,7 @@ severity level lower, `confidence="REVIEW"`, no route.
 from __future__ import annotations
 
 from checks.dnl import taint_solver
+from checks.dnl.taint import PREFIX_MARK
 from checks.dnl.findings import dnl_finding
 from core.models import Finding
 
@@ -113,8 +114,12 @@ def check(model, refs: list) -> list[Finding]:
     # the rest are counted ("also reached from N more route(s)").
     best: dict[tuple, object] = {}
     routes_for: dict[tuple, set] = {}
+    path_only: dict[tuple, bool] = {}
     for r in rows:
         key = (RULE_FOR_KIND[r.hit.kind], r.hit.file, r.hit.line)
+        if r.hit.kind == "ssrf" and r.proven:
+            # SSRF is path-only when every proven flow into this call starts from an untainted prefix
+            path_only[key] = path_only.get(key, True) and PREFIX_MARK in r.hit.taint.cleansed
         if r.proven and r.ref is not None:
             routes_for.setdefault(key, set()).add(_route_key(r))
         cur = best.get(key)
@@ -132,8 +137,15 @@ def check(model, refs: list) -> list[Finding]:
             extra = len(routes_for.get((rule, file, line), ())) - 1
             if extra > 0:
                 text += f"; also reached from {extra} more route(s)"
+            conf = {}
+            if path_only.get((rule, file, line)):
+                # the URL starts with a fixed prefix: the host and scheme are not attacker-controlled
+                sev = "low"
+                conf = {"confidence": "REVIEW"}
+                text += "; only the path is attacker-controlled (the URL starts with an untainted prefix)"
             out.append(dnl_finding(rule, sev, _LABEL[r.hit.kind], text, file, line, route=route,
-                                   api_surface=bool(route.meta.get("api_surface", False)) if route else False))
+                                   api_surface=bool(route.meta.get("api_surface", False)) if route else False,
+                                   **conf))
         else:
             out.append(dnl_finding(rule, _LOWER[sev], _LABEL[r.hit.kind], _unproven_text(model, r), file, line,
                                    confidence="REVIEW"))

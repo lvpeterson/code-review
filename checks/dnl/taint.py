@@ -112,6 +112,15 @@ _SAN_RES = [(s, re.compile(s.member)) for s in T.SANITIZERS]
 _LEVEL_NAME_RE = re.compile(r"(?i)^(event|eventid|evt|eid|level|loglevel|lvl|\w+eventid|\w+loglevel)$")
 _EXC_NAME_RE = re.compile(r"^(e|ex|exc|err|error|exception|[a-z]\w*(Ex|Exception))$")
 _GUARD = {g.shape: g for g in T.GUARDS}
+_BODY_SYM_RE = re.compile(r"^Microsoft\.AspNetCore\.Http\.Http(Request|Response)\.Body$")
+_BODY_TEXT_RE = re.compile(r"(?i)(^|\.)(request|response)\.body$")
+# Calls whose result is a stream (never a path), by name.
+_STREAM_CALLS = frozenset({"openreadstream", "openread", "openwrite", "getresponsestream", "getrequeststream",
+                           "getstream", "readasstreamasync", "getstreamasync", "openstream"})
+# Receiver types of TryGetValue that hold request input.
+_REQUEST_COLLECTIONS = frozenset({"iquerycollection", "iformcollection", "iheaderdictionary",
+                                  "irequestcookiecollection", "querycollection", "formcollection",
+                                  "headerdictionary", "requestcookiecollection", "routevaluedictionary"})
 _REQUEST_PROP_RE = re.compile(r"(?i)^((this|me)\.)?((httpcontext\.current|context|page)\.)?request$")
 _HELPER_RES = [(h, re.compile(h.member)) for h in T.STRING_HELPERS]
 _TERMINATORS = ("return", "throw")
@@ -139,6 +148,17 @@ _SYNC_CALLBACKS = re.compile(r"(?i)^(foreach|select|selectmany|where|any|all|fir
                              r"tolist|toarray|todictionary|tolookup|exists|findall|convertall|truefor\w*)$")
 # Static receivers of the LINQ / parallel forms: `Enumerable.Where(source, x => ..)`.
 _STATIC_SEQ_TYPES = {"enumerable", "queryable", "parallel", "parallelenumerable"}
+
+
+# A literal that is only a scheme and / or slashes (`"https://"`, `"//"`, `"/"`, ""): the host is still the request's.
+_SCHEME_ONLY_RE = re.compile(r"(?i)\s*([a-z][a-z0-9+.\-]*:)?/{0,2}\s*")
+# Marker in `Taint.cleansed`: the value starts with an untainted prefix (SSRF: only the path is controlled).
+# It survives a merge only when every merged value has it, so a fully tainted contribution removes it.
+PREFIX_MARK = "~prefix"
+
+
+def _with_prefix(t: Taint) -> Taint:
+    return Taint(t.origins, t.cleansed | {PREFIX_MARK})
 
 
 def _strip_literals(text: str) -> str:
@@ -513,7 +533,29 @@ class _Analysis:
         if sink.kind != "path":
             return True
         tn = self.type_of(arg)
-        return not tn or _simple(tn) in ("string", "object")
+        if tn:
+            return _simple(tn) in ("string", "object")
+        return not self._stream_like(arg)
+
+    def _stream_like(self, e: Any) -> bool:
+        """An expression with no declared type that is evidently a stream, not a path: the request / response
+        `Body`, `file.OpenReadStream()` and the other stream-returning calls. A typed value is judged by its type."""
+        if not isinstance(e, dict):
+            return False
+        tn = _simple(self.type_of(e) or "").lower()
+        if tn:
+            return tn.endswith("stream")
+        k = e.get("k")
+        if k == "member" and (e.get("name") or "").lower() == "body":
+            sym = e.get("sym")
+            if sym:
+                return bool(_BODY_SYM_RE.match(sym))
+            return bool(_BODY_TEXT_RE.search(self._text(e) or ""))
+        if k == "call":
+            fn = e.get("fn") or {}
+            name = (fn.get("name") if fn.get("k") == "member" else fn.get("id")) or ""
+            return name.lower() in _STREAM_CALLS
+        return False
 
     def _check_call_sinks(self, call: dict, name: str, recv: Any, args: list, vals: list, nvals: list) -> None:
         bare = recv is None
@@ -707,7 +749,41 @@ class _Analysis:
         a, b = self.ev(e.get("l")), self.ev(e.get("r"))
         if str(e.get("op") or "").lower() in _COMPARE_OPS:
             return None
-        return merge(a, b)
+        out = merge(a, b)
+        if out is not None and e.get("op") == "+" and self._path_only(e):
+            return _with_prefix(out)
+        return out
+
+    def _leading(self, e: Any) -> Any:
+        """First non-empty piece of a concatenation / interpolated string (None when there is none)."""
+        if not isinstance(e, dict):
+            return None
+        if e.get("k") == "bin" and e.get("op") == "+":
+            lead = self._leading(e.get("l"))
+            return lead if lead is not None else self._leading(e.get("r"))
+        if e.get("k") == "interp":
+            for p in e.get("parts") or []:
+                lead = self._leading(p)
+                if lead is not None:
+                    return lead
+            return None
+        if e.get("k") == "lit" and literal_str(e) == "":
+            return None
+        return e
+
+    def _path_only(self, e: dict) -> bool:
+        """A Core string that starts with something the request did not supply and that is not just a scheme or
+        slashes: a relative literal (`"users/" + id`), a literal base URL, or an untainted value
+        (`$"{baseUrl}{x}"`). Only the tail of the result is attacker-controlled."""
+        if not self._is_core_project():
+            return False
+        lead = self._leading(e)
+        if lead is None:
+            return False
+        if lead.get("k") == "lit":
+            v = literal_str(lead)
+            return v is not None and not _SCHEME_ONLY_RE.fullmatch(v)
+        return self.ev(lead) is None
 
     def _ev_unary(self, e: dict) -> Taint | None:
         self.ev(e.get("e"))
@@ -717,6 +793,8 @@ class _Analysis:
         out = None
         for p in e.get("parts") or []:
             out = merge(out, self.ev(p))
+        if out is not None and self._path_only(e):
+            return _with_prefix(out)
         return out
 
     def _ev_cond(self, e: dict) -> Taint | None:
@@ -748,6 +826,13 @@ class _Analysis:
             if ent.get("name"):
                 self._check_assign_sinks(ent["name"], None, None, tf or e.get("type"), v, e.get("line", 0), sibs)
         if self._check_new_sinks(e, args, vals, nvals):
+            if _simple(e.get("type_full") or e.get("type") or "").lower() == "streamreader" and args                     and self._is_core_project() and self._stream_like(args[0]):
+                # `new StreamReader(Request.Body)`: what the reader reads is the stream's data, so the reader
+                # carries the stream's taint (a StreamReader over a path does not: the file is not request data).
+                out = None
+                for v in vals[:1]:
+                    out = merge(out, v)
+                return out
             return None
         if self.summaries is not None:
             self._call_ctors(e, args, vals, nvals)
@@ -813,6 +898,14 @@ class _Analysis:
         src = self._source(e) or self._source(fn) or self._request_default(fn)
         if src is not None:
             return src
+        if low == "trygetvalue" and len(args) >= 2 and recv is not None and self._is_core_project():
+            # `Request.Query.TryGetValue("c", out var v)`: the out variable holds the collection's data
+            src = rv
+            if src is None and _simple(self.type_of(recv) or "").lower() in _REQUEST_COLLECTIONS:
+                src = self._origin("Request", line)
+            if src is not None:
+                self._bind_out_args(args[:1] + args[-1:], src, clean=False)
+                return None
         # sanitizers
         san = self._sanitize(e, fn, name, recv, args, vals, rv)
         if san is not False:
@@ -1020,8 +1113,9 @@ class _Analysis:
             c |= {"header", "log"}
         return Taint(value.origins, frozenset(c))
 
-    def _bind_out_args(self, args: list, src: Taint | None) -> None:
-        """TryParse(text, out x): x is a number whatever text held."""
+    def _bind_out_args(self, args: list, src: Taint | None, clean: bool = True) -> None:
+        """TryParse(text, out x): x is a number whatever text held. `clean=False`: x keeps the taint
+        (`TryGetValue(key, out x)`)."""
         for a in args[1:]:
             if not isinstance(a, dict):
                 continue
@@ -1031,7 +1125,7 @@ class _Analysis:
             elif a.get("k") in ("unknown", "other") and a.get("text"):
                 nm = a["text"].split()[-1]
             if nm:
-                self.env[self.key(nm)] = cleanse(src, ["*"])
+                self.env[self.key(nm)] = cleanse(src, ["*"]) if clean else src
                 self.locals.add(self.key(nm))
 
     # -- project method calls ---------------------------------------------
@@ -1343,6 +1437,15 @@ class _Analysis:
     def _apply_guards(self, guards: list[tuple[str, frozenset]]) -> None:
         for kk, kinds in guards:
             cur = self.env.get(kk, self.field_taint.get(kk))
+            if cur is None and "." in kk:
+                # `Url.IsLocalUrl(model.ReturnUrl)`: a member path is tainted through its root object (a bound
+                # parameter or property), so the cleansed value is recorded under the path itself.
+                parts = kk.split(".")
+                for n in range(len(parts) - 1, 0, -1):
+                    pre = ".".join(parts[:n])
+                    cur = self.env.get(pre, self.field_taint.get(pre))
+                    if cur is not None:
+                        break
             if cur is not None:
                 self.env[kk] = cleanse(cur, kinds)
 
@@ -1369,6 +1472,8 @@ class _Analysis:
         tn = s.get("type_full") or s.get("type")
         if not tn or tn.lower() in ("var", "dim"):
             tn = self.type_of(init)
+            if not tn and self._stream_like(init):
+                tn = "Stream"
         if tn:
             self.types[kk] = tn
         else:
