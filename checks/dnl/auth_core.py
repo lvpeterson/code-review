@@ -103,10 +103,21 @@ _AUTHZ_TOUCH = re.compile(r"filter|metadata|authoriz|anonymous|polic|requirement
 # BCL string / collection / LINQ / route-model members a route-only convention uses; anything else is a blocker.
 _CONVENTION_SAFE_CALLS = frozenset("""
 ToLower ToLowerInvariant ToUpper ToUpperInvariant Trim TrimStart TrimEnd Replace StartsWith EndsWith Contains Split
-Substring Insert Remove IndexOf Join Concat Format IsNullOrEmpty IsNullOrWhiteSpace Equals ToString Add AddRange Any All
-Where Select First FirstOrDefault Single SingleOrDefault Count ToList ToArray Last LastOrDefault
+Substring IndexOf Join Concat Format IsNullOrEmpty IsNullOrWhiteSpace Equals ToString Any All
+Where First FirstOrDefault Single SingleOrDefault Count ToList ToArray Last LastOrDefault
 CombineAttributeRouteModel
 """.split())
+# Mutators: safe only on the selector collection or a route template string of the model.
+_CONVENTION_MUTATORS = frozenset("Add AddRange Insert Remove RemoveAt RemoveAll Clear".split())
+_MUTABLE_ROUTE_PARTS = frozenset("Selectors Template Name ControllerName ActionName".split())
+# Calls that take a predicate: model-derivation passes through them. Any other call taking a lambda is a
+# projection (Select, SelectMany, Cast...) and ends it.
+_PREDICATE_CALLS = frozenset("Where Any All First FirstOrDefault Single SingleOrDefault Last LastOrDefault Count SkipWhile TakeWhile".split())
+# `new` of anything else, anywhere in a convention class, blocks.
+_CONVENTION_NEW_OK = frozenset("""
+AttributeRouteModel RouteAttribute SelectorModel string String List HashSet Dictionary StringBuilder Regex Uri
+""".split())
+_PRIMITIVES = frozenset("string String int long bool byte short uint ulong char double float decimal".split())
 _POLICY_DEFS = frozenset({"AddPolicy", "AddDefaultPolicy", "AddFallbackPolicy"})
 _KNOWN_DENY_REQS = frozenset("""
 DenyAnonymousAuthorizationRequirement RolesAuthorizationRequirement ClaimsAuthorizationRequirement
@@ -606,25 +617,31 @@ _ALIAS = re.compile(r"(?m)^[ \t]*(global[ \t]+)?using[ \t]+(\w+)[ \t]*=[ \t]*([\
 
 def _usings_aliases(model: ProjectModel, file: str) -> dict[str, str]:
     """`using Alias = Ns.Type;` of one source file plus the `global using` aliases of every file in the same
-    project, as {Alias: Type}."""
-    def read(rel: str) -> str:
-        try:
-            return (model.root / rel).read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return ""
+    project, as {Alias: Type}. The per-project global map is built once (every file read once)."""
     cache = model.cache.setdefault("auth_core_aliases", {})
     if file in cache:
         return cache[file]
-    out: dict[str, str] = cache.setdefault(file, {})
     own = model.files.get(file)
     proj = own.project if own is not None else None
-    for rel, f in model.files.items():
-        if rel != file and (proj is None or f.project != proj):
-            continue
-        for m in _ALIAS.finditer(read(rel)):
-            if rel == file or m.group(1):
-                out[m.group(2)] = _simple(m.group(3))
-    return out
+    gkey = ("global", proj)
+    if gkey not in cache:
+        per_file: dict[str, dict[str, str]] = {}
+        glob: dict[str, str] = {}
+        for rel, f in model.files.items():
+            if proj is not None and f.project != proj:
+                continue
+            try:
+                text = (model.root / rel).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for m in _ALIAS.finditer(text):
+                per_file.setdefault(rel, {})[m.group(2)] = _simple(m.group(3))
+                if m.group(1):
+                    glob[m.group(2)] = _simple(m.group(3))
+        cache[gkey] = (glob, per_file)
+    glob, per_file = cache[gkey]
+    cache[file] = {**glob, **per_file.get(file, {})}
+    return cache[file]
 
 
 def _auth_options_type(model: ProjectModel, name: str, depth: int = 0) -> bool:
@@ -913,7 +930,8 @@ def _convention_benign(model: ProjectModel, call: dict, depth: int = 0) -> bool:
 
 
 def _root(e) -> str | None:
-    """Innermost receiver of a member / call chain: a name, `new T`, a literal marker, or None."""
+    """Innermost receiver of a member / call chain: a name, `new T`, a literal marker, or None. A call that
+    takes a lambda and is not a predicate (a projection) ends the chain: what it yields is not the model."""
     for _ in range(40):
         if not isinstance(e, dict):
             return None
@@ -921,7 +939,12 @@ def _root(e) -> str | None:
         if k == "member":
             e = e.get("obj")
         elif k == "call":
-            e = e.get("fn")
+            fn = e.get("fn") or {}
+            lam = any(isinstance(a, dict) and a.get("k") == "lambda"
+                      for a in list(e.get("args") or []) + list((e.get("named") or {}).values()))
+            if lam and call_name(e) not in _PREDICATE_CALLS:
+                return None
+            e = fn
         elif k == "name":
             return e.get("id")
         elif k == "new":
@@ -936,10 +959,17 @@ def _root(e) -> str | None:
 _BCL_STATICS = frozenset("string String Path Enumerable Uri Regex Char Math".split())
 
 
-def _framework_vars(model: ProjectModel, m: MethodIR) -> set[str]:
+def _framework_vars(model: ProjectModel, m: MethodIR) -> set[str] | None:
     """Names in a method that hold values derived from its parameters (the convention's model argument): the
-    parameters, loop variables over them, locals initialised from them, lambda parameters of calls on them."""
+    parameters, loop variables over them, locals initialised from them, lambda parameters of calls on them.
+    None when the method defeats the analysis: a dynamic / object parameter or local, or a derived local that
+    is assigned again."""
+    if any(_simple(p.type) in ("dynamic", "object", "Object") for p in m.params):
+        return None
     fw = {p.name for p in m.params if not model.find_types(_simple(p.type))}
+    for n in walk(m.body):
+        if n.get("k") == "local" and _simple(n.get("type")) in ("dynamic", "object", "Object"):
+            return None
     for _ in range(6):
         before = len(fw)
         for n in walk(m.body):
@@ -956,6 +986,10 @@ def _framework_vars(model: ProjectModel, m: MethodIR) -> set[str]:
                         fw.update(x for x in a.get("params") or [] if isinstance(x, str))
         if len(fw) == before:
             break
+    for n in walk(m.body):
+        t = n.get("target") if n.get("k") == "assign" else None
+        if isinstance(t, dict) and t.get("k") == "name" and t.get("id") in fw:
+            return None
     return fw
 
 
@@ -975,14 +1009,41 @@ def _convention_type_benign(model: ProjectModel, tn: str, new: dict | None, dept
             if not model.find_types(bn) or not _convention_type_benign(model, bn, None, depth + 1):
                 return False
         own = {m.name for m in t.methods}
-        members = {f.name for f in t.fields} | {p.name for p in t.properties}
-        solution_methods = {x.name for u in model.types() for x in u.methods}
+        # Members a convention may read: literal-initialised string / primitive fields (const or not).
+        literals = {f.name for f in t.fields
+                    if (f.is_const or (isinstance(f.init, dict) and f.init.get("k") == "lit"))
+                    and _simple(f.type) in _PRIMITIVES}
         for m in t.methods:
             if _AUTHZ_TOUCH.search(_body_text(m.body)):
                 return False
             fw = _framework_vars(model, m)
+            if fw is None:
+                return False
+
+            def value_ok(a) -> bool:
+                """A name / member used as a value (argument, assigned or initialising value)."""
+                ar = _root(a)
+                last = a.get("id") if a.get("k") == "name" else a.get("name")
+                if ar in fw or (ar in _BCL_STATICS and not model.find_types(ar)):
+                    return True
+                if a.get("k") == "name" and a.get("id") in literals:
+                    return True
+                if a.get("k") == "member" and ar in ("this", "base", t.name) and last in literals:
+                    return True
+                return last in own and (a.get("k") == "name" or ar in ("this", "base", t.name))
+
             for n in walk(m.body):
-                if n.get("k") != "call":
+                k = n.get("k")
+                if k == "new" and _simple(n.get("type")).replace("[]", "") not in _CONVENTION_NEW_OK \
+                        and not _simple(n.get("type")).endswith("Exception") and n.get("type"):
+                    return False
+                if k == "assign" or k == "local":
+                    v = n.get("value") if k == "assign" else n.get("init")
+                    if isinstance(v, dict) and v.get("k") == "lambda":
+                        return False
+                    if isinstance(v, dict) and v.get("k") in ("name", "member") and not value_ok(v):
+                        return False
+                if k != "call":
                     continue
                 fn = n.get("fn") or {}
                 callee = call_name(n) or ""
@@ -990,24 +1051,17 @@ def _convention_type_benign(model: ProjectModel, tn: str, new: dict | None, dept
                 root = _root(fn.get("obj")) if fn.get("k") == "member" else None
                 is_own = callee in own and (fn.get("k") == "name" or recv in ("this", "base", t.name))
                 if not is_own:
-                    # An allowlisted BCL name is safe only on a receiver that is the model or a value derived
-                    # from it (or a BCL static / literal): never on a solution type, a local object or a member.
-                    if callee not in _CONVENTION_SAFE_CALLS or root is None or not (
+                    ok = callee in _CONVENTION_SAFE_CALLS or (
+                        callee in _CONVENTION_MUTATORS and recv.split(".")[-1] in _MUTABLE_ROUTE_PARTS)
+                    # Only on the model or a value derived from it (or a BCL static / literal): never on a
+                    # solution type, a local object or a member.
+                    if not ok or root is None or not (
                             root in fw or root == "<lit>" or (root in _BCL_STATICS and not model.find_types(root))):
                         return False
-                # A name / member argument that is not a lambda may be a method group: it must be model-derived,
-                # a plain member of this class (not a method), or a BCL static member.
+                # A name / member argument may be a method group or a stored delegate.
                 for a in list(n.get("args") or []) + list((n.get("named") or {}).values()):
-                    if not (isinstance(a, dict) and a.get("k") in ("name", "member")):
-                        continue
-                    ar, last = _root(a), (a.get("id") if a.get("k") == "name" else a.get("name"))
-                    if ar in fw or (ar in _BCL_STATICS and not model.find_types(ar)):
-                        continue
-                    if (ar in members or (a.get("k") == "member" and ar in ("this", "base"))) and last not in solution_methods:
-                        continue
-                    if last in own and (a.get("k") == "name" or ar in ("this", "base", t.name)):
-                        continue
-                    return False
+                    if isinstance(a, dict) and a.get("k") in ("name", "member") and not value_ok(a):
+                        return False
     return True
 
 

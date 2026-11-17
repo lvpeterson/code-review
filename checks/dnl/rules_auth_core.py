@@ -52,28 +52,40 @@ def _tokens(name: str) -> list[str]:
     return [t.lower() for t in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+", name)]
 
 
+def _privileged_owner(ref: CoreRouteRef) -> bool:
+    """The controller / page itself looks privileged (the action's own name is judged by its words)."""
+    if ref.type is None:
+        return False
+    if ref.style == "razorpage":
+        return bool(_SENSITIVE_CONTROLLER.search(ref.route.path or ""))
+    tname = ref.type.name.split(".")[-1]
+    return bool(_SENSITIVE_CONTROLLER.search(tname[: -len("controller")] if tname.lower().endswith("controller") else tname))
+
+
 def _anonymous_by_design(ref: CoreRouteRef) -> bool:
-    if _sensitive(ref):
+    if _privileged_owner(ref):
         return False
     r = ref.route
-    action = ref.method.name if ref.method else (r.handler_name or "").split(".")[-1]
+    segs = [x for x in (r.path or "").split("/") if x and not x.startswith("{") and not x.startswith("[")]
+    leaf = segs[-1] if segs else ""
+    # The action's own name must be a credential-flow name; the route only ever rules it out. Where the
+    # action has no name of its own (a minimal-API lambda, an OnPost handler of a page) the route is its identity.
+    action = ref.method.name if ref.method else ""
     if ref.style == "razorpage":
         action = _HANDLER_PREFIX.sub("", action)
-    names = [action]
-    segs = [x for x in (r.path or "").split("/") if x and not x.startswith("{") and not x.startswith("[")]
-    if segs:
-        names.append(segs[-1])
-    toks = [_tokens(n) for n in names if n]
-    # One dangerous word anywhere (action or path) rules the exemption out.
-    if any(_DANGEROUS_TOKENS & set(t) for t in toks):
+        if action.lower() in ("", "async"):
+            action = leaf
+    elif not action:
+        action = leaf
+    if not action:
         return False
-    for n, t in zip([n for n in names if n], toks):
-        if ({"user", "users"} & set(t)) and not (_FLOW_TOKENS & set(t)):
-            continue
-        # Every word must belong to a credential flow, and the name must start like one.
-        if set(t) <= _FLOW_WORDS and _ANON_BY_DESIGN.match(re.sub(r"[^a-z]", "", n.lower())):
-            return True
-    return False
+    if any(_DANGEROUS_TOKENS & set(_tokens(n)) for n in (action, leaf) if n):
+        return False
+    t = _tokens(action)
+    if ({"user", "users"} & set(t)) and not (_FLOW_TOKENS & set(t)):
+        return False
+    # Every word must belong to a credential flow, and the name must start like one.
+    return set(t) <= _FLOW_WORDS and bool(_ANON_BY_DESIGN.match(re.sub(r"[^a-z]", "", action.lower())))
 
 
 def _sensitive(ref: CoreRouteRef) -> bool:

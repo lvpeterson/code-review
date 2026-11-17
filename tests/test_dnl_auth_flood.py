@@ -280,9 +280,9 @@ public class AccountController : ControllerBase
     [HttpPost("login"), AllowAnonymous] public IActionResult Login() => Ok();
     [HttpPost, AllowAnonymous] public IActionResult Register() => Ok();
     [HttpPost("a1"), AllowAnonymous] public IActionResult ForgotPassword() => Ok();
-    [HttpPost("reset-password"), AllowAnonymous] public IActionResult Submit() => Ok();
+    [HttpPost("reset-password"), AllowAnonymous] public IActionResult ResetPassword() => Ok();
     [HttpPost("a3"), AllowAnonymous] public IActionResult ConfirmEmail() => Ok();
-    [HttpPost("refresh"), AllowAnonymous] public IActionResult Renew() => Ok();
+    [HttpPost("refresh"), AllowAnonymous] public IActionResult RefreshToken() => Ok();
     [HttpPost("a4"), AllowAnonymous] public IActionResult LogOut() => Ok();
     [HttpPost("wipe"), AllowAnonymous] public IActionResult WipeAll() => Ok();
     [HttpPost("login/delete-all"), AllowAnonymous] public IActionResult Purge() => Ok();
@@ -317,9 +317,9 @@ public class OpsController : ControllerBase
 {
     [HttpPost("reset-database"), AllowAnonymous] public IActionResult Run1() => Ok();
     [HttpPost("token-purge"), AllowAnonymous] public IActionResult Run2() => Ok();
-    [HttpPost("confirm-email"), AllowAnonymous] public IActionResult Run3() => Ok();
-    [HttpPost("reset-password"), AllowAnonymous] public IActionResult Run4() => Ok();
-    [HttpPost("login"), AllowAnonymous] public IActionResult Run5() => Ok();
+    [HttpPost("confirm-email"), AllowAnonymous] public IActionResult ConfirmEmail() => Ok();
+    [HttpPost("reset-password"), AllowAnonymous] public IActionResult ResetPassword() => Ok();
+    [HttpPost("login"), AllowAnonymous] public IActionResult Login() => Ok();
 }
 '''
     fs = _findings(tmp_path, mode, _program(extra=ctl))
@@ -394,6 +394,78 @@ public class AccountController : ControllerBase
     flagged = {f.route.handler_name for f in fs if f.check_id == "DNL-AUTHZ-002"}
     assert flagged == {"AccountController.ConfirmAccountDeletion", "AccountController.ResetPasswordAndCloseAccount",
                        "AccountController.WipeEverything", "AccountController.DisableTwoFactor"}
+
+
+TAGS3 = ("using Microsoft.AspNetCore.Mvc.ApplicationModels;\n"
+         "public class Tags { public void Add(ApplicationModel m) { foreach (var c in m.Controllers) "
+         "{ c.Filters.Add(new AllowAnonymousFilter()); } } }\n")
+GATE3 = ("using Microsoft.AspNetCore.Mvc.ApplicationModels;\n"
+         "public static class Gate { public static bool Open(ControllerModel c) { c.Filters.Add(new AllowAnonymousFilter()); return true; } }\n")
+
+
+def _member_conv(body, field="private Func<ControllerModel, bool>? G;"):
+    return {"SneakyConvention.cs": "using Microsoft.AspNetCore.Mvc.ApplicationModels;\npublic class SneakyConvention : IApplicationModelConvention\n{\n"
+            f"    {field}\n    public void Apply(ApplicationModel application)\n    {{\n{body}\n    }}\n}}\n"}
+
+
+@pytest.mark.parametrize("body, extra", [
+    # R3-2: projections end model derivation (chain and foreach)
+    ("application.Controllers.Select(c => new Tags()).First().Add(application);", {"Tags.cs": TAGS3}),
+    ("foreach (var tg in application.Controllers.Select(c => new Tags())) { tg.Add(application); }", {"Tags.cs": TAGS3}),
+    ("var tg = application.Controllers.Select(c => Make(c)).First(); tg.Add(application);", {"Tags.cs": TAGS3}),
+    # R3-2: a `new` of a non-BCL, non-framework type anywhere
+    ("var t = new Tags();", {"Tags.cs": TAGS3}),
+    # R3-3: dynamic / object locals, reassignment of a derived local
+    ("dynamic x = application; x = new Tags(); x.Add(application);", {"Tags.cs": TAGS3}),
+    ("object x = application; ((dynamic)x).Add(application);", {"Tags.cs": TAGS3}),
+    ("var x = application; x = Other(); x.Controllers.Clear();", {}),
+    # R3-5: mutators on anything but selectors / route templates
+    ("foreach (var c in application.Controllers) { c.Actions.Clear(); }", {}),
+    ("application.Controllers.RemoveAt(0);", {}),
+])
+def test_r3_structural_holes_in_convention_analysis(tmp_path, mode, body, extra):
+    files = _conv("SneakyConvention", body)
+    files.update(extra)
+    a = _with_convention(tmp_path, mode, "new SneakyConvention()", files)
+    assert a.state == UNKNOWN and any("Conventions.Add" in r for r in a.reasons), body
+
+
+@pytest.mark.parametrize("body, field", [
+    # R3-1: a delegate stored in a member and handed to a framework call
+    ("G = Gate.Open;\n        application.Controllers.Any(G);", "private Func<ControllerModel, bool>? G;"),
+    ("application.Controllers.Any(G);", "private Func<ControllerModel, bool> G = Gate.Open;"),
+    ("Func<ControllerModel, bool> g = Gate.Open;\n        application.Controllers.Any(g);", "private int N = 1;"),
+    ("var g = Gate.Open;\n        application.Controllers.Any(g);", "private int N = 1;"),
+])
+def test_r3_member_and_local_delegates_cannot_hide_an_opt_out(tmp_path, mode, body, field):
+    files = _member_conv(body, field)
+    files["Gate.cs"] = GATE3
+    a = _with_convention(tmp_path, mode, "new SneakyConvention()", files)
+    assert a.state == UNKNOWN and any("Conventions.Add" in r for r in a.reasons), body
+
+
+def test_r3_literal_members_and_selector_mutators_stay_benign(tmp_path, mode):
+    body = ("foreach (var c in application.Controllers) { foreach (var s in c.Selectors) { "
+            "s.AttributeRouteModel = new AttributeRouteModel(new RouteAttribute(Prefix + \"/\" + Limit)); } "
+            "c.Selectors.Add(new SelectorModel()); }")
+    files = _member_conv(body, "private const string Prefix = \"v1\";\n    private readonly int Limit = 3;")
+    assert _with_convention(tmp_path, mode, "new SneakyConvention()", files).state == PROTECTED
+
+
+def test_r3_route_name_alone_cannot_vouch_for_an_action(tmp_path, mode):
+    ctl = '''
+[ApiController, Route("api/account")]
+public class AccountController : ControllerBase
+{
+    [HttpPost("login"), AllowAnonymous] public IActionResult ExportCustomers() => Ok();
+    [HttpPost("reset-password"), AllowAnonymous] public IActionResult Dump() => Ok();
+    [HttpPost("a"), AllowAnonymous] public IActionResult ResetPassword() => Ok();
+    [HttpPost("login"), AllowAnonymous] public IActionResult Login() => Ok();
+}
+'''
+    fs = _findings(tmp_path, mode, _program(extra=ctl))
+    flagged = {f.route.handler_name for f in fs if f.check_id == "DNL-AUTHZ-002"}
+    assert flagged == {"AccountController.ExportCustomers", "AccountController.Dump"}
 
 
 def test_d9_minimal_hosting_adds_authorization_middleware_itself(tmp_path, mode):
