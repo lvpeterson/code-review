@@ -176,6 +176,32 @@ def _template(a, named_key: str = "template") -> str | None:
     return None
 
 
+def _nonconst_template(a) -> bool:
+    """A Route/Http* attribute that names a template which is not a compile-time string."""
+    key = attr_key(a.name)
+    if key == "acceptverbs":
+        return any(k.lower() == "route" and const_str(v) is None for k, v in (a.named or {}).items())
+    if key != "route" and key not in _VERB_ATTRS:
+        return False
+    if a.args:
+        return const_str(a.args[0]) is None
+    return any(k.lower() == "template" and const_str(v) is None for k, v in (a.named or {}).items())
+
+
+def _grouped(call: PipeCall) -> bool:
+    """The mapping call sits on a route group (`app.MapGroup("/api")....MapControllers()`)."""
+    for link in call.chain:
+        if link is call.node:
+            return False
+        if call_name(link) == "MapGroup":
+            return True
+    return False
+
+
+_GROUPED_MSG = "mapped on a route group; group prefix and conventions not applied"
+_NONCONST_MSG = "route template is not a constant"
+
+
 def _verb_names(a) -> list[str]:
     """Verbs of an AcceptVerbs attribute: "GET" literals and HttpVerbs.Get-style members."""
     out: list[str] = []
@@ -353,6 +379,11 @@ def _controller_routes(model: ProjectModel, t: TypeIR, decls: list[TypeIR], chai
         unknown.append("controller mapping sits under an environment condition that could not be parsed")
     if any(m.unresolved_pattern for m in maps):
         unknown.append("a conventional route pattern is not a literal")
+    if any(_grouped(m.call) for m in maps):
+        unknown.append(_GROUPED_MSG)
+    # F6: a class-level [Route] with a non-constant template is dropped from class_tmpls above.
+    if any(_nonconst_template(a) for c in chain for a in c.attributes if attr_key(a.name) == "route"):
+        unknown.append(_NONCONST_MSG)
     envs = {m.call.env for m in maps}
     env = None if not maps or None in envs else ", ".join(sorted(envs))
 
@@ -381,6 +412,7 @@ def _controller_routes(model: ProjectModel, t: TypeIR, decls: list[TypeIR], chai
             decl = next((d for d in decls if any(x is m for x in d.methods)), decl)
         action = _action_name(m)
         seen: set[tuple[str, tuple[str, ...]]] = set()
+        act_unknown = [_NONCONST_MSG] if any(_nonconst_template(a) for a in m.attributes) else []
 
         def add(path: str, verbs: list[str] | None, mapping: _Mapping | str | None, assumed: bool = False) -> None:
             methods = verbs or ["ANY"]
@@ -405,7 +437,7 @@ def _controller_routes(model: ProjectModel, t: TypeIR, decls: list[TypeIR], chai
             else:
                 links, note = [], None
             refs.append(CoreRouteRef(route, t, m, proj, style="controller", convention_calls=list(links),
-                                     unknown=list(unknown) + ([note] if note else []), partials=list(decls)))
+                                     unknown=list(unknown) + act_unknown + ([note] if note else []), partials=list(decls)))
 
         conv_verbs: list[str] | None = None
         conventional = False
@@ -610,6 +642,8 @@ def discover_pages(model: ProjectModel) -> list[CoreRouteRef]:
             unknown.append("no MapRazorPages call found for this page")
         elif any(c.runs_in("Production") is None for c in maps):
             unknown.append("Razor Pages mapping sits under an environment condition that could not be parsed")
+        if any(_grouped(c) for c in maps):
+            unknown.append(_GROUPED_MSG)
         envs = {c.env for c in maps}
         env = None if not maps or None in envs else ", ".join(sorted(envs))
         conv, conv_note = _common_tail(maps) if maps else ([], None)
@@ -1309,9 +1343,13 @@ class _Scan:
             if name == "MapHub":
                 meta["kind"], handler = "hub", t_text or "Hub"
                 htype = self.find_type(t_text)
+                if htype is None:
+                    notes.append(f"hub type {t_text or '?'} not in solution; its [Authorize] cannot be read")
             elif name == "MapGrpcService":
                 meta["kind"], meta["api_surface"], methods = "grpc", True, ["POST"]
                 handler, htype = t_text or "GrpcService", self.find_type(t_text)
+                if htype is None:
+                    notes.append(f"service type {t_text or '?'} not in solution; its [Authorize] cannot be read")
                 pattern = f"/{t_text or '{service}'}/*"
             elif name == "MapRazorComponents":
                 meta["kind"], handler, pattern = "blazor", t_text or "App", "/*"
@@ -1404,8 +1442,63 @@ def discover_endpoints(model: ProjectModel) -> list[CoreRouteRef]:
     return refs
 
 
+# -- code the IR could not represent -----------------------------------------------------------
+# The helper stops lowering past a nesting cap and emits `unknown` (expression) / `other` (statement)
+# text nodes instead. A registration inside such a node was never walked, so it must not vanish:
+# the model gets a note, and a Map call with a literal pattern becomes an UNKNOWN route.
+_OPAQUE = frozenset({"unknown", "other"})
+_OPAQUE_REG = re.compile(r"\.(?:Map|Use|Add)(?:[A-Z]\w*)?\s*[(<]|\b(?:Map|Use|Add)[A-Z]\w*\s*[(<]")
+_OPAQUE_MAP = re.compile(r"\b(Map(?:Get|Post|Put|Patch|Delete|Methods)?)\s*\(\s*[$@]*\"((?:[^\"\\]|\\.)*)\"")
+_DEEP_MSG = "code too deeply nested to analyze; routes and registrations in it were not discovered"
+
+
+def _opaque_nodes(node) -> list[dict]:
+    """Opaque text nodes under node whose text looks like a registration (not descended into)."""
+    out: list[dict] = []
+    stack = [node]
+    while stack:
+        x = stack.pop()
+        if isinstance(x, dict):
+            if x.get("k") in _OPAQUE:
+                if _OPAQUE_REG.search(str(x.get("text") or "")):
+                    out.append(x)
+                continue
+            stack.extend(v for v in x.values() if isinstance(v, (dict, list)))
+        elif isinstance(x, list):
+            stack.extend(x)
+    return out
+
+
+def _opaque_refs(model: ProjectModel) -> list[CoreRouteRef]:
+    refs: list[CoreRouteRef] = []
+    seen: set[tuple] = set()
+    for t in model.types():
+        parts: list = [m.body for m in t.methods] + [f.init for f in t.fields]
+        parts += [p for pr in t.properties for p in (pr.get, pr.set, pr.init)]
+        for part in parts:
+            for n in _opaque_nodes(part):
+                line, text = n.get("line", 0), str(n.get("text") or "")
+                note = f"{_DEEP_MSG} ({t.file}:{line})"
+                if note not in model.notes:
+                    model.notes.append(note)
+                for mo in _OPAQUE_MAP.finditer(text):
+                    name, pattern = mo.groups()
+                    key = (t.file, line, name, pattern)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    verb = _VERB_CALLS.get(name)
+                    route = Route(path=strip_constraints(_join(pattern)), methods=[verb] if verb else ["ANY"],
+                                  handler_name=name, file=t.file, line=line, source_start_line=line,
+                                  source_end_line=line, meta={"kind": "minimalapi", "api_surface": True})
+                    refs.append(CoreRouteRef(route, None, None, model.project_of(t.file), style="minimalapi",
+                                             unknown=[f"{_DEEP_MSG}; the route was recovered from source text"]))
+    return refs
+
+
 def discover_all(model: ProjectModel) -> list[CoreRouteRef]:
     """Controllers, Razor Pages and endpoints, computed once per model."""
     if "core_routes" not in model.cache:
-        model.cache["core_routes"] = discover_controllers(model) + discover_pages(model) + discover_endpoints(model)
+        model.cache["core_routes"] = (discover_controllers(model) + discover_pages(model)
+                                      + discover_endpoints(model) + _opaque_refs(model))
     return model.cache["core_routes"]

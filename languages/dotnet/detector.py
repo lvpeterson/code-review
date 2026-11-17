@@ -13,8 +13,10 @@ from checks.dnl import project
 from checks.dnl.files import iter_dnl_files, read_source
 
 _FRAMEWORK_ORDER = ["controllers", "razorpages", "minimalapi", "config"]
-_CONTROLLER = re.compile(r"\[\s*(?:[\w.]+\.)?(?:ApiController|Controller)(?:Attribute)?\s*[\](]"
-                         r"|\bclass\s+\w+(?:<[^>]*>)?\s*:[^{;]*?\b(?:Controller|ControllerBase)\b")
+# `[ApiController]`, `[ApiController, Route(..)]`, `[Route(..), ApiController]`; the base-list form allows a
+# primary constructor (`class T(ILogger<T> log) : ControllerBase`).
+_CONTROLLER = re.compile(r"[\[,]\s*(?:[\w.]+\.)?(?:ApiController|Controller)(?:Attribute)?\s*[\],(]"
+                         r"|\bclass\s+\w+(?:<[^>]*>)?(?:\s*\([^)]*\))?\s*:[^{;]*?\b(?:Controller|ControllerBase)\b")
 # Any endpoint-builder Map call (MapGet, MapGroup, MapHub, MapBlazorHub, MapRazorComponents, MapOpenApi,
 # MapFallbackToFile, MapHealthChecks, ...) or `.Map("...")`. MapControllers / MapRazorPages and the
 # conventional controller routes only enable the styles detected separately.

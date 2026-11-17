@@ -333,7 +333,22 @@ def _expr_kind(e, scope: dict) -> str | None:
     return None
 
 
-def _call_kind(call: dict, root, calls: list[dict], scope: dict) -> str:
+def _call_kind(call: dict, root, calls: list[dict], scope: dict, memo: dict | None = None) -> str:
+    # `memo` holds the answer per link of this chain (and each link's position): a long fluent chain
+    # is otherwise re-walked once per link below it, which is cubic in the chain length.
+    if memo is None:
+        memo = {}
+    hit = memo.get(id(call))
+    if hit is not None:
+        return hit
+    pos = memo.get("pos")
+    if pos is None:
+        pos = memo["pos"] = {id(c): i for i, c in enumerate(calls)}
+    kind = memo[id(call)] = _call_kind_uncached(call, root, calls, scope, memo, pos)
+    return kind
+
+
+def _call_kind_uncached(call: dict, root, calls: list[dict], scope: dict, memo: dict, pos: dict) -> str:
     # Builder factories are not part of any pipeline stage, with or without a symbol.
     if call_name(call) in _FACTORIES:
         return "other"
@@ -344,8 +359,8 @@ def _call_kind(call: dict, root, calls: list[dict], scope: dict) -> str:
     if not call.get("sym") and nm.startswith("Map"):
         return "endpoints"
     # Links after an endpoint link (`MapGroup(..).RequireAuthorization().MapGet(..)`) stay endpoint calls.
-    idx = calls.index(call)
-    if idx and _call_kind(calls[idx - 1], root, calls, scope) == "endpoints":
+    idx = pos[id(call)]
+    if idx and _call_kind(calls[idx - 1], root, calls, scope, memo) == "endpoints":
         return "endpoints"
     # Chain root: `x.Services` / `services` / a known local or parameter.
     text = receiver_text(root) if root is not None else ""
@@ -355,7 +370,7 @@ def _call_kind(call: dict, root, calls: list[dict], scope: dict) -> str:
     if rk in ("services", "app", "endpoints"):
         return rk
     # A later link of a chain whose earlier link has a known kind (`AddAuthentication().AddCookie()`).
-    for prev in calls[: calls.index(call)][::-1]:
+    for prev in calls[:idx][::-1]:
         pk = _sym_kind(prev.get("sym"))
         if pk:
             return pk
@@ -592,8 +607,9 @@ def _expr(ctx: _Ctx, e, scope: dict, guards: tuple, file: str, stack: tuple, dep
     if root is not None and root.get("k") == "member" and root.get("name") == "Services":
         recv_kind = "services"
     kind = None
+    memo: dict = {}
     for call in calls:
-        kind = _call_kind(call, root, calls, scope)
+        kind = _call_kind(call, root, calls, scope, memo)
         nm = call_name(call) or ""
         target = _find_target(ctx, call)
         if target is not None and target[1] in stack:

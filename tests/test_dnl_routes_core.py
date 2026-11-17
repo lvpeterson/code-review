@@ -806,3 +806,56 @@ def test_conditional_conventions_in_loop_try_and_switch(roslyn_helper, tmp_path,
           'var G = app.MapGroup("/cx");' + chr(10) + wrapper + chr(10) + 'G.MapGet("/x", () => 1);' + chr(10) + "app.Run();")
     r = ep(_discover_eps(root), "/cx/x")
     assert any("RequireAuthorization applied conditionally" in u for u in r.unknown), wrapper
+
+
+# -- IR nesting cap (F1) ----------------------------------------------------------------------------
+
+def _deep_app(tmp_path, links: int, line: str = 'app.MapGet("/x", () => 1)') -> Path:
+    root = tmp_path / "app"
+    root.mkdir()
+    (root / "App.csproj").write_text('<Project Sdk="Microsoft.NET.Sdk.Web"><PropertyGroup>'
+                                     '<TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>')
+    (root / "Program.cs").write_text("var builder = WebApplication.CreateBuilder(args);\nvar app = builder.Build();\n"
+                                     + line + '.WithTags("t")' * links + ";\napp.Run();\n")
+    return root
+
+
+def test_route_past_ir_depth_cap_is_not_silently_dropped(roslyn_helper, tmp_path):
+    root = _deep_app(tmp_path, 300)
+    project._CACHE.clear()
+    project.prepare(root, False)
+    model = project.get_model(root, "dotnet")
+    out = discover_all(model)
+    assert [r.route.path for r in out] == ["/x"]
+    assert out[0].style == "minimalapi" and out[0].route.methods == ["GET"]
+    assert any("too deeply nested" in u for u in out[0].unknown)
+    assert any("too deeply nested" in n and "Program.cs:3" in n for n in model.notes)
+
+
+def test_registration_without_literal_pattern_past_cap_is_noted(roslyn_helper, tmp_path):
+    root = _deep_app(tmp_path, 300, "app.UseCompanyThing()")
+    project._CACHE.clear()
+    project.prepare(root, False)
+    model = project.get_model(root, "dotnet")
+    assert discover_all(model) == []
+    assert any("too deeply nested" in n for n in model.notes)
+
+
+def test_long_chain_is_not_superlinear():
+    # Each link's kind is computed once per chain (it used to re-walk the links below it: cubic).
+    from checks.dnl import pipeline
+    from checks.dnl.ir import call_chain
+    expr = {"k": "name", "id": "app"}
+    for i in range(400):
+        expr = {"k": "call", "fn": {"k": "member", "obj": expr, "name": "WithTags" if i else "MapGet"}, "args": []}
+    root, calls = call_chain(expr)
+    seen: list[int] = []
+    orig = pipeline._call_kind_uncached
+    pipeline._call_kind_uncached = lambda *a: (seen.append(1), orig(*a))[1]
+    try:
+        memo: dict = {}
+        for c in calls:
+            pipeline._call_kind(c, root, calls, {}, memo)
+    finally:
+        pipeline._call_kind_uncached = orig
+    assert len(seen) == len(calls) == 400

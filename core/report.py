@@ -33,6 +33,9 @@ def print_console(results: list[ScanResult]) -> None:
         for route in result.routes:
             methods = ",".join(route.methods) or "?"
             auth = ",".join(route.auth_decorators) if route.auth_decorators else "-"
+            # An analyzer that could not resolve auth (ASP.NET Core) says so: "?" is not "unprotected".
+            if not route.auth_decorators and (route.meta.get("auth") or {}).get("state") == "unknown":
+                auth = "?"
             print(f"  [{methods}] {route.path} -> {route.handler_name}  ({route.file}:{route.line})  auth={auth}")
 
         if result.entry_points:

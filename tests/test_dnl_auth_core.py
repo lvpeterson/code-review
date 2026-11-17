@@ -696,3 +696,45 @@ def test_n4_trailing_untraced_call_on_followed_result_is_noted(roslyn_helper, tm
         'static RouteGroupBuilder Wrap(RouteGroupBuilder g) { g.MapGet("/y", () => 1); return g; }')})
     a = App(root)("/x/y")
     assert a.state == UNKNOWN and any("AllowPublic" in r for r in a.reasons)
+
+
+# -- final-review fixes ---------------------------------------------------------------------------
+
+def test_group_mapped_controllers_are_unknown(roslyn_helper, tmp_path):
+    # F2: the group's prefix and conventions are not applied to MapControllers, so never "definitely unprotected".
+    root = copy(CONTROLLERS, tmp_path, {"Program.cs": (
+        "app.MapControllers();", 'app.MapGroup("/api").RequireAuthorization().MapControllers();')})
+    a = App(root)("HealthController.Get")
+    assert a.state == UNKNOWN and any("route group" in r for r in a.reasons)
+
+
+def test_group_mapped_razor_pages_are_unknown(roslyn_helper, tmp_path):
+    root = copy(RAZOR, tmp_path, {"Program.cs": ("app.MapRazorPages();", 'app.MapGroup("/p").MapRazorPages();')})
+    app = App(root)
+    pages = [r for r in app.refs if r.style == "razorpage"]
+    assert pages and all(any("route group" in u for u in r.unknown) for r in pages)
+
+
+def test_hub_type_outside_solution_is_unknown(roslyn_helper, tmp_path):
+    # F4: [Authorize] on a hub type that is not in the solution cannot be read.
+    root = copy(MINIMAL, tmp_path, {"Program.cs": ("app.MapHub<ChatHub>(", "app.MapHub<ExternalHub>(")})
+    a = App(root)("/chat")
+    assert a.state == UNKNOWN and any("ExternalHub" in r and "not in solution" in r for r in a.reasons)
+
+
+def test_hub_type_in_solution_still_protected(minimal):
+    assert minimal("/chat").state == PROTECTED
+
+
+def test_non_constant_route_template_is_unknown(roslyn_helper, tmp_path):
+    # F6: a [Route] whose template is not a constant must not silently pass for an absent one.
+    ctl = ('using Microsoft.AspNetCore.Mvc;\nnamespace Shop.Controllers;\n'
+           'public class Tmpl { public static string Base = "x" + System.DateTime.Now; }\n'
+           '[Route(Tmpl.Base)]\npublic class DynController : ControllerBase\n{\n'
+           '    [HttpGet]\n    public IActionResult Get() => Ok();\n'
+           '    [HttpPost(Tmpl.Base)]\n    public IActionResult Post() => Ok();\n}\n')
+    root = copy(CONTROLLERS, tmp_path, extra={"Controllers/DynController.cs": ctl})
+    app = App(root)
+    for h in ("DynController.Get", "DynController.Post"):
+        a = app(h)
+        assert a.state == UNKNOWN and any("not a constant" in r for r in a.reasons), h

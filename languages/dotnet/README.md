@@ -78,3 +78,23 @@ findings can be less precise.
   not modelled.
 - Third-party extension registrations that are not in the known-harmless table
   make affected routes unknown by design.
+
+## Known limits
+
+- Unresolved attributes with neutral names are ignored (parked N5): only names that look like
+  authorize / anonymous attributes block a PROTECTED verdict.
+- Unresolved global extensions only affect routes without explicit endpoint auth (parked N6, spec
+  Decision 2): a route with its own `RequireAuthorization` stays protected.
+- `RequireAssertion` with a non-literal lambda is counted as a deny (it may in fact always succeed).
+- `MapGroup(...).MapControllers()` / `MapRazorPages()` / `MapControllerRoute()`: the group prefix and
+  conventions are not applied; the routes are reported REVIEW with a reason.
+- IR nesting cap: code nested deeper than the helper's JSON depth cap (for example a fluent chain of a
+  few hundred links) is not lowered. A model note says where, and a `MapGet`/`MapPost`/... call with a
+  literal pattern inside it is reported as a REVIEW route recovered from source text.
+- Blazor `.razor` components are not analyzed (only `MapRazorComponents` is listed as an endpoint).
+- Extension methods defined in another project are not followed; routes registered there are found by a
+  sweep and carry the "caller unknown" reason.
+- A `MapHub<T>` / `MapGrpcService<T>` whose type is not in the solution is REVIEW (its `[Authorize]`
+  cannot be read), as is a `[Route]` whose template is not a constant.
+- Behaviour change in dotnet_legacy (intended): modern C# lowering removes a false positive on a
+  constant-only `switch`.

@@ -244,3 +244,17 @@ def test_dotnet_only_target_without_helper_fails_preflight(monkeypatch):
     _degraded(monkeypatch)
     with pytest.raises(helper.PreflightError):
         enumerator.enumerate_target(MINIMAL)
+
+
+def test_detector_controller_attribute_lists_and_primary_constructors(tmp_path):
+    # F3: `[ApiController, Route(..)]` and `class T(ILogger<T> log) : ControllerBase` are controllers.
+    cases = ('[ApiController, Route("api/[controller]")]\npublic class A { }\n',
+             '[Route("x"), ApiController]\npublic class A { }\n',
+             'public class T(ILogger<T> log) : ControllerBase { }\n')
+    for i, src in enumerate(cases):
+        root = tmp_path / f"c{i}"
+        root.mkdir()
+        (root / "A.csproj").write_text('<Project Sdk="Microsoft.NET.Sdk.Web"><PropertyGroup>'
+                                       '<TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>')
+        (root / "A.cs").write_text("// Controller\n" + src)
+        assert "controllers" in core_detector.detect_frameworks(root), src
