@@ -163,3 +163,40 @@ def test_nested_app_directory_reports_repo_relative_path(tmp_path, mode):
              "Api/appsettings.json": _cs(REAL)}
     got = _sec(tmp_path / "w", files, mode)
     assert [(f.check_id, f.file, f.line) for f in got] == [("DNL-SEC-001", "Api/appsettings.json", 3)]
+
+
+def _conn(tmp_path, value, mode):
+    return _sec(tmp_path, {"appsettings.json": '{"ConnectionStrings": {"Default": %s}}' % __import__("json").dumps(value)}, mode)
+
+
+def test_quoted_and_braced_passwords_are_reported(tmp_path, mode):
+    for i, v in enumerate(['Server=a;Password="Zx9;kLm3pQ"', "Server=a;Password='Zx9;kLm3pQ'",
+                           "Server=a;Password={Zx9;kLm3pQ}", 'Server=a;Password="Zx9""kLm3pQ";Port=1',
+                           "Server=a;Password = Zx9kLm3pQ", "Server=a;PASSWORD=Zx9kLm3pQ",
+                           "Server=a; pwd =Zx9kLm3pQ", "Server=a;DBPassword=Zx9kLm3pQ"]):
+        got = _conn(tmp_path / str(i), v, mode)
+        assert {f.check_id for f in got} == {"DNL-SEC-001"}, v
+
+
+def test_quoted_placeholders_and_empty_are_clean(tmp_path, mode):
+    for i, v in enumerate(['Server=a;Password=""', 'Server=a;Password="${DbPassword}"', "Server=a;Password='$(Pw)'",
+                           "Server=a;Password=${DbPassword}", "Server=a;Password=$(Pw)", "Server=a;Password=#{Pw}#",
+                           "Server=a;Password=@Microsoft.KeyVault(SecretUri=https://v.example.test/secrets/k)",
+                           "Server=a;Password=secret://kv/db"]):
+        assert _conn(tmp_path / str(i), v, mode) == [], v
+
+
+def test_reference_prefix_with_secret_tail_is_reported(tmp_path, mode):
+    for i, v in enumerate(["Server=a;Pwd=vault:Real123x", "Server=a;Pwd=keyvault:Real123x",
+                           "Server=a;Password=@Microsoft.KeyVault(x)Real123x"]):
+        assert {f.check_id for f in _conn(tmp_path / str(i), v, mode)} == {"DNL-SEC-001"}, v
+
+
+def test_placeholder_with_literal_text_is_reported(tmp_path, mode):
+    for i, v in enumerate(["Server=a;Password=${A}real${B}", "Server=a;Password=$(A)real$(B)",
+                           "Server=a;Password=%A%real%B%", "Server=a;Password=pre#{A}#", "Server=a;Password=<a>real<b>"]):
+        assert {f.check_id for f in _conn(tmp_path / str(i), v, mode)} == {"DNL-SEC-001"}, v
+    text = '{"Jwt": {"Key": "${A}real${B}"}}'
+    assert {f.check_id for f in _sec(tmp_path / "k", {"appsettings.json": text}, mode)} == {"DNL-SEC-002"}
+    text = '{"Jwt": {"Key": "${JwtKey}"}, "A": {"Secret": "$(S)", "Token": "#{T}#", "ApiKey": "%K%"}}'
+    assert _sec(tmp_path / "j", {"appsettings.json": text}, mode) == []

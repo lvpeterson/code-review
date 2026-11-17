@@ -8,13 +8,23 @@ from __future__ import annotations
 
 import re
 
-from checks.dnl.auth_core import CONN_PW, PLACEHOLDER, SECRET_KEY, is_setting_key
+from checks.dnl.auth_core import SECRET_KEY, is_setting_key
 from checks.dnl.cfgctx import Ctx
 
-# Whole-value placeholders beyond auth_core's `$(X)` / `{X}` / `*` forms: `#{X}#`, `${X}`, `%X%`, `<set me>`.
-_TOKEN = re.compile(r"(?i)^(\#\{.*\}\#?|\$\{.*\}|\{\{.*\}\}|%[^%]+%|<[^>]*>)$")
-# Key Vault / user-secrets style references: the value lives elsewhere.
-_REFERENCE = re.compile(r"(?i)^(@microsoft\.keyvault\(|vault:|keyvault:|secret://)")
+# A placeholder is ONE token that is the entire value, with no literal text around it (`${A}real${B}`
+# is a real value): `$(X)`, `${X}`, `{X}`, `{{X}}`, `#{X}#`, `%X%`, `<...>`, `***`, `xxx`, `__X__`.
+_TOKEN = re.compile(r"(?i)^(\$\([^()\s]+\)|\$\{[^{}\s]+\}|\{[a-z_]\w*\}|\{\{[^{}]+\}\}|\#\{[^{}]+\}\#?"
+                    r"|%[^%\s]+%|<[^<>]+>|\*+|x+|__\w+__)$")
+# Key Vault / user-secrets style references: the value lives elsewhere. Only a COMPLETE reference counts;
+# a bare `vault:` / `keyvault:` prefix is a reference only as a whole setting value, or (inside a
+# connection string, where `vault:Real123x` could be a password) when a `/` path follows.
+_KV_FULL = re.compile(r"(?i)^@microsoft\.keyvault\([^()]+\)$")
+_BARE_REF = re.compile(r"(?i)^(vault:|keyvault:)[\w./\-]+$")
+_BARE_REF_PATH = re.compile(r"(?i)^(vault:|keyvault:)[\w.\-]*/[\w./\-]*$")
+_SECRET_URI = re.compile(r"(?i)^secret://[\w./\-]+$")
+# `Password=` / `Pwd=` part of an ADO.NET connection string; a prefix such as `DB` is accepted (an
+# app-defined keyword), the value is read by _conn_value.
+_PW_KEYWORD = re.compile(r"(?i)(?:^|[;\s])\w*(?:password|pwd)\s*=\s*")
 # Words a developer leaves in a local file; `changeme` is only ignored under the Development rule.
 _WEAK = {"password", "pass", "passwd", "pwd", "secret", "test", "testing", "dev", "development", "local",
          "localhost", "example", "sample", "demo", "changeme", "change-me", "change_me", "admin", "root",
@@ -25,9 +35,13 @@ _KEY_SECRET = re.compile(r"(?i)(signing|secret|encryption|symmetric|master|acces
 _JWT_PATH = re.compile(r"(?i)jwt|signing|bearer|token")
 
 
-def _placeholder(v: str) -> bool:
+def _placeholder(v: str, whole: bool = True) -> bool:
+    """True for an empty value, a lone placeholder token or a complete reference. `whole` is False for the
+    password part of a connection string, where only path-shaped bare references count."""
     v = v.strip()
-    return bool(PLACEHOLDER.match(v) or _TOKEN.match(v) or _REFERENCE.match(v))
+    if not v or _TOKEN.match(v) or _KV_FULL.match(v) or _SECRET_URI.match(v):
+        return True
+    return bool((_BARE_REF if whole else _BARE_REF_PATH).match(v))
 
 
 def _looks_real(v: str) -> bool:
@@ -63,12 +77,42 @@ def _is_secret_key(segs: list[str]) -> bool:
     return last.lower() == "key" and any(_JWT_PATH.search(s) for s in segs[:-1])
 
 
+def _conn_value(text: str, i: int) -> str:
+    """The value starting at text[i]: `"..."` / `'...'` (a doubled quote is a literal quote) read to the closing
+    quote, `{...}` kept with its braces, else up to the next `;`."""
+    if i < len(text) and text[i] in "\"'":
+        q, out, j = text[i], [], i + 1
+        while j < len(text):
+            if text[j] == q:
+                if text[j + 1:j + 2] == q:
+                    out.append(q)
+                    j += 2
+                    continue
+                break
+            out.append(text[j])
+            j += 1
+        return "".join(out)
+    if i < len(text) and text[i] == "{":
+        j = i + 1
+        while j < len(text):
+            if text[j] == "}":
+                if text[j + 1:j + 2] == "}":
+                    j += 2
+                    continue
+                return text[i:j + 1]
+            j += 1
+        return text[i:]
+    j = text.find(";", i)
+    return text[i:] if j < 0 else text[i:j]
+
+
 def _conn_password(value: str) -> str | None:
     """The first real password value of a connection string, or None when it has none (Integrated
-    Security, a placeholder, an empty value)."""
-    for m in CONN_PW.finditer(value):
-        pw = m.group(2).strip()
-        if pw and not _placeholder(pw):
+    Security, a placeholder, an empty value). The shared CONN_PW cannot read a quoted value that holds a
+    `;`, so the parts are read here."""
+    for m in _PW_KEYWORD.finditer(value):
+        pw = _conn_value(value, m.end()).strip()
+        if pw and not _placeholder(pw, whole=False):
             return pw
     return None
 
