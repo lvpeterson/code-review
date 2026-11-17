@@ -1,6 +1,6 @@
 """Analyzer registrations for the ASP.NET Core (modern .NET) package.
 
-Four analyzers share one ProjectModel view (the `dotnet` projects of the scan, prepared once by the
+Five analyzers share one ProjectModel view (the `dotnet` projects of the scan, prepared once by the
 enumerator so the Roslyn helper runs once for both .NET packages): controllers, razorpages and
 minimalapi split the routes and auth findings by route kind, config reports the route-less findings
 (never-denying handlers / policies / filters, middleware order). Route discovery and auth resolution
@@ -12,7 +12,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from checks.dnl import project, routes_core, rules_auth_core, rules_object, rules_taint, rules_xss
+from checks.dnl import (project, routes_core, rules_auth_core, rules_crypto, rules_deser_xml, rules_errors,
+                        rules_integrity, rules_misc, rules_object, rules_sca_core, rules_session, rules_taint,
+                        rules_xss)
 from checks.dnl.project import ProjectModel
 from core.base import BaseFrameworkAnalyzer
 from core.models import Finding, Route, ScanResult
@@ -20,6 +22,10 @@ from core.registry import register
 from languages.dotnet import detector
 
 _KINDS = ("controllers", "razorpages", "minimalapi", "config")
+# Must match the rules_taint wiring in _code_results (rules_deser_xml leaves DESER-001 / XXE-001 on
+# tainted lines to rules_taint; a mismatch loses or doubles them). Core runs rules_taint, so True.
+CORE_RUNS_TAINT = True
+_ROUTELESS = ("config", "deps")   # analyzers that never take routes or route-less code findings
 # route.meta["kind"] -> analyzer
 _KIND_OWNER = {"controller": "controllers", "razorpage": "razorpages", "minimalapi": "minimalapi",
                "hub": "minimalapi", "grpc": "minimalapi", "blazor": "minimalapi", "health": "minimalapi",
@@ -64,6 +70,18 @@ def _code_results(model: ProjectModel) -> dict[str, tuple[list[Route], list[Find
     findings += guarded("rules_taint", lambda: rules_taint.check(model, refs))
     findings += guarded("rules_xss", lambda: rules_xss.check(model, refs))
     findings += guarded("rules_object", lambda: rules_object.check(model, refs))
+    findings += guarded("rules_crypto", lambda: rules_crypto.check(model, refs))
+    findings += guarded("rules_deser_xml", lambda: rules_deser_xml.check(model, refs, taint_reports=CORE_RUNS_TAINT))
+    findings += guarded("rules_integrity", lambda: rules_integrity.check(model, refs))
+    findings += guarded("rules_session", lambda: rules_session.check(model, refs))
+    findings += guarded("rules_errors", lambda: rules_errors.check(model, refs))
+
+    def run_misc():
+        # Web.config checks stay legacy-only: no configs are loaded for SDK projects.
+        found, notes = rules_misc.check(model, refs, ())
+        model.notes.extend(n for n in notes if n not in model.notes)
+        return found
+    findings += guarded("rules_misc", run_misc)
     running = _running(model)
 
     def owner_of(kind: str) -> str:
@@ -72,10 +90,11 @@ def _code_results(model: ProjectModel) -> dict[str, tuple[list[Route], list[Find
         want = _KIND_OWNER.get(kind, "minimalapi")
         if want in running or not running:
             return want
-        return next((k for k in running if k != "config"), "config")
+        return next((k for k in running if k not in _ROUTELESS), "config")
 
     # Route-less findings go to config; without it, the first analyzer that runs takes them.
-    fallback = "config" if "config" in running or not running else running[0]
+    fallback = "config" if "config" in running or not running else next(
+        (k for k in running if k not in _ROUTELESS), "config")
     for ref in refs:
         out[owner_of(ref.route.meta["kind"])][0].append(ref.route)
     for f in findings:
@@ -132,3 +151,30 @@ class MinimalApiAnalyzer(_CoreAnalyzer):
 class ConfigAnalyzer(_CoreAnalyzer):
     """Route-less findings; also takes routes when no route analyzer runs."""
     framework = "config"
+
+
+@register("dotnet", "deps")
+class DepsAnalyzer(_CoreAnalyzer):
+    """Offline SCA for SDK projects (PackageReference, lock file, end-of-support frameworks, wwwroot
+    libraries); needs no IR, so it also runs in degraded mode. Has no routes."""
+    framework = "deps"
+
+    def __init__(self, target_path: Path):
+        super().__init__(target_path)
+        self._notes: list[str] = []
+
+    def find_routes(self) -> list[Route]:
+        return []
+
+    def run_baseline_checks(self, routes_: list[Route]) -> list[Finding]:
+        try:
+            findings, self._notes = rules_sca_core.check(self.model)
+        except Exception as exc:  # noqa: BLE001
+            self._notes = [f"rules_sca_core failed ({type(exc).__name__}: {exc}); its findings are missing"]
+            return []
+        return findings
+
+    def analyze(self) -> ScanResult:
+        result = super().analyze()
+        result.notes += self._notes
+        return result

@@ -212,7 +212,7 @@ def test_core_project_side_files_never_reach_legacy(roslyn_helper, tmp_path):
     root = tmp_path / "sol"
     shutil.copytree(FX, root)
     modern = root / "Modern"
-    (modern / "wwwroot" / "lib").mkdir(parents=True)
+    (modern / "wwwroot" / "lib").mkdir(parents=True, exist_ok=True)
     (modern / "Views").mkdir()
     (modern / "web.config").write_text(
         '<configuration><system.web><compilation debug="true" />'

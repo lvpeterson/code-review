@@ -84,7 +84,8 @@ OWASP mapping under "OWASP coverage"):
   reaching sinks (CONSUME-001..002).
 - **Components / SCA** -- vulnerable NuGet packages and bundled JavaScript
   from the offline advisory set, end-of-support framework, unmanaged
-  binaries, `http://` NuGet sources (SCA-001..005).
+  binaries, `http://` NuGet sources (SCA-001..005). ASP.NET Core SDK projects run the same
+  rules through `checks/dnl/rules_sca_core.py` (plus SCA-006).
 
 ### Proven vs REVIEW
 
@@ -368,7 +369,7 @@ either mode.
 |---|---|---|---|
 | 2025 | A01 | Broken Access Control | DNL-AUTHZ-001, DNL-AUTHZ-002, DNL-AUTHZ-003, DNL-AUTHZ-004, DNL-AUTHZ-005, DNL-AUTHZ-008, DNL-CSRF-001, DNL-PATH-001, DNL-REDIR-001, DNL-SSRF-001 |
 | 2025 | A02 | Security Misconfiguration | DNL-CFG-001, DNL-CFG-002, DNL-CFG-003, DNL-CFG-004, DNL-CFG-005, DNL-CFG-006, DNL-CFG-007, DNL-INV-001, DNL-INV-002, DNL-WCF-001, DNL-WCF-002, DNL-WCF-003, DNL-XXE-001, DNL-XXE-002 |
-| 2025 | A03 | Software Supply Chain Failures | DNL-SCA-001, DNL-SCA-002, DNL-SCA-003, DNL-SCA-004, DNL-SCA-005 |
+| 2025 | A03 | Software Supply Chain Failures | DNL-SCA-001, DNL-SCA-002, DNL-SCA-003, DNL-SCA-004, DNL-SCA-005, DNL-SCA-006 |
 | 2025 | A04 | Cryptographic Failures | DNL-CRY-001, DNL-CRY-002, DNL-CRY-003, DNL-CRY-004, DNL-CRY-005, DNL-CRY-007, DNL-CRY-008, DNL-SESS-005 |
 | 2025 | A05 | Injection | DNL-INJ-001, DNL-INJ-002, DNL-INJ-003, DNL-INJ-004, DNL-INJ-005, DNL-INJ-006, DNL-XSS-001, DNL-XSS-002, DNL-XSS-003, DNL-XSS-004 |
 | 2025 | A06 | Insecure Design | DNL-AUTHZ-006, DNL-AUTHZ-007, DNL-DES-001, DNL-RES-001, DNL-RES-002, DNL-RES-003, DNL-WCF-004 |
@@ -381,7 +382,7 @@ either mode.
 | 2021 | A03 | Injection | DNL-INJ-001, DNL-INJ-002, DNL-INJ-003, DNL-INJ-004, DNL-INJ-005, DNL-INJ-006, DNL-XSS-001, DNL-XSS-002, DNL-XSS-003, DNL-XSS-004 |
 | 2021 | A04 | Insecure Design | DNL-AUTHZ-006, DNL-AUTHZ-007, DNL-DES-001, DNL-ERR-001, DNL-ERR-003, DNL-RES-001, DNL-RES-002, DNL-RES-003, DNL-WCF-004 |
 | 2021 | A05 | Security Misconfiguration | DNL-CFG-001, DNL-CFG-002, DNL-CFG-003, DNL-CFG-004, DNL-CFG-005, DNL-CFG-006, DNL-CFG-007, DNL-ERR-002, DNL-INV-001, DNL-INV-002, DNL-WCF-001, DNL-WCF-002, DNL-WCF-003, DNL-XXE-001, DNL-XXE-002 |
-| 2021 | A06 | Vulnerable and Outdated Components | DNL-SCA-001, DNL-SCA-002, DNL-SCA-003, DNL-SCA-004 |
+| 2021 | A06 | Vulnerable and Outdated Components | DNL-SCA-001, DNL-SCA-002, DNL-SCA-003, DNL-SCA-004, DNL-SCA-006 |
 | 2021 | A07 | Identification and Authentication Failures | DNL-SEC-001, DNL-SEC-002, DNL-SEC-003, DNL-SESS-001, DNL-SESS-002, DNL-SESS-003, DNL-SESS-004, DNL-SESS-006, DNL-SESS-007, DNL-SESS-008 |
 | 2021 | A08 | Software and Data Integrity Failures | DNL-CONSUME-001, DNL-CONSUME-002, DNL-CRY-006, DNL-DESER-001, DNL-DESER-002, DNL-DESER-003, DNL-INT-001, DNL-INT-002, DNL-INT-003, DNL-INT-004, DNL-SCA-005 |
 | 2021 | A09 | Security Logging and Monitoring Failures | DNL-LOG-001, DNL-LOG-002, DNL-LOG-003, DNL-LOG-004 |
@@ -482,11 +483,12 @@ DNL-INV-001, which always carries it.
 | DNL-INV-002 | low | Web API HelpPage area (its `HelpController`, or `HelpPageAreaRegistration`) reachable without auth (an authorize attribute, global authorize filter or web.config rule covers it otherwise); Swagger UI / document endpoints (`EnableSwagger`, `EnableSwaggerUi`, `UseSwagger*`) unless web.config denies anonymous users for `swagger` (a global authorize filter does not cover the Swagger handler); controllers named `*Test*Controller`, `Debug*Controller` or `Diagnostics*Controller` in non-test projects (project name not ending in test / tests, no test framework reference) | A02:2025 | A05:2021 | API9:2023 |
 | DNL-CONSUME-001 | low | (REVIEW) Outbound call to a hard-coded `http://` URL: `HttpClient` / `WebClient` / `RestClient` / `WebRequest.Create` URL or base address, `new Uri(..)`, resolved through locals, const / static readonly fields and properties, concatenation, interpolation and `String.Format`; plus `<system.serviceModel><client><endpoint address="http://...">` in web.config. `localhost`, `127.0.0.1` and `[::1]` are skipped as development endpoints | A08:2025 | A08:2021 | API10:2023 |
 | DNL-CONSUME-002 | low | (REVIEW) An outbound response body (`ReadAsAsync<T>`, `ReadAsStringAsync`, `WebClient.DownloadString`, `GetStringAsync`, RestSharp `Execute`), deserialized (`JsonConvert.DeserializeObject`, `JObject.Parse`) or used raw, reaching a SQL / dynamic LINQ / command / LDAP / XPath / path / redirect sink. Uses the taint source kind `external`, which the request-source rules (INJ, XSS, PATH, REDIR ...) never see | A08:2025 | A08:2021 | API10:2023 |
-| DNL-SCA-001 | high/medium/low | (Severity from the advisory.) NuGet package (`packages.config`, or a `packages\<Id>.<Version>\` HintPath with no `packages.config` entry) inside a known-vulnerable range from the offline advisory data | A03:2025 | A06:2021 | -- |
+| DNL-SCA-001 | high/medium/low | (Severity from the advisory.) NuGet package (`packages.config`; an SDK-style / ASP.NET Core `PackageReference` or central `Directory.Packages.props` version, or a `packages.lock.json` resolved version, transitive entries included; or a `packages\<Id>.<Version>\` HintPath with no `packages.config` entry) inside a known-vulnerable range from the offline advisory data | A03:2025 | A06:2021 | -- |
 | DNL-SCA-002 | high/medium/low | (Severity from the advisory.) Bundled JS library (`Scripts` / `Content` / `lib` banners: jQuery, jQuery UI, jQuery Validation, Bootstrap, Moment, Knockout, AngularJS, Handlebars, Lodash) inside a known-vulnerable range | A03:2025 | A06:2021 | -- |
-| DNL-SCA-003 | medium | Target framework before v4.6.2 (end of support) | A03:2025 | A06:2021 | API9:2023 |
+| DNL-SCA-003 | medium | Target framework before v4.6.2 (end of support); on ASP.NET Core, a `netcoreapp*` / `net5.0`+ target framework past its Microsoft end-of-support date (dated table in the advisory data file) | A03:2025 | A06:2021 | API9:2023 |
 | DNL-SCA-004 | low | (REVIEW) DLL referenced from a `packages` or library folder with no matching `packages.config` entry and no version in the path (unmanaged binary dependency) | A03:2025 | A06:2021 | -- |
 | DNL-SCA-005 | medium | `nuget.config` package source over `http://` (loopback hosts exempt) | A03:2025 | A08:2021 | -- |
+| DNL-SCA-006 | low | (REVIEW) ASP.NET Core `PackageReference` whose version cannot be resolved (floating `1.*`, MSBuild property `$(X)`, no `Version` and no central entry, unparsable range), so it cannot be matched against advisories | A03:2025 | A06:2021 | -- |
 
 `tests/test_dnl_end_to_end.py` fails if a rule in `core/owasp_web.RULES` is
 missing here or its tags drift.
@@ -498,7 +500,9 @@ set (`nuget`: by package id, case-insensitive; `js`: by library name matched
 from the banner comment in the first 4 KB of the file). Every entry carries a
 GHSA / CVE id, the advisory URL, the affected range copied from the advisory,
 a severity (GitHub's rating; "critical" is recorded as `high`) and the
-advisory title. Ranges use space separated comparators (`>=5.0 <5.5.12`,
+advisory title. The file also carries `eol` / `eol_as_of`: the dated Microsoft end-of-support table for
+.NET Core / .NET target frameworks (copied from the .NET support policy page, source URL per row), read by the
+ASP.NET Core SCA rules only. Ranges use space separated comparators (`>=5.0 <5.5.12`,
 ANDed) and `||` for alternatives; NuGet / SemVer ordering applies, including
 prerelease versions and 4-part versions.
 

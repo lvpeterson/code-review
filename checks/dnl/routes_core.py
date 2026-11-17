@@ -1372,6 +1372,8 @@ class _Scan:
         path = strip_constraints(_join(*prefixes, pattern))
         if env_pc is not None and env_pc.runs_in("Production") is not True and env_pc.env:
             meta["env"] = env_pc.env
+            if env_pc.runs_in("Production") is False:
+                meta["dev_only"] = True
         route = Route(path=path, methods=methods, handler_name=handler or name, file=file, line=line,
                       source_file=src_file, source_start_line=start, source_end_line=end, meta=meta)
         ref = CoreRouteRef(route, htype, hmeth, self.proj, style=style, caller_unknown=not fr.reached, unknown=notes)
@@ -1393,6 +1395,8 @@ class _Scan:
             meta: dict = {"kind": "openapi", "api_surface": False, "middleware": True}
             if env:
                 meta["env"] = env
+            if env_pc is not None and env_pc.runs_in("Production") is False:
+                meta["dev_only"] = True     # definitely not Production (an unparseable guard is not)
             route = Route(path=path, methods=["GET"], handler_name=name, file=pc.file if pc is not None else fr.type.file,
                           line=line, source_start_line=line, source_end_line=line, meta=meta)
             self.entries.append(_Entry(CoreRouteRef(route, None, None, self.proj, style="endpoint",

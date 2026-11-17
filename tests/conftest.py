@@ -31,3 +31,14 @@ def roslyn_helper() -> str:
     binary = ROSLYN_BIN_DIR / name
     assert binary.exists(), f"publish did not produce {binary}"
     return str(binary)
+
+
+@pytest.fixture
+def pinned_today(monkeypatch):
+    """Pin the run date of the ASP.NET Core SCA (end-of-support comparison) so the tests that depend on
+    which target frameworks are past end of support do not shift as the calendar moves."""
+    import datetime
+    from checks.dnl import rules_sca_core
+    day = datetime.date(2026, 11, 16)
+    monkeypatch.setattr(rules_sca_core, "_today", lambda: day)
+    return day

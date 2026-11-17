@@ -14,6 +14,7 @@ online, authoritative path stays `--sca` (osv-scanner, checks/sca.py).
 """
 from __future__ import annotations
 
+import datetime
 import json
 import re
 from functools import lru_cache
@@ -134,6 +135,35 @@ def _load(path: Path) -> tuple[dict, str | None, int]:
 
 def _advisories() -> dict:
     return _load(_DATA)[0]
+
+
+@lru_cache(maxsize=None)
+def _load_eol(path: Path) -> tuple[str | None, tuple[dict, ...]]:
+    """(eol_as_of, rows) of the end-of-support table beside the advisories (read by the
+    ASP.NET Core rules only; `_load` ignores these keys). Rows with a bad date, an empty
+    framework or a non-https source are dropped; a missing or malformed file gives (None, ())."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        as_of = data.get("eol_as_of")
+        datetime.date.fromisoformat(as_of)
+        rows = []
+        for r in data.get("eol", []):
+            try:
+                datetime.date.fromisoformat(r["eol"])
+                if isinstance(r["tfm"], str) and r["tfm"].strip() and str(r["source"]).startswith("https://"):
+                    rows.append({"tfm": r["tfm"].strip().lower(), "eol": r["eol"], "source": r["source"]})
+            except (KeyError, TypeError, ValueError):
+                continue
+        return as_of, tuple(rows)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None, ()
+
+
+def eol_table(path: Path = _DATA) -> tuple[str | None, list[dict]]:
+    """Public: (eol_as_of ISO date or None, [{"tfm", "eol", "source"}]) with lower-cased
+    framework monikers; see `_load_eol`."""
+    as_of, rows = _load_eol(path)
+    return as_of, list(rows)
 
 
 def _match(entries: list[dict], version: str) -> list[dict]:
