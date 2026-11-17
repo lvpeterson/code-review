@@ -4,8 +4,10 @@ never hides the others. Later tasks add their group to _GROUPS.
 """
 from __future__ import annotations
 
+import re
+
 from checks.dnl.cfgctx import Ctx, build_ctx
-from checks.dnl.ir import call_name, receiver_text, walk
+from checks.dnl.ir import call_name, const_str, literal_str, receiver_text, walk
 from checks.dnl.options import const, opt, options_of
 from checks.dnl.pipeline import PipeCall, Pipeline
 from checks.dnl.project import ProjectModel
@@ -210,6 +212,15 @@ def _web_pipeline(pipe: Pipeline) -> bool:
     return any(c.kind in ("app", "endpoints") and c.name not in ("Build", "Run", "RunAsync") for c in pipe.calls)
 
 
+def _first_site(pipe: Pipeline) -> tuple[str, int]:
+    """(file, line) to anchor a finding about the pipeline as a whole: its first middleware or endpoint
+    call, else the entry method it was built from."""
+    first = next((c for c in pipe.calls if c.kind in ("app", "endpoints")), None)
+    if first is not None:
+        return first.file, first.line
+    return (pipe.entries[0][0].file, pipe.entries[0][1].line) if pipe.entries else ("", 0)
+
+
 def _missing_handler(ctx: Ctx, pipe: Pipeline, add) -> None:
     if pipe.style == "none" or not _web_pipeline(pipe):
         return
@@ -217,11 +228,7 @@ def _missing_handler(ctx: Ctx, pipe: Pipeline, add) -> None:
         return
     if pipe.named("UseDeveloperExceptionPage"):
         return  # a developer page that certainly runs is the handler; DNL-CFG-008 reports it
-    first = next((c for c in pipe.calls if c.kind in ("app", "endpoints")), None)
-    if first is not None:
-        file, line = first.file, first.line
-    else:
-        file, line = (pipe.entries[0][0].file, pipe.entries[0][1].line) if pipe.entries else ("", 0)
+    file, line = _first_site(pipe)
     _conf, note = ctx.absent_confidence(pipe)
     desc = ("The Production pipeline has no UseExceptionHandler, UseStatusCodePages* or problem-details "
             "handler, so an unhandled exception gives a bare 500 response. A reverse proxy, a global exception "
@@ -262,8 +269,207 @@ def _errors(ctx: Ctx) -> None:
         _handler_leaks(ctx, pipe, add)
 
 
+# -- transport (DNL-CFG-010, DNL-CFG-011, DNL-CFG-013, DNL-CFG-014) -------------------------------------
+
+_HSTS_HEADER = "strict-transport-security"
+_LISTEN_CALLS = ("Listen", "ListenAnyIP", "ListenLocalhost")
+_HTTPS_CALLS = ("UseHttps", "ConfigureHttpsDefaults")
+_LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "[::1]")
+_PROXY_NOTE = " A TLS-terminating reverse proxy or load balancer in front of the app may provide this; confirm it."
+
+
+def _has_string(node, wanted: str) -> bool:
+    """True when a string literal equal to `wanted` (ignoring case) sits anywhere inside the node."""
+    return any((literal_str(n) or "").strip().lower() == wanted for n in walk(node))
+
+
+def _sets_hsts_header(pipe: Pipeline) -> bool:
+    """A Strict-Transport-Security header literal in a call that certainly runs in Production: an inline
+    `app.Use(...)` writing `Headers["Strict-Transport-Security"]` or `Headers.Append(...)`."""
+    return any(_has_string(c.node, _HSTS_HEADER) for c in pipe.named())
+
+
+def _redirects_to_https(pipe: Pipeline) -> bool:
+    """UseHttpsRedirection, or its older equivalents: a rewrite rule `AddRedirectToHttps*` or a
+    `RequireHttpsAttribute` filter, in a call that certainly runs in Production."""
+    if pipe.named("UseHttpsRedirection"):
+        return True
+    for c in pipe.named():
+        for n in walk(c.node):
+            if (call_name(n) or "").startswith("AddRedirectToHttps"):
+                return True
+            if n.get("k") == "new" and (n.get("type") or "").split(".")[-1].startswith("RequireHttps"):
+                return True
+    return False
+
+
+def _middleware_names(ctx: Ctx, pipe: Pipeline) -> list[str]:
+    """`UseMiddleware<T>()` calls (certain or under an unparsed guard): a custom middleware can write any
+    header, and its body is not read here."""
+    out = []
+    for c, _conf in _certain_and_uncertain(ctx, pipe, "UseMiddleware"):
+        fn = c.node.get("fn") if isinstance(c.node.get("fn"), dict) else {}
+        targs = [str(t) for t in fn.get("targs") or []]
+        out.append(f"{', '.join(targs) or 'UseMiddleware'} at {c.file}:{c.line}")
+    return out
+
+
+def _https_redirection_and_hsts(ctx: Ctx, pipe: Pipeline, add) -> None:
+    if pipe.style == "none" or not _web_pipeline(pipe):
+        return
+    file, line = _first_site(pipe)
+    conf, note = ctx.absent_confidence(pipe)
+    tail = f" Pipeline notes: {note}." if note else ""
+    if not _redirects_to_https(pipe):
+        add("DNL-CFG-010", "low", "No HTTPS redirection in the Production pipeline",
+            "The Production pipeline never calls UseHttpsRedirection, so plain-HTTP requests are served "
+            "instead of being sent to HTTPS." + _PROXY_NOTE + tail, file, line, conf)
+    if not pipe.named("UseHsts") and not _sets_hsts_header(pipe):
+        hsts_conf, hsts_tail = conf, tail
+        mw = _middleware_names(ctx, pipe)
+        if mw:
+            hsts_conf = "REVIEW"
+            hsts_tail += f" Custom middleware ({'; '.join(mw)}) could set the header; its body was not read."
+        add("DNL-CFG-011", "low", "No HSTS in the Production pipeline",
+            "The Production pipeline never calls UseHsts and sets no Strict-Transport-Security header "
+            "(AddHsts alone only configures the options), so browsers are not told to insist on HTTPS."
+            + _PROXY_NOTE + hsts_tail, file, line, hsts_conf)
+
+
+def _url_parts(text: str) -> tuple[str, str] | None:
+    """(scheme, host) of an http(s) URL, lower-cased; None for anything else (a unix socket, a bare port)."""
+    m = re.match(r"^\s*(https?)://(\[[^\]]*\]|[^:/\s]*)", text, re.I)
+    return (m.group(1).lower(), m.group(2).lower()) if m else None
+
+
+def _url_sites(text: str) -> tuple[bool, bool]:
+    """(has an https URL, has a non-loopback http URL) for a `;`-separated URL list."""
+    https = http = False
+    for part in text.split(";"):
+        u = _url_parts(part)
+        if u is None:
+            continue
+        if u[0] == "https":
+            https = True
+        elif u[1] not in _LOOPBACK_HOSTS:
+            http = True
+    return https, http
+
+
+def _kestrel_code(pipe: Pipeline) -> tuple[bool, bool, list[tuple[str, int, str | None]]]:
+    """(https present, something unreadable, [(file, line, confidence)] of HTTP-only listeners) from
+    ConfigureKestrel / UseKestrel option lambdas and UseUrls calls that can run in Production."""
+    https = unreadable = False
+    sites: list[tuple[str, int, str | None]] = []
+    seen: set = set()
+    for c in pipe.calls:
+        run = c.runs_in("Production")
+        if run is False:
+            continue
+        conf = None if run else "REVIEW"
+        for n in walk(c.node):
+            if n.get("k") != "call" or id(n) in seen:
+                continue
+            seen.add(id(n))
+            name = call_name(n)
+            line = n.get("line") or c.line
+            args = list(n.get("args") or []) + list((n.get("named") or {}).values())
+            if name in ("ConfigureKestrel", "UseKestrel"):
+                lams = [a for a in args if isinstance(a, dict) and a.get("k") == "lambda"]
+                if args and not lams:
+                    unreadable = True      # a method group or options object: its listeners are not read
+                for lam in lams:
+                    inner = [x for x in walk(lam) if x.get("k") == "call"]
+                    if any(call_name(x) in _HTTPS_CALLS for x in inner):
+                        https = True
+                        continue
+                    listens = [x for x in inner if call_name(x) in _LISTEN_CALLS]
+                    if listens:
+                        sites.append((c.file, listens[0].get("line") or line, conf))
+            elif name == "UseUrls":
+                for a in args:
+                    text = const_str(a)
+                    if text is None:
+                        unreadable = True
+                        continue
+                    h, p = _url_sites(text)
+                    https = https or h
+                    if p:
+                        sites.append((c.file, line, conf))
+    return https, unreadable, sites
+
+
+def _kestrel_settings(ctx: Ctx, pipe: Pipeline) -> tuple[bool, list]:
+    """(https present, [Entry] of non-loopback http URLs) in the Production `Urls` and
+    `Kestrel:Endpoints:*:Url` settings of the pipeline's project."""
+    scope = _scope_of(ctx, pipe)
+    if scope is None:
+        return False, []
+    https = False
+    bad = []
+    for key, e in ctx.settings.effective("Production", scope).items():
+        parts = key.split(":")
+        # A certificate configured for an endpoint, or a default certificate, means TLS is served.
+        if ((len(parts) >= 4 and parts[:2] == ["kestrel", "endpoints"] and parts[3] == "certificate")
+                or parts[:2] == ["kestrel", "certificates"]):
+            https = True
+        is_url = key == "urls" or (len(parts) == 4 and parts[:2] == ["kestrel", "endpoints"] and parts[3] == "url")
+        if is_url and isinstance(e.value, str):
+            h, p = _url_sites(e.value)
+            https = https or h
+            if p:
+                bad.append(e)
+    return https, bad
+
+
+def _http_only(ctx: Ctx, pipe: Pipeline, add) -> None:
+    code_https, unreadable, sites = _kestrel_code(pipe)
+    cfg_https, bad = _kestrel_settings(ctx, pipe)
+    if code_https or cfg_https:
+        return
+    desc = ("The app listens on plain HTTP only: no HTTPS endpoint is configured in code or in the Production "
+            "settings, so traffic and cookies cross the network unencrypted." + _PROXY_NOTE)
+    if unreadable:
+        desc += " Some listener configuration is not a compile-time value, so an HTTPS endpoint may exist; confirm it."
+    for file, line, conf in sites:
+        add("DNL-CFG-013", "low", "Listens on HTTP only", desc, file, line, "REVIEW" if unreadable else conf)
+    for e in bad:
+        add("DNL-CFG-013", "low", "Listens on HTTP only", desc + f" Setting {e.key} is {e.value!r}.",
+            e.file, e.line, "REVIEW" if unreadable else None)
+
+
+def _allowed_hosts(ctx: Ctx, pipe: Pipeline, add) -> None:
+    scope = _scope_of(ctx, pipe)
+    if scope is None:
+        return
+    e = ctx.settings.effective("Production", scope).get("allowedhosts")
+    if e is None or not isinstance(e.value, str):
+        return
+    if any(seg.strip() == "*" for seg in e.value.split(";")):
+        add("DNL-CFG-014", "low", "AllowedHosts accepts any host",
+            f"AllowedHosts is {e.value!r} in the Production configuration, so host filtering is off and the "
+            "app answers requests for any Host header (host header injection, cache poisoning). List the "
+            "real host names; a gateway that already validates the Host header may make this acceptable.",
+            e.file, e.line, None)
+
+
+def _transport(ctx: Ctx) -> None:
+    seen: set = set()
+
+    def add(cid, sev, title, desc, file, line, conf):
+        key = (cid, file, line, conf)
+        if key not in seen:
+            seen.add(key)
+            ctx.add(cid, sev, title, desc, file, line, confidence=conf)
+
+    for pipe in ctx.pipes:
+        _https_redirection_and_hsts(ctx, pipe, add)
+        _http_only(ctx, pipe, add)
+        _allowed_hosts(ctx, pipe, add)
+
+
 # (name, fn(ctx)) in run order; each fn appends to ctx.out.
-_GROUPS: list = [("errors", _errors)]
+_GROUPS: list = [("errors", _errors), ("transport", _transport)]
 
 
 def check(model: ProjectModel, refs: list[CoreRouteRef]) -> list[Finding]:

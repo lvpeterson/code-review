@@ -67,6 +67,7 @@ def _add(ids, c25, c21, api, mode="api_surface"):
 
 _add([f"DNL-CFG-00{n}" for n in range(1, 8)], "A02", "A05", "API8")
 _add(["DNL-CFG-008", "DNL-CFG-009"], "A02", "A05", "API8")
+_add(["DNL-CFG-010", "DNL-CFG-011", "DNL-CFG-013", "DNL-CFG-014"], "A02", "A05", "API8")
 _add(["DNL-XSS-002"], "A05", "A03", None)
 _add([f"DNL-SESS-00{n}" for n in range(1, 5)], "A07", "A07", "API2")
 _add(["DNL-SESS-005"], "A04", "A02", "API2")
