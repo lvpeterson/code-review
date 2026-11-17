@@ -487,3 +487,43 @@ def test_https_listener_unguarded_clears(tmp_path, mode):
 def test_https_listener_in_development_only_does_not_clear(tmp_path, mode):
     services = HTTP_ONLY + "\nif (builder.Environment.IsDevelopment()) { " + HTTPS_LISTENER + " }"
     assert ("DNL-CFG-013", "low", None) in ids(_scan(tmp_path, mode, "app.UseRouting();", services=services))
+
+
+# -- guards inside lambda bodies (Task 4b) -------------------------------------------------------------
+
+def test_https_listener_under_in_lambda_development_guard_is_review(tmp_path, mode):
+    services = ("builder.WebHost.ConfigureKestrel(o => { if (builder.Environment.IsDevelopment()) "
+                "o.ListenAnyIP(8443, l => l.UseHttps()); o.ListenAnyIP(8080); });")
+    assert ("DNL-CFG-013", "low", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseRouting();", services=services))
+
+
+def test_https_listener_under_in_lambda_flag_is_review(tmp_path, mode):
+    services = ("builder.WebHost.ConfigureKestrel(o => { o.ListenAnyIP(8080); "
+                "if (Flags.Tls()) { o.ListenAnyIP(8443, l => l.UseHttps()); } });")
+    assert ("DNL-CFG-013", "low", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseRouting();", services=services))
+
+
+def test_unconditional_https_listener_in_lambda_still_clears(tmp_path, mode):
+    services = "builder.WebHost.ConfigureKestrel(o => { o.ListenAnyIP(8080); o.ListenAnyIP(8443, l => l.UseHttps()); });"
+    assert not _of(_scan(tmp_path, mode, "app.UseRouting();", services=services), "DNL-CFG-013")
+
+
+def test_conditional_http_listener_is_review(tmp_path, mode):
+    services = "builder.WebHost.ConfigureKestrel(o => { if (Flags.Plain()) { o.ListenAnyIP(8080); } });"
+    assert ("DNL-CFG-013", "low", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseRouting();", services=services))
+
+
+def test_conditional_bad_detailed_errors_is_review(tmp_path, mode):
+    services = ("builder.Services.AddServerSideBlazor(o => { if (Flags.Debug()) { o.DetailedErrors = true; } });")
+    assert ("DNL-CFG-008", "medium", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseExceptionHandler(\"/e\");", services))
+
+
+def test_conditional_good_value_does_not_clear_bad_detailed_errors(tmp_path, mode):
+    services = ("builder.Services.AddServerSideBlazor(o => { o.DetailedErrors = true; "
+                "if (Flags.Safe()) { o.DetailedErrors = false; } });")
+    assert ("DNL-CFG-008", "medium", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseExceptionHandler(\"/e\");", services))
+
+
+def test_unconditional_bad_detailed_errors_stays_firm(tmp_path, mode):
+    services = "builder.Services.AddServerSideBlazor(o => { o.DetailedErrors = true; });"
+    assert ("DNL-CFG-008", "medium", None) in ids(_scan(tmp_path, mode, "app.UseExceptionHandler(\"/e\");", services))

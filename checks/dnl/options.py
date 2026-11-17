@@ -33,6 +33,9 @@ class Opt:
     path: str        # dotted, relative to the lambda parameter or initializer root: "Password.RequiredLength"
     value: dict      # the assigned Expr
     line: int
+    # True when the assignment sits under an if / else (switch lowers to if), a loop, a ternary or a
+    # catch handler inside the lambda: it may not run, so it can neither clear nor prove a value.
+    conditional: bool = False
 
 
 def lambda_args(call: dict) -> list[dict]:
@@ -113,49 +116,75 @@ def _block_entries(text: str, prefix: str, line: int, out: list[Opt]) -> bool:
     return True
 
 
-def _scan(node, params: frozenset, prefix: str, out: list[Opt]) -> None:
+# Statement / expression kinds whose children may not run (`try` is special: only its catches).
+_BRANCH_KINDS = frozenset({"if", "loop", "cond"})
+
+
+def child_conditional(node: dict, key: str, cond: bool) -> bool:
+    """Whether the child under `key` of an IR node is conditional, given the node's own state."""
+    k = node.get("k")
+    return cond or k in _BRANCH_KINDS or (k == "try" and key == "catches")
+
+
+def walk_conditional(node, cond: bool = False):
+    """Pre-order like ir.walk, yielding (node, conditional): conditional is True below an if / else,
+    loop, ternary or catch handler. A lambda keeps the state of where it is written."""
+    if isinstance(node, dict):
+        yield node, cond
+        for key, v in node.items():
+            if isinstance(v, (dict, list)):
+                yield from walk_conditional(v, child_conditional(node, key, cond))
+    elif isinstance(node, list):
+        for v in node:
+            yield from walk_conditional(v, cond)
+
+
+def _scan(node, params: frozenset, prefix: str, out: list[Opt], cond: bool = False) -> None:
     if isinstance(node, list):
         for x in node:
-            _scan(x, params, "", out)
+            _scan(x, params, "", out, cond)
         return
     if not isinstance(node, dict):
         return
     k = node.get("k")
     if k == "lambda":
-        _scan(node.get("body"), params | {p for p in node.get("params") or [] if isinstance(p, str)}, "", out)
+        _scan(node.get("body"), params | {p for p in node.get("params") or [] if isinstance(p, str)}, "", out, cond)
         return
     if k == "assign" and node.get("op") == "=":
         chain = _chain(node.get("target"))
         if chain and chain[0] in params and len(chain) > 1:
             path = ".".join(chain[1:])
-            out.append(Opt(path, node.get("value"), node.get("line") or 0))
-            _scan(node.get("value"), params, path, out)
+            out.append(Opt(path, node.get("value"), node.get("line") or 0, cond))
+            _scan(node.get("value"), params, path, out, cond)
         else:
-            _scan(node.get("value"), params, "", out)
+            _scan(node.get("value"), params, "", out, cond)
         return
     if k == "new":
         line = node.get("line") or 0
         for a in node.get("args") or []:
-            _scan(a, params, "", out)
+            _scan(a, params, "", out, cond)
         for e in node.get("init") or []:
             if not (isinstance(e, dict) and "name" in e and "value" in e):
-                _scan(e, params, "", out)  # a collection element
+                _scan(e, params, "", out, cond)  # a collection element
                 continue
             path = f"{prefix}.{e['name']}" if prefix else e["name"]
             v = e["value"]
             vline = (v.get("line") if isinstance(v, dict) else None) or line
             if isinstance(v, dict) and v.get("k") == "unknown" and _block_entries(v.get("text") or "", path, vline, out):
+                if cond:
+                    for o in out:
+                        o.conditional = o.conditional or (o.path.startswith(path + ".") and o.line == vline)
                 continue
             # An untyped `new` with named entries is a nested object initializer (`Nested = { A = 1 }`).
             nested = (isinstance(v, dict) and v.get("k") == "new" and not v.get("type")
                       and any(isinstance(x, dict) and "name" in x for x in v.get("init") or []))
             if not nested:
-                out.append(Opt(path, v, vline))
-            _scan(v, params, path, out)
+                out.append(Opt(path, v, vline, cond))
+            _scan(v, params, path, out, cond)
         return
-    for v in node.values():
+    for key, v in node.items():
         if isinstance(v, (dict, list)):
-            _scan(v, params, "", out)
+            _scan(v, params, "", out, child_conditional(node, key, cond))
 
 
 def assignments(node: dict) -> list[Opt]:
@@ -178,9 +207,28 @@ def options_of(call: dict) -> list[Opt]:
 
 
 def opt(opts: list[Opt], path: str) -> Opt | None:
-    """The last assignment whose path equals `path`, ignoring case (later assignments win)."""
+    """The last assignment whose path equals `path`, ignoring case (later assignments win). It ignores
+    `Opt.conditional`, so a conditional good value can mask an earlier bad one: a rule about a
+    security-relevant path must use `verdict` instead (opt is fine for "is this option set at all")."""
     want = path.lower()
     return next((o for o in reversed(opts) if o.path.lower() == want), None)
+
+
+def verdict(opts: list[Opt], path: str, bad=None) -> tuple[Opt | None, bool]:
+    """(effective assignment, uncertain) for `path`. `uncertain` is True when any assignment to the path
+    is conditional: the caller must then downgrade a finding to REVIEW. The effective assignment is the
+    last one; when `bad` (a predicate over an Opt) is given and the path is uncertain, it is the last
+    assignment that satisfies `bad`, so a conditional good value never clears a bad one."""
+    want = path.lower()
+    same = [o for o in opts if o.path.lower() == want]
+    if not same:
+        return None, False
+    uncertain = any(o.conditional for o in same)
+    if uncertain and bad is not None:
+        bads = [o for o in same if bad(o)]
+        if bads:
+            return bads[-1], True
+    return same[-1], uncertain
 
 
 # -- values -----------------------------------------------------------------

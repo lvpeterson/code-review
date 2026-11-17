@@ -1,5 +1,5 @@
 """Option reader: assignments in option lambdas and initializers, constants, TimeSpans (hand-built IR)."""
-from checks.dnl.options import (UNKNOWN, Opt, always_true, assignments, const, lambda_args, opt, options_of,
+from checks.dnl.options import (UNKNOWN, Opt, always_true, assignments, const, lambda_args, opt, options_of, verdict,
                                 timespan_minutes)
 
 
@@ -136,3 +136,63 @@ def test_opt_last_match_case_insensitive():
     a, b, c = Opt("Password.RequiredLength", lit(4), 1), Opt("x", lit(1), 2), Opt("password.requiredlength", lit(8), 3)
     assert opt([a, b, c], "Password.RequiredLength") is c
     assert opt([a, b], "missing") is None
+
+
+# -- conditional assignments and verdict ----------------------------------------------------------------
+
+def _cond_flags(body):
+    return [(a.path, a.conditional) for a in assignments(lam(["o"], body))]
+
+
+def test_straight_line_assignment_is_not_conditional():
+    assert _cond_flags([assign("o", "A", lit(1))]) == [("A", False)]
+
+
+def test_assignment_under_if_else_is_conditional():
+    body = [{"k": "if", "cond": name("x"), "then": [assign("o", "A", lit(1))], "else": [assign("o", "B", lit(2))]}]
+    assert _cond_flags(body) == [("A", True), ("B", True)]
+
+
+def test_assignment_under_loop_is_conditional():
+    body = [{"k": "loop", "body": [assign("o", "A", lit(1))], "line": 1}]
+    assert _cond_flags(body) == [("A", True)]
+
+
+def test_assignment_in_ternary_branch_is_conditional():
+    value = {"k": "cond", "c": name("x"), "t": {"k": "assign", "target": member(name("o"), "A"), "op": "=",
+                                                "value": lit(1), "line": 1}, "f": lit(0), "line": 1}
+    assert _cond_flags([{"k": "expr", "e": value, "line": 1}]) == [("A", True)]
+
+
+def test_try_body_unconditional_catch_conditional():
+    body = [{"k": "try", "body": [assign("o", "A", lit(1))], "catches": [{"body": [assign("o", "B", lit(2))]}],
+             "finally": [assign("o", "C", lit(3))], "line": 1}]
+    assert _cond_flags(body) == [("A", False), ("B", True), ("C", False)]
+
+
+def test_initializer_entries_are_not_conditional():
+    new = {"k": "new", "type": "T", "args": [], "init": [{"name": "A", "value": lit(1)}], "line": 1}
+    assert [(a.path, a.conditional) for a in assignments(new)] == [("A", False)]
+
+
+def test_verdict_plain_and_absent():
+    opts = assignments(lam(["o"], [assign("o", "A", lit(1)), assign("o", "A", lit(2))]))
+    o, uncertain = verdict(opts, "a")
+    assert o.value["v"] == 2 and uncertain is False
+    assert verdict(opts, "Missing") == (None, False)
+
+
+def test_verdict_conditional_is_uncertain():
+    body = [assign("o", "A", lit(True)),
+            {"k": "if", "cond": name("x"), "then": [assign("o", "A", lit(False))], "else": []}]
+    opts = assignments(lam(["o"], body))
+    o, uncertain = verdict(opts, "A")
+    assert uncertain is True and o.value["v"] is False      # last wins when no `bad` predicate is given
+
+
+def test_verdict_bad_predicate_keeps_the_bad_value():
+    body = [assign("o", "A", lit(True)),
+            {"k": "if", "cond": name("x"), "then": [assign("o", "A", lit(False))], "else": []}]
+    opts = assignments(lam(["o"], body))
+    o, uncertain = verdict(opts, "A", bad=lambda x: const(x.value) is not False)
+    assert uncertain is True and o.value["v"] is True       # the conditional good value never clears it

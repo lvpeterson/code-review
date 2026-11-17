@@ -8,7 +8,7 @@ import re
 
 from checks.dnl.cfgctx import Ctx, build_ctx
 from checks.dnl.ir import call_name, const_str, literal_str, receiver_text, walk
-from checks.dnl.options import const, opt, options_of
+from checks.dnl.options import const, opt, options_of, verdict, walk_conditional
 from checks.dnl.pipeline import PipeCall, Pipeline
 from checks.dnl.project import ProjectModel
 from checks.dnl.routes_core import CoreRouteRef
@@ -187,14 +187,20 @@ def _detailed_errors(ctx: Ctx, pipe: Pipeline, add) -> None:
                 desc += f" The value {e.value!r} could not be read as a boolean; confirm it is false."
             add("DNL-CFG-008", "medium", title, desc, e.file, e.line, None if firm else "REVIEW")
     for c, conf in _certain_and_uncertain(ctx, pipe, *_DETAILED_ERROR_CALLS):
-        o = opt(options_of(c.node), "DetailedErrors")
+        # A conditional assignment may not run: a conditional good value never clears a bad one, and a
+        # bad value that is conditional is only REVIEW.
+        o, uncertain = verdict(options_of(c.node), "DetailedErrors", bad=lambda x: const(x.value) is not False)
         if o is None:
             continue
         v = const(o.value)
         if v is False:
             continue
-        if v is True:
+        if v is True and not uncertain:
             desc = "DetailedErrors = true sends exception detail to the browser; limit it to Development."
+        elif v is True:
+            conf = "REVIEW"
+            desc = ("DetailedErrors = true is set, but some assignment to it sits under a condition, so it may "
+                    "not take effect in Production; confirm it is limited to Development.")
         else:
             conf = "REVIEW"
             desc = ("DetailedErrors is not a compile-time value, so it may be true in Production; confirm it is "
@@ -357,9 +363,16 @@ def _url_sites(text: str) -> tuple[bool, bool]:
 
 
 def _kestrel_code(pipe: Pipeline) -> tuple[bool, list[str], bool, list[tuple[str, int, str | None]]]:
-    """(https certainly present, where an https listener sits under an unparsed environment guard,
-    something unreadable, [(file, line, confidence)] of HTTP-only listeners) from
-    ConfigureKestrel / UseKestrel option lambdas and UseUrls calls that can run in Production."""
+    """(https certainly present, where an https listener may or may not run, something unreadable,
+    [(file, line, confidence)] of HTTP-only listeners) from ConfigureKestrel / UseKestrel option lambdas
+    and UseUrls calls that can run in Production.
+
+    Conditions are read at two levels. A call under an environment guard in the pipeline is judged by
+    `runs_in("Production")` (False: skipped; None: uncertain). Inside a lambda body the pipeline models no
+    guards, so `walk_conditional` marks anything below an if / else / switch / loop / ternary / catch as
+    conditional: an HTTPS listener or UseHttps there never clears the finding (it goes to `maybe_https`,
+    which turns CFG-013 into REVIEW), and an HTTP-only listener there is REVIEW unless an unconditional
+    one is also present. Only an unconditional HTTPS listener in a call that certainly runs clears it."""
     https = unreadable = False
     maybe_https: list[str] = []
     sites: list[tuple[str, int, str | None]] = []
@@ -381,16 +394,21 @@ def _kestrel_code(pipe: Pipeline) -> tuple[bool, list[str], bool, list[tuple[str
                 if args and not lams:
                     unreadable = True      # a method group or options object: its listeners are not read
                 for lam in lams:
-                    inner = [x for x in walk(lam) if x.get("k") == "call"]
-                    if any(call_name(x) in _HTTPS_CALLS for x in inner):
-                        if run:
-                            https = True
-                        else:
-                            maybe_https.append(f"{c.file}:{line}")
-                        continue
-                    listens = [x for x in inner if call_name(x) in _LISTEN_CALLS]
+                    inner = [(x, cd) for x, cd in walk_conditional(lam) if x.get("k") == "call"]
+                    for x, cd in inner:
+                        if call_name(x) in _HTTPS_CALLS:
+                            if run and not cd:
+                                https = True
+                            else:
+                                maybe_https.append(f"{c.file}:{x.get('line') or line}")
+                    # A Listen* call that carries its own UseHttps is the HTTPS listener, not an HTTP one.
+                    listens = [(x, cd) for x, cd in inner if call_name(x) in _LISTEN_CALLS
+                               and not any(call_name(y) in _HTTPS_CALLS for y in walk(x))]
                     if listens:
-                        sites.append((c.file, listens[0].get("line") or line, conf))
+                        # Report the first listener that certainly runs; when every one is conditional the
+                        # first of them is reported as REVIEW.
+                        x, cd = next(((x, cd) for x, cd in listens if not cd), listens[0])
+                        sites.append((c.file, x.get("line") or line, "REVIEW" if cd else conf))
             elif name == "UseUrls":
                 for a in args:
                     text = const_str(a)
