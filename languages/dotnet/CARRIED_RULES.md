@@ -10,7 +10,7 @@ Rule modules shared with `dotnet_legacy` that also run on SDK projects. The Core
 | XML parser defaults | DNL-XXE-002 | no effect | only fires below .NET Framework 4.5.2, which SDK projects never target |
 | integrity (SRI) | DNL-INT-003 | yes | text scan of `.cshtml` layouts and views |
 | ViewState | DNL-INT-004 | no | WebForms directives (`.aspx`, `.ascx`, `.master`) do not exist in SDK projects |
-| System.Web-only constructs | no rule id (`FormsAuthentication`, `MachineKey`, `HttpContext.Current`); only the `HashPasswordForStoringInConfigFile` branch of DNL-CRY-001 is System.Web-specific | no | the types do not exist in ASP.NET Core, so they are not in the Core fixture; DNL-CRY-001 itself still fires on Core through MD5 / SHA1 |
+| System.Web-only constructs | `FormsAuthentication`, `MachineKey`, `HttpContext.Current`: legacy rules DNL-SESS-006 / DNL-SESS-007 (rules_session), DNL-INT-002 (machineKey in Web.config) and the legacy source tables (taint_tables, rules_object, rules_resources) match them | no | the types are absent on Core and Web.config checks are not run on Core, so none fire; not in the Core fixture. DNL-CRY-001 itself still fires on Core through MD5 / SHA1; only its `HashPasswordForStoringInConfigFile` branch is System.Web-specific |
 
 Caveat: DNL-DESER-003 (see the deserialization row) is by-name on Core. `JavaScriptSerializer` and
 `SimpleTypeResolver` do not exist in the net8.0 reference packs; the rule matches the name, so a ported or

@@ -156,7 +156,9 @@ def test_taint_flag_matches_wiring(monkeypatch):
     from languages.dotnet import analyzers
     called = []
     monkeypatch.setattr(rules_taint, "check", lambda *a, **k: called.append(1) or [])
-    _dotnet(CARRIED_APP, allow_degraded=False)
+    results = _dotnet(CARRIED_APP, allow_degraded=False)
+    # the analyzers must really have run, or "not called" would prove nothing
+    assert results and "DNL-CRY-001" in {f.check_id for r in results for f in r.findings}
     assert bool(called) == analyzers.CORE_RUNS_TAINT, (
         "CORE_RUNS_TAINT and the rules_taint wiring drifted: set the flag to True in the same change "
         "that runs rules_taint.check in languages/dotnet/analyzers.py (and back), otherwise "
