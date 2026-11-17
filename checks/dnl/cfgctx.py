@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .appsettings import load_settings
 from .auth_core import _NON_AUTHZ_EXTENSIONS
 from .findings import dnl_finding
 from .pipeline import Pipeline, PipeCall, pipeline_for
@@ -65,4 +66,8 @@ def build_ctx(model: ProjectModel, refs: list[CoreRouteRef]) -> Ctx:
         pipe = pipeline_for(model, proj)
         if pipe.style != "none":
             pipes.append(pipe)
-    return Ctx(model, refs, pipes)
+    # One settings load per model: it appends a note per malformed file, so it must not repeat.
+    settings = model.cache.get("appsettings")
+    if settings is None:
+        settings = model.cache["appsettings"] = load_settings(model)
+    return Ctx(model, refs, pipes, settings)
