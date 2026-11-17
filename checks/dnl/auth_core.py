@@ -288,6 +288,9 @@ def _succeeds_always(body: list) -> bool:
         if k == "loop" and any(c.get("k") == "expr" and any(call_name(n) == "Succeed" for n in walk(c))
                                for c in s.get("body") or [] if isinstance(c, dict)):
             return True
+        if k == "if" and s.get("else") and _succeeds_always(s.get("then")) and _succeeds_always(s.get("else")):
+            # Succeed is reached on both branches (an else-if chain recurses through `else`).
+            return True
         if any(n.get("k") in ("return", "throw") for n in walk(s)):
             return False
     return False
@@ -1369,13 +1372,15 @@ def resolve(model: ProjectModel, ref: CoreRouteRef, pipe: Pipeline) -> CoreAuth:
                      "not be evaluated" + (f" ({S.issue[0]})" if S.issue is not None else "")]
 
     p2, p3 = prot(2), prot(3)
+    # Endpoint metadata (attributes, calls, Razor page conventions) is enforced by the authorization
+    # middleware; an MVC filter is not.
+    cands = [x for x in (p2, p3) if x is not None]
+    free = [x for x in cands if not (x[0].step == 2 or x[0].source.startswith("convention:"))]
     downgraded = False
-    chosen = p2 or p3
-    if p2 is not None:
+    chosen = (free or cands or [None])[0]
+    if chosen is not None and not free:
         downgraded = S.issue is not None and S.suppress_certain
-        if (downgraded or mw_unsure) and p3 is not None:
-            chosen, downgraded, mw_unsure = p3, False, False
-        elif mw_unsure and not downgraded:
+        if mw_unsure and not downgraded:
             return CoreAuth(UNKNOWN, "none", policies=pnames, roles=roles, reasons=unsure_reason, notes=notes)
     if chosen is not None and not downgraded:
         it, e = chosen

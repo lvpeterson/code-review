@@ -524,10 +524,12 @@ def _stmt(ctx: _Ctx, s, scope: dict, guards: tuple, file: str, stack: tuple, dep
         if _exits([s]):
             return None
     elif k == "if":
-        pred = _pred(s.get("cond"), scope, ctx)
+        # A condition that reads no environment is still a condition: the calls under it may not run, so
+        # they get an unknown guard (runs_in None) rather than counting as certain.
+        pred = _pred(s.get("cond"), scope, ctx) or _UNKNOWN
         # Nested conditions compose: every enclosing guard stays in force.
-        t_g = guards + ((pred, True),) if pred else guards
-        e_g = guards + ((pred, False),) if pred else guards
+        t_g = guards + ((pred, True),)
+        e_g = guards + ((pred, False),)
         _stmts(ctx, s.get("then"), scope, t_g, file, stack, depth)
         _stmts(ctx, s.get("else"), scope, e_g, file, stack, depth)
         # An early exit leaves the rest of the list under the other branch's guard.

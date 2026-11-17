@@ -1115,6 +1115,22 @@ class _Scan:
                     state.ref.unknown.append(msg)
                 elif isinstance(state, _Node) and state.kind == "group" and msg not in state.notes:
                     state.notes.append(msg)
+                elif isinstance(state, _Result):
+                    # On a followed call's result: what it returns (groups, routes), the routes it
+                    # registered and the value it was called on.
+                    for t in state.targets:
+                        if isinstance(t, _Node) and msg not in t.notes:
+                            t.notes.append(msg)
+                        elif isinstance(t, _Entry) and msg not in t.ref.unknown:
+                            t.ref.unknown.append(msg)
+                    for e in state.entries:
+                        if msg not in e.ref.unknown:
+                            e.ref.unknown.append(msg)
+                    o = state.origin
+                    if isinstance(o, _Node) and o.kind == "group" and msg not in o.notes:
+                        o.notes.append(msg)
+                    elif isinstance(o, _Entry) and msg not in o.ref.unknown:
+                        o.ref.unknown.append(msg)
             # Two untraced hops in a row (`g.MapX().Foo().RequireAuthorization()`): the origin stays the
             # first thing that was a group or a route, not the previous untraced result.
             if isinstance(state, _Result) and not state.traced:

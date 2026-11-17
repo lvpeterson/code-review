@@ -532,7 +532,7 @@ def test_c4_project_authorize_attribute_is_analysed(roslyn_helper, tmp_path):
                 {"Controllers/HealthController.cs": ("[HttpGet]\n    public IActionResult Get", "[HttpGet]\n    [Authorize]\n    public IActionResult Get")},
                 {"MyAuthorize.cs": attr})
     a = App(root)("HealthController.Get")
-    assert a.state != PROTECTED
+    assert a.state == UNKNOWN
 
 
 def test_c5_unresolved_convention_after_require_authorization_blocks_protection(roslyn_helper, tmp_path):
@@ -615,3 +615,84 @@ def test_r23_opaque_statement_blocks_protection(roslyn_helper, tmp_path):
     root = copy(RAZOR, tmp_path, {"Program.cs": ('o.Conventions.AllowAnonymousToPage("/Admin/Login");',
                                                  'o.Conventions.AllowAnonymousToPage("/Admin/Login");\n    switch (Mode) { case 1: o.Conventions.AllowAnonymousToFolder("/Admin"); break; }')})
     assert App(root)("UsersModel.OnGet").state == UNKNOWN
+
+
+# -- fix round 2 -----------------------------------------------------------------------------------
+
+def test_n1_use_authorization_under_non_environment_condition_is_uncertain(roslyn_helper, tmp_path):
+    root = copy(STARTUP, tmp_path, {"Startup.Pipeline.cs": ("app.UseAuthorization();", "if (Config.On) { app.UseAuthorization(); }")})
+    project._CACHE.clear()
+    project.prepare(root, False)
+    model = project.get_model(root, "dotnet")
+    pipe = pipeline_for(model, model.projects[0])
+    assert "UseAuthorization" in {c.name for c in pipe.uncertain()}
+    assert not pipe.named("UseAuthorization")
+    assert middleware_issue(pipe) is None
+
+
+def test_n1_fallback_under_non_environment_condition_is_unknown(roslyn_helper, tmp_path):
+    root = copy(CONTROLLERS, tmp_path, {"Program.cs": (
+        "var app = builder.Build();",
+        f"if (Config.On) {{ builder.Services.AddAuthorization(o => {{ {FALLBACK_AUTHED} }}); }}\nvar app = builder.Build();")})
+    a = App(root)("HealthController.Get")
+    assert a.state == UNKNOWN and a.reasons
+
+
+def test_n1_page_convention_under_non_environment_condition_is_unknown(roslyn_helper, tmp_path):
+    root = copy(RAZOR, tmp_path, {"Program.cs": ("builder.Services.AddRazorPages(o =>", "if (Config.On) builder.Services.AddRazorPages(o =>")})
+    a = App(root)("UsersModel.OnGet")
+    assert a.state == UNKNOWN and a.reasons
+
+
+def _razor_net6(tmp_path, use_authorization):
+    return copy(RAZOR, tmp_path, {
+        "RazorApp.csproj": ("net8.0", "net6.0"),
+        "Program.cs": ("app.UseAuthorization();", use_authorization),
+    })
+
+
+def test_n2_page_convention_with_suppressed_missing_middleware(roslyn_helper, tmp_path):
+    root = _razor_net6(tmp_path, "")
+    prog = root / "Program.cs"
+    prog.write_text(prog.read_text().replace(
+        "var app = builder.Build();",
+        "builder.Services.Configure<RouteOptions>(o => o.SuppressCheckForUnhandledSecurityMetadata = true);\nvar app = builder.Build();"))
+    a = App(root)("UsersModel.OnGet")
+    assert a.state == UNPROTECTED and any("not enforced" in n for n in a.notes)
+    # Without the flag the broken pipeline fails closed: the page stays protected.
+    assert App(_razor_net6(tmp_path / "b", ""))("UsersModel.OnGet").state == PROTECTED
+
+
+def test_n2_page_convention_with_uncertain_middleware_and_suppress_is_unknown(roslyn_helper, tmp_path):
+    root = _razor_net6(tmp_path, "if (app.Environment.IsEnvironment(Settings.Env)) { app.UseAuthorization(); }")
+    prog = root / "Program.cs"
+    prog.write_text(prog.read_text().replace(
+        "var app = builder.Build();",
+        "builder.Services.Configure<RouteOptions>(o => o.SuppressCheckForUnhandledSecurityMetadata = true);\nvar app = builder.Build();"))
+    a = App(root)("UsersModel.OnGet")
+    assert a.state == UNKNOWN and a.reasons
+
+
+def test_n3_succeed_on_every_branch_is_never_denying(roslyn_helper, tmp_path):
+    def handler(body):
+        return ("using Microsoft.AspNetCore.Authorization;\n\npublic class AuditRequirement : IAuthorizationRequirement { }\n\n"
+                "public class AuditHandler : AuthorizationHandler<AuditRequirement>\n{\n"
+                "    protected override Task HandleRequirementAsync(AuthorizationHandlerContext context, AuditRequirement requirement)\n    {\n"
+                f"{body}\n        return Task.CompletedTask;\n    }}\n}}\n")
+    cases = {
+        "if (context.User.IsInRole(\"a\")) { context.Succeed(requirement); } else { context.Succeed(requirement); }": UNPROTECTED,
+        "if (X) { context.Succeed(requirement); } else if (Y) { context.Succeed(requirement); } else { context.Succeed(requirement); }": UNPROTECTED,
+        "if (X) { context.Succeed(requirement); } else if (Y) { context.Succeed(requirement); }": PROTECTED,
+    }
+    for i, (body, want) in enumerate(cases.items()):
+        root = copy(CONTROLLERS, tmp_path / f"c{i}", None, {"Auth/AuditHandler.cs": handler(body)})
+        assert App(root)("AuditController.Log").state == want, body
+
+
+def test_n4_trailing_untraced_call_on_followed_result_is_noted(roslyn_helper, tmp_path):
+    root = copy(MINIMAL, tmp_path, {"Program.cs": (
+        'app.MapGet("/", () => "hello");',
+        'app.MapGet("/", () => "hello");\nWrap(app.MapGroup("/x").RequireAuthorization()).AllowPublic();\n'
+        'static RouteGroupBuilder Wrap(RouteGroupBuilder g) { g.MapGet("/y", () => 1); return g; }')})
+    a = App(root)("/x/y")
+    assert a.state == UNKNOWN and any("AllowPublic" in r for r in a.reasons)
