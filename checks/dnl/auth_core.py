@@ -80,6 +80,22 @@ NameAuthorizationRequirement AssertionRequirement
 """.split())
 # A whole-value placeholder (shared with rules_config): `{...}` only counts as a single `{identifier}`.
 PLACEHOLDER = re.compile(r"(?i)^(\$\(.*\)|\{[a-z_]\w*\}|#\{.*\}|__.*__|\*+|x+|)$")
+# Secret-key naming shared with rules_config (which re-exports aliases): a connection-string password,
+# a key that names a secret, and the words that mark a key as a setting about one (PasswordResetUrl).
+CONN_PW = re.compile(r"(?i)\b(password|pwd)\s*=\s*(\{[^}]*\}?|'[^']*'?|[^;\"]+)")
+SECRET_KEY = re.compile(r"(?i)password|pwd|secret|apikey|api_key|token|privatekey|clientsecret")
+_SETTING_WORDS = {"url", "regex", "length", "format", "minimum", "required", "attempts", "window", "policy"}
+_WORD_SPLIT = re.compile(r"[_\-. ]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def is_setting_key(key: str) -> bool:
+    """True when a word of the key (split on camelCase, `_`, `-`, `.`) names a setting:
+    `Password_Format`, `PasswordResetUrl` -- but not `InformationApiKey` ("Information"
+    merely contains "format")."""
+    return any(w.lower() in _SETTING_WORDS or w.lower().startswith("expir")
+               for w in _WORD_SPLIT.split(key) if w)
+
+
 _CTX = _Ctx()
 _UNK = ("unknown",)
 _SUPPRESS = "SuppressCheckForUnhandledSecurityMetadata"

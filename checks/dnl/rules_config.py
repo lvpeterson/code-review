@@ -10,7 +10,7 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from checks.dnl.auth_core import PLACEHOLDER
+from checks.dnl.auth_core import CONN_PW, PLACEHOLDER, SECRET_KEY, is_setting_key
 from checks.dnl.findings import dnl_finding
 from checks.dnl.webconfig import LINE, NOTES, ORIGIN, WebConfig, anonymous_denied, config_chain, effective
 from core.models import Finding
@@ -19,19 +19,10 @@ from core.models import Finding
 # ADO.NET lets a braced value hold anything (`Password={Secr3t;x}`).
 _PLACEHOLDER = PLACEHOLDER    # defined in auth_core so the ASP.NET Core rules share it
 # Value is a braced or single-quoted ADO.NET token, else it runs to the next `;`.
-_CONN_PW = re.compile(r"(?i)\b(password|pwd)\s*=\s*(\{[^}]*\}?|'[^']*'?|[^;\"]+)")
-_SECRET_KEY = re.compile(r"(?i)password|pwd|secret|apikey|api_key|token|privatekey|clientsecret")
-# Keys that name a secret but hold a setting about it (PasswordResetUrl, TokenExpiration...).
-_SETTING_WORDS = {"url", "regex", "length", "format", "minimum", "required", "attempts", "window", "policy"}
-_WORD_SPLIT = re.compile(r"[_\-. ]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
-
-
-def _is_setting_key(key: str) -> bool:
-    """True when a word of the key (split on camelCase, `_`, `-`, `.`) names a setting:
-    `Password_Format`, `PasswordResetUrl` -- but not `InformationApiKey` ("Information"
-    merely contains "format")."""
-    return any(w.lower() in _SETTING_WORDS or w.lower().startswith("expir")
-               for w in _WORD_SPLIT.split(key) if w)
+# Defined in auth_core so the ASP.NET Core secrets rules share them (aliases keep this module's names).
+_CONN_PW = CONN_PW
+_SECRET_KEY = SECRET_KEY
+_is_setting_key = is_setting_key
 
 
 # Response-wide settings: reported on app-root configs only, not on every

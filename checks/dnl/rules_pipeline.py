@@ -7,7 +7,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from checks.dnl import rules_pipeline_auth
+from checks.dnl import rules_pipeline_auth, rules_secrets_core
 from checks.dnl.auth_core import _sensitive
 from checks.dnl.cfgctx import Ctx, build_ctx
 from checks.dnl.ir import attr_key, call_chain, call_name, const_str, literal_str, receiver_text, walk
@@ -884,7 +884,8 @@ _GROUPS: list = [("errors", _errors), ("transport", _transport), ("cors", _cors)
                  ("cookies", rules_pipeline_auth.check_cookies),
                  ("antiforgery", rules_pipeline_auth.check_antiforgery),
                  ("tokens", rules_pipeline_auth.check_tokens),
-                 ("identity", rules_pipeline_auth.check_identity)]
+                 ("identity", rules_pipeline_auth.check_identity),
+                 ("secrets", rules_secrets_core.check)]
 
 
 def check(model: ProjectModel, refs: list[CoreRouteRef]) -> list[Finding]:
