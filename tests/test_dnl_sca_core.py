@@ -10,6 +10,9 @@ import pytest
 from checks.dnl import project, rules_sca, rules_sca_core
 from core.owasp_web import RULES
 
+# The end-of-support comparison reads the run date; pin it so these tests do not shift with the calendar.
+pytestmark = pytest.mark.usefixtures("pinned_today")
+
 FX = Path(__file__).parent / "fixtures" / "aspnetcore" / "sca_app"
 DATA = Path(__file__).resolve().parent.parent / "checks" / "dnl" / "data" / "dnl_advisories.json"
 TODAY = datetime.date(2026, 11, 16)
@@ -168,6 +171,16 @@ def test_eol_future_tfm_not_flagged():
 def test_eol_uses_injected_today():
     findings, _ = _run(today=datetime.date(2020, 1, 1))
     assert not _by(findings, "DNL-SCA-003")
+
+
+def test_default_clock_is_the_pinned_one(pinned_today, monkeypatch):
+    # No `today` argument: both entry points read rules_sca_core._today(), which the fixture pins.
+    assert rules_sca_core.eol_tfms() == rules_sca_core.eol_tfms(pinned_today)
+    findings, _ = rules_sca_core.check(_model(FX))
+    assert {f.title for f in _by(findings, "DNL-SCA-003")} == {f.title for f in _by(_run()[0], "DNL-SCA-003")}
+    monkeypatch.setattr(rules_sca_core, "_today", lambda: datetime.date(2020, 1, 1))
+    assert not _by(rules_sca_core.check(_model(FX))[0], "DNL-SCA-003")
+    assert "net6.0" not in rules_sca_core.eol_tfms()
 
 
 def test_eol_tfms_helper():
@@ -404,3 +417,23 @@ def test_mixed_solution_each_file_once(tmp_path):
                       for f in r.findings if f.check_id == "DNL-SCA-002")
     assert js("dotnet_legacy") == ["Framework/Scripts/jquery.js"]
     assert js("dotnet") == ["Modern/wwwroot/lib/jquery/jquery.js"]
+
+
+def test_detector_deps_survives_a_file_that_resolves_outside_its_owner(tmp_path, monkeypatch):
+    # A loose Core project owns files outside any project file; a symlinked or junctioned .js that
+    # resolves outside the scan root has no path relative to that owner and must not abort detection.
+    root = tmp_path / "scan"
+    (root / "App").mkdir(parents=True)
+    (root / "App" / "App.csproj").write_text(
+        '<Project Sdk="Microsoft.NET.Sdk.Web"><PropertyGroup><TargetFramework>net10.0</TargetFramework>'
+        "</PropertyGroup></Project>", encoding="utf-8")
+    (root / "Program.cs").write_text(
+        "var app = WebApplication.CreateBuilder(args).Build();\napp.MapGet(\"/\", () => \"ok\");\napp.Run();\n",
+        encoding="utf-8")
+    outside = tmp_path / "elsewhere" / "wwwroot" / "lib" / "x.js"
+    outside.parent.mkdir(parents=True)
+    outside.write_text("//", encoding="utf-8")
+    real = core_detector.iter_dnl_files
+    monkeypatch.setattr(core_detector, "iter_dnl_files",
+                        lambda target, exts: iter([outside]) if ".js" in exts else real(target, exts))
+    assert "deps" not in core_detector.detect_frameworks(root)

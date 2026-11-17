@@ -1,4 +1,5 @@
 """ASP.NET Core SCA and carried-over rule families: golden legacy baselines and Core fixtures."""
+import shutil
 from pathlib import Path
 
 import pytest
@@ -155,7 +156,9 @@ def test_taint_flag_matches_wiring(monkeypatch):
     from checks.dnl import rules_taint
     from languages.dotnet import analyzers
     called = []
-    monkeypatch.setattr(rules_taint, "check", lambda *a, **k: called.append(1) or [])
+    # Only calls on the Core view count: carried_app has a Web.config, so the legacy package also runs
+    # (on its own, empty view) and calls rules_taint.
+    monkeypatch.setattr(rules_taint, "check", lambda model, *a, **k: (called.append(1) if model.owner == "dotnet" else None) or [])
     results = _dotnet(CARRIED_APP, allow_degraded=False)
     # the analyzers must really have run, or "not called" would prove nothing
     assert results and "DNL-CRY-001" in {f.check_id for r in results for f in r.findings}
@@ -274,10 +277,13 @@ def test_rules_misc_runs_without_web_config_on_core(monkeypatch):
     from checks.dnl import rules_misc, webconfig
     seen = []
     real = rules_misc.check
-    monkeypatch.setattr(rules_misc, "check", lambda model, refs=(), configs=(): seen.append(tuple(configs)) or real(model, refs, configs))
+    monkeypatch.setattr(rules_misc, "check", lambda model, refs=(), configs=(): seen.append(configs) or real(model, refs, configs))
     monkeypatch.setattr(webconfig, "load_configs", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Web.config read on Core")))
     results = _dotnet(CARRIED_APP, allow_degraded=False)
-    assert seen == [()]
+    # carried_app has a Web.config, so the legacy package also runs its config analyzer here: it loads
+    # configs but its ownership filter drops the SDK project's file (the Core call passes a tuple).
+    assert seen and all(len(c) == 0 for c in seen)
+    assert sum(isinstance(c, tuple) for c in seen) == 1
     assert not [n for r in results for n in r.notes if "failed (" in n]
 
 
@@ -301,3 +307,110 @@ def test_one_crashing_module_does_not_hide_others(monkeypatch):
     assert not _family(results, ("DNL-ERR-",))
     # the modules wired after the crashing one still ran
     assert _family(results, ("DNL-LOG-", "DNL-SESS-")) >= LOGGING_EXPECTED
+
+
+# -- Web.config guard (Review Focus 3) --------------------------------------------------------------
+
+WEB_CONFIG_ONLY = FX / "web_config_only_core"
+
+
+@pytest.mark.parametrize("root", [CARRIED_APP, WEB_CONFIG_ONLY], ids=["carried_app", "web_config_only_core"])
+@pytest.mark.parametrize("mode", ["helper", "degraded"])
+def test_web_config_checks_do_not_run_on_core(root, mode, monkeypatch):
+    # carried_app's Web.config holds the IIS hosting stub plus legacy system.web / system.webServer
+    # sections (debug, version header, customErrors Off, detailed errors); none of it is read on Core.
+    assert (root / "Web.config").is_file()
+    if mode == "degraded":
+        _degraded(monkeypatch)
+    results = _dotnet(root, allow_degraded=(mode == "degraded"))
+    assert results
+    findings = [f for r in results for f in r.findings]
+    assert not [f for f in findings if f.check_id.startswith(("DNL-CFG-", "DNL-WCF-"))]
+    assert not [f for f in findings if Path(f.file).name.lower() == "web.config"]
+    assert not [n for r in results for n in r.notes if "failed (" in n]
+
+
+def test_legacy_still_reads_web_config_in_mixed_solution(tmp_path):
+    # Copy of the mixed solution with a legacy Web.config beside the .NET Framework project: the legacy
+    # package reports the config finding, the SDK package of the same scan reports none.
+    root = tmp_path / "mixed"
+    shutil.copytree(FX / "mixed_solution", root)
+    (root / "Legacy" / "Web.config").write_text(
+        '<?xml version="1.0"?><configuration><system.web><customErrors mode="Off" /></system.web></configuration>',
+        encoding="utf-8")
+    project._CACHE.clear()
+    legacy = [f for r in _legacy(root) for f in r.findings if Path(f.file).name == "Web.config"]
+    assert "DNL-CFG-002" in {f.check_id for f in legacy}     # customErrors mode="Off"
+    assert not [f for r in _dotnet(root) for f in r.findings if f.check_id.startswith("DNL-CFG-")]
+
+
+# -- degraded parity ---------------------------------------------------------------------------------
+
+# {check id: what it needs from the Roslyn helper that the tree-sitter IR cannot give}. Empty on purpose:
+# every carried id the two fixtures exercise reports the same (id, file) with and without the helper, so
+# nothing is excused. An id may only be added here with the symbol it needs (and in CARRIED_RULES.md).
+JUSTIFIED_DEGRADED: dict[str, str] = {}
+
+_FAMILIES = {
+    "SCA": ("DNL-SCA-",),
+    "CRY": ("DNL-CRY-", "DNL-SEC-"),
+    "DESER": ("DNL-DESER-", "DNL-XXE-"),
+    "INT": ("DNL-INT-",),
+    "ERR": ("DNL-ERR-",),
+    "LOG": ("DNL-LOG-", "DNL-CONSUME-", "DNL-DES-"),
+    "RES": ("DNL-RES-", "DNL-INV-"),
+    "SESS": ("DNL-SESS-",),
+}
+_TEXT_SCANS = ("SCA", "INT")     # no IR involved: identical in both modes
+_CONF_RANK = {None: 1, "REVIEW": 0}     # a degraded finding may only be less sure, never surer
+
+
+def _by_family(results):
+    """{family: {(check_id, file): confidence rank}} (the weakest confidence wins for a repeated key)."""
+    out = {fam: {} for fam in _FAMILIES}
+    for r in results:
+        for f in r.findings:
+            for fam, prefixes in _FAMILIES.items():
+                if f.check_id.startswith(prefixes):
+                    key = (f.check_id, Path(f.file).as_posix())
+                    out[fam][key] = min(out[fam].get(key, 9), _CONF_RANK[f.confidence])
+    return out
+
+
+@pytest.mark.parametrize("root", [CARRIED_APP, SCA_APP], ids=["carried_app", "sca_app"])
+def test_degraded_parity_per_family(root, roslyn_helper, monkeypatch):
+    helper_results = _dotnet(root, allow_degraded=False)
+    assert helper_results and not any(r.degraded for r in helper_results)
+    project._CACHE.clear()
+    _degraded(monkeypatch)
+    degraded_results = _dotnet(root, allow_degraded=True)
+    assert degraded_results
+    # every dotnet result says it ran degraded, and says why
+    for r in degraded_results:
+        assert r.degraded and "degraded" in r.degraded.lower() and "tree-sitter" in r.degraded
+    assert {r.framework for r in degraded_results} == {r.framework for r in helper_results}
+
+    assert all(reason.strip() for reason in JUSTIFIED_DEGRADED.values())
+    helped, degraded = _by_family(helper_results), _by_family(degraded_results)
+    for fam in _FAMILIES:
+        h, d = helped[fam], degraded[fam]
+        extra = set(d) - set(h)
+        assert not extra, f"{fam}: degraded-only findings (no helper counterpart): {sorted(extra)}"
+        if fam in _TEXT_SCANS:
+            assert d == h, f"{fam} is a text scan and must not depend on the helper"
+            continue
+        missing = {k for k in set(h) - set(d) if k[0] not in JUSTIFIED_DEGRADED}
+        assert not missing, f"{fam}: lost in degraded mode with no justification: {sorted(missing)}"
+        higher = {k for k in d if d[k] > h[k]}
+        assert not higher, f"{fam}: degraded confidence above the helper's: {sorted(higher)}"
+    # the fixtures really exercise the families (a vacuous pass proves nothing)
+    if root == CARRIED_APP:
+        assert all(helped[f] for f in _FAMILIES if f != "SCA")
+    else:
+        assert helped["SCA"]
+
+
+def test_justified_degraded_entries_are_documented():
+    doc = (Path(__file__).parent.parent / "languages" / "dotnet" / "CARRIED_RULES.md").read_text(encoding="utf-8")
+    for check_id, reason in JUSTIFIED_DEGRADED.items():
+        assert reason.strip() and check_id in doc

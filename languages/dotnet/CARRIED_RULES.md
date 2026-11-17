@@ -22,3 +22,16 @@ Rule modules shared with `dotnet_legacy` that also run on SDK projects. The Core
 Caveat: DNL-DESER-003 (see the deserialization row) is by-name on Core. `JavaScriptSerializer` and
 `SimpleTypeResolver` do not exist in the net8.0 reference packs; the rule matches the name, so a ported or
 shimmed type is still flagged.
+
+## Web.config and degraded mode
+
+- A `Web.config` inside an SDK project (the IIS `aspNetCore` hosting stub, or leftover `system.web` /
+  `system.webServer` sections) is never read for Core: no DNL-CFG-*, DNL-WCF-* or Web.config-located
+  finding is reported for `dotnet`, and no crash note appears. The legacy package's ownership filter
+  drops the same file, so the legacy side reports nothing for it either (tests
+  `test_web_config_checks_do_not_run_on_core`, `test_legacy_still_reads_web_config_in_mixed_solution`).
+- Without the Roslyn helper (degraded mode) every id in the table above reports the same ids and files as
+  with it on the fixtures; `JUSTIFIED_DEGRADED` in `tests/test_dnl_core_carried.py` is empty, so no id is
+  excused. Degraded confidence is never higher than the helper's (`test_degraded_parity_per_family`).
+- The end-of-support comparison reads the run date through `rules_sca_core._today()`; tests that depend on
+  which frameworks are past end of support pin it with the `pinned_today` fixture.

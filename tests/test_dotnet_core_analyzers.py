@@ -11,6 +11,9 @@ from core.owasp_web import tag_results
 from languages.dotnet import detector as core_detector
 from languages.dotnet_legacy import detector as legacy_detector
 
+# The end-of-support comparison reads the run date; pin it so these tests do not shift with the calendar.
+pytestmark = pytest.mark.usefixtures("pinned_today")
+
 FIX = Path(__file__).parent / "fixtures"
 FX = FIX / "aspnetcore"
 CONTROLLERS, RAZOR, MINIMAL, MIXED = (FX / n for n in ("controllers_api", "razor_app", "minimal_api", "mixed_solution"))

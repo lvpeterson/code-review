@@ -52,6 +52,18 @@ def _owning(projects: list[project.Project], path: Path) -> project.Project | No
 _LIB_DIRS = {"lib", "libs", "scripts", "content"}
 
 
+def _below(f: Path, owner_dir: Path, target: Path) -> tuple[str, ...]:
+    """Directory names between the owner's directory and the file. A symlinked file resolves outside
+    the owner (a loose project owns the whole root): fall back to where it sits under the scan root,
+    and to nothing when it is outside that too."""
+    for base, path in ((owner_dir.resolve(), f.resolve()), (target, f)):
+        try:
+            return path.relative_to(base).parts[:-1]
+        except ValueError:
+            continue
+    return ()
+
+
 def _has_deps(target: Path, all_projects: list[project.Project], core: list[project.Project]) -> bool:
     """Something for the offline SCA to judge: package references, an end-of-support target framework,
     a packages.lock.json beside a project file, or bundled JS below a project's lib/scripts folder."""
@@ -69,7 +81,7 @@ def _has_deps(target: Path, all_projects: list[project.Project], core: list[proj
         if not js:
             if f.parent.resolve() == owner.dir.resolve():
                 return True
-        elif any(part.lower() in _LIB_DIRS for part in f.resolve().relative_to(owner.dir.resolve()).parts[:-1]):
+        elif any(part.lower() in _LIB_DIRS for part in _below(f, owner.dir, target)):
             return True
     return False
 

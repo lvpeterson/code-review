@@ -64,9 +64,14 @@ def _norm_tfm(tfm: str) -> str:
     return tfm.strip().lower().split("-")[0]
 
 
+def _today() -> datetime.date:
+    """The run date; the single clock of this module (tests pin it, see tests/conftest.py)."""
+    return datetime.date.today()
+
+
 def eol_tfms(today: datetime.date | None = None) -> set[str]:
     """Lower-cased target frameworks whose end-of-support date is on or before today."""
-    today = today or datetime.date.today()
+    today = today or _today()
     return {r["tfm"] for r in sca.eol_table()[1] if datetime.date.fromisoformat(r["eol"]) <= today}
 
 
@@ -239,7 +244,7 @@ def _check_references(model: ProjectModel, projects: list[Project], notes: list[
 def check(model: ProjectModel, today: datetime.date | None = None) -> tuple[list[Finding], list[str]]:
     """All SCA findings for the SDK projects of the model's root, plus notes (data problems,
     unreadable files, the date the end-of-support table was verified)."""
-    today = today or datetime.date.today()
+    today = today or _today()
     notes: list[str] = []
     _index, err, skipped = sca._load(sca._DATA)
     if err:
