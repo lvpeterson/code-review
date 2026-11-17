@@ -22,12 +22,29 @@ _MUTATING = {"POST", "PUT", "DELETE", "PATCH"}
 _SENSITIVE_CONTROLLER = re.compile(r"(?i)admin|manage|role|permission|setting|config")
 _SENSITIVE_ACTION = re.compile(r"(?i)^(delete|remove|purge|approve|grant|revoke|reset)")
 _HANDLER_PREFIX = re.compile(r"(?i)^on(get|post|put|delete|patch|head|options)")
+# Actions that are anonymous by design (sign-in, registration, token exchange, password recovery): a public
+# state-changing handler named or routed like this is not an AUTHZ-002 item. Matched on the action name and
+# on the last literal segment of the path, as a prefix, so `/reset-password` and `ForgotPassword` count but a
+# `Delete` under `/login/` does not.
+_ANON_BY_DESIGN = re.compile(r"^(login|signin|register|signup|logout|signout|token|refresh|callback|forgot|reset|confirm)")
 _UNPROTECTED = ("No [Authorize], RequireAuthorization (endpoint, group or Map call), global filter, "
                 "Razor Pages convention or fallback policy covers this route.")
 
 
 def _mutating_verbs(route) -> str:
     return ", ".join(sorted(_MUTATING & {v.upper() for v in route.methods}))
+
+
+def _anonymous_by_design(ref: CoreRouteRef) -> bool:
+    r = ref.route
+    action = ref.method.name if ref.method else (r.handler_name or "").split(".")[-1]
+    if ref.style == "razorpage":
+        action = _HANDLER_PREFIX.sub("", action)
+    names = [action]
+    segs = [x for x in (r.path or "").split("/") if x and not x.startswith("{") and not x.startswith("[")]
+    if segs:
+        names.append(segs[-1])
+    return any(_ANON_BY_DESIGN.match(re.sub(r"[^a-z]", "", n.lower())) for n in names if n)
 
 
 def _sensitive(ref: CoreRouteRef) -> bool:
@@ -61,7 +78,7 @@ def _route_findings(ref: CoreRouteRef, info: auth_core.CoreAuth) -> list[Finding
             "DNL-AUTHZ-001", "info", f"Anonymous action {r.handler_name}",
             f"{where} is explicitly public via {info.source}; confirm this is intended.{notes}",
             r.file, r.line, **kw))
-        if mutating:
+        if mutating and not _anonymous_by_design(ref):
             out.append(dnl_finding(
                 "DNL-AUTHZ-002", "medium", f"Anonymous state-changing action {r.handler_name}",
                 f"{r.handler_name} accepts {_mutating_verbs(r)} without authentication ({info.source}). "

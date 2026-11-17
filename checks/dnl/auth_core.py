@@ -73,6 +73,29 @@ _OPTION_CALLS = frozenset("""
 AddAuthorization AddAuthorizationCore AddControllers AddControllersWithViews AddMvc AddMvcCore AddRazorPages
 AddRazorPagesOptions AddMvcOptions Configure PostConfigure ConfigureOptions
 """.split())
+# Generic option registrations (`Configure<T>`, `AddOptions<T>().Bind(..)`) only matter when T can carry
+# authorization. A bare name that looks like a type parameter (T, TOptions) is as unknown as no argument.
+_CONFIGURE_CALLS = frozenset({"Configure", "PostConfigure", "ConfigureOptions"})
+_GENERIC_OPTION_CALLS = _CONFIGURE_CALLS | {"AddOptions", "Bind", "BindConfiguration"}
+_AUTH_OPTION_TYPES = frozenset("""
+AuthorizationOptions MvcOptions MvcCoreOptions RazorPagesOptions AuthenticationOptions CookieAuthenticationOptions
+JwtBearerOptions RouteOptions
+""".split())
+_TYPE_PARAM = re.compile(r"^T([A-Z]\w*)?$")
+# Unresolved registrations whose name, generic arguments or lambda look like authorization keep an
+# otherwise unprotected route UNKNOWN; the rest cannot turn it into anything but a definite finding.
+_AUTH_LOOKING = re.compile(r"auth|polic|identity|permission|security|claim|jwt|openid|oidc|cookie|session|access|role|acl",
+                           re.IGNORECASE)
+# Framework MVC / Razor Pages conventions that only edit routes, names or API explorer data.
+_BENIGN_CONVENTION_TYPES = re.compile(
+    r"^(RouteTokenTransformerConvention|PageRouteTransformerConvention|ApiExplorer\w*Convention|(Default)?ApiVersion\w*Convention)$")
+_CONVENTION_IFACES = frozenset("""
+IApplicationModelConvention IControllerModelConvention IActionModelConvention IParameterModelConvention
+IParameterModelBaseConvention IPageApplicationModelConvention IPageRouteModelConvention IPageHandlerModelConvention
+IPageConvention
+""".split())
+# What in a convention body could add, remove or replace authorization.
+_AUTHZ_TOUCH = re.compile(r"filter|metadata|authoriz|anonymous|polic|requirement|permission|\battributes\b", re.IGNORECASE)
 _POLICY_DEFS = frozenset({"AddPolicy", "AddDefaultPolicy", "AddFallbackPolicy"})
 _KNOWN_DENY_REQS = frozenset("""
 DenyAnonymousAuthorizationRequirement RolesAuthorizationRequirement ClaimsAuthorizationRequirement
@@ -417,7 +440,34 @@ def _from_result_true(e) -> bool:
             and len(e.get("args") or []) == 1 and _is_true(e["args"][0]))
 
 
-def _apply_link(model: ProjectModel, pol: _Pol, link: dict, runs: bool | None) -> None:
+def _policy_extension(model: ProjectModel, name: str) -> MethodIR | None:
+    """The one in-solution extension method `name(this AuthorizationPolicyBuilder ..)`, if exactly one exists."""
+    found = [m for t in model.types() for m in t.methods
+             if m.name == name and m.params and "this" in m.params[0].modifiers
+             and _simple(m.params[0].type) == "AuthorizationPolicyBuilder"]
+    return found[0] if len(found) == 1 else None
+
+
+def _apply_extension(model: ProjectModel, pol: _Pol, m: MethodIR, link: dict, runs: bool | None) -> None:
+    """Follow one level into a policy-builder extension: only calls on the builder parameter count."""
+    if runs is not True:
+        pol.unknown.append(f"{m.name} is applied under a condition")
+        return
+    bname = m.params[0].name
+    for kind, node, guards, root in _stmt_events(m.body, ()):
+        r = _runs(guards)
+        if r is False:
+            continue
+        if kind == "opaque":
+            pol.unknown.append(f"{m.name} contains a statement that could not be analysed")
+        elif kind == "call" and isinstance(root, dict) and root.get("k") == "name" and root.get("id") == bname:
+            _apply_link(model, pol, node, r, depth=1)
+        elif kind == "call" and any(isinstance(a, dict) and a.get("k") == "name" and a.get("id") == bname
+                                    for a in node.get("args") or []):
+            pol.unknown.append(f"the policy builder is passed to {call_name(node)} inside {m.name}")
+
+
+def _apply_link(model: ProjectModel, pol: _Pol, link: dict, runs: bool | None, depth: int = 0) -> None:
     name = call_name(link) or ""
     if name in ("Build", "AddAuthenticationSchemes"):
         return
@@ -452,7 +502,11 @@ def _apply_link(model: ProjectModel, pol: _Pol, link: dict, runs: bool | None) -
             else:
                 pol.unknown.append("AddRequirements argument is not a `new` expression")
     else:
-        pol.unknown.append(f"{name} is not analysed")
+        ext = _policy_extension(model, name) if depth == 0 else None
+        if ext is None:
+            pol.unknown.append(f"{name} is not analysed")
+        else:
+            _apply_extension(model, pol, ext, link, runs)
 
 
 def _policy_expr(model: ProjectModel, e) -> _Pol:
@@ -511,6 +565,9 @@ class _Settings:
     # Unanalysed registrations that could add an anonymous opt-out or otherwise weaken protection:
     # they block PROTECTED (-> UNKNOWN), not only UNPROTECTED.
     blockers: list[tuple[str, tuple | None]] = field(default_factory=list)
+    # Unresolved registrations that do not look like authorization (name, generic arguments, lambda): not a
+    # reason for an otherwise unprotected route, still one for a route protected only by a fallback policy.
+    plain_unresolved: list[tuple[str, tuple | None]] = field(default_factory=list)
     issue: tuple | None = None
     suppress_certain: bool = False
     suppress_uncertain: bool = False
@@ -522,8 +579,19 @@ class _Settings:
     def blockers_for(self, style: str) -> list[str]:
         return _dedup(r for r, st in self.blockers if st is None or style in st)
 
+    def plain_unresolved_for(self, style: str) -> list[str]:
+        return _dedup(r for r, st in self.plain_unresolved if st is None or style in st)
+
 
 _MVC_STYLES = ("controller", "razorpage")
+
+
+def _targs_of(call: dict) -> list[str]:
+    return [_simple(t) for t in (call.get("fn") or {}).get("targs") or []]
+
+
+def _auth_options_type(name: str) -> bool:
+    return name in _AUTH_OPTION_TYPES or name.endswith("AuthorizationOptions") or bool(_TYPE_PARAM.match(name))
 
 
 def _target_name(target) -> str:
@@ -653,19 +721,28 @@ def _build_settings(model: ProjectModel, pipe: Pipeline) -> _Settings:
         base = c.runs_in("Production")
         if base is False:
             continue
-        # Unresolved registrations that could change authorization.
-        if (not c.resolved and c.kind in ("services", "app") and c.name not in _NON_AUTHZ_EXTENSIONS
-                and c.name not in _ANALYSED):
-            S.reasons.append((f"{c.name} at {c.file}:{c.line} is not resolved and may change authorization", None))
-        if c.kind != "services":
-            continue
         node = c.node
         fn = node.get("fn") or {}
         targs = [_simple(t) for t in fn.get("targs") or []]
         idx = next((i for i, x in enumerate(c.chain) if x is node), 0)
         prior = {call_name(x) for x in c.chain[:idx]}
+        # Unresolved registrations that could change authorization.
+        if (not c.resolved and c.kind in ("services", "app") and c.name not in _NON_AUTHZ_EXTENSIONS
+                and c.name not in _ANALYSED):
+            msg = f"{c.name} at {c.file}:{c.line} is not resolved and may change authorization"
+            text = " ".join([c.name, *targs] + [v for n in walk([node.get("args"), node.get("named")])
+                                                 for v in n.values() if isinstance(v, str)])
+            (S.reasons if _AUTH_LOOKING.search(text) else S.plain_unresolved).append((msg, None))
+        if c.kind != "services":
+            continue
+        # Options type of a generic options registration: its own argument, or the AddOptions<T>() it continues.
+        otargs = targs or next((_targs_of(x) for x in reversed(c.chain[:idx]) if call_name(x) == "AddOptions"), [])
         auth_ctx = (c.name in ("AddAuthorization", "AddAuthorizationCore", "AddAuthorizationBuilder")
-                    or (c.name in ("Configure", "PostConfigure", "ConfigureOptions") and "AuthorizationOptions" in targs))
+                    or (c.name in _CONFIGURE_CALLS and "AuthorizationOptions" in otargs))
+        # Configure<T> and friends are an options call only for an authorization-relevant (or unknown) T.
+        generic_opts = c.name in _GENERIC_OPTION_CALLS
+        opts_relevant = any(_auth_options_type(t) for t in otargs) or (c.name in _CONFIGURE_CALLS and not otargs)
+        opt_call = opts_relevant if generic_opts else c.name in _OPTION_CALLS
         builder_ctx = "AddAuthorizationBuilder" in prior
         file, line = c.file, node.get("line") or c.line
 
@@ -723,15 +800,17 @@ def _build_settings(model: ProjectModel, pipe: Pipeline) -> _Settings:
                     S.filters.append(_Fact({"call": ev}, runs is True, file, eline))
                 elif recv.endswith("Conventions"):
                     S.page_convs.append(_Fact({"call": ev, "name": name}, runs is True, file, eline))
-                if (c.name in _OPTION_CALLS and p
+                if (opt_call and p
                         and any(isinstance(a, dict) and a.get("k") == "name" and a.get("id") == p
                                 for a in ev.get("args") or [])):
                     opaque = name
             # The options object handed to another method: what it does is not analysed.
-        if c.name in _OPTION_CALLS and (opaque or any(isinstance(a, dict) and a.get("k") in ("name", "member")
-                                                     for a in node.get("args") or [])):
-            what = opaque or next(receiver_text(a) or "a method group" for a in node.get("args") or []
-                                  if isinstance(a, dict) and a.get("k") in ("name", "member"))
+        # A generic registration of a relevant T is blocked by any non-lambda argument (a configuration
+        # section may bind anything the type has); other calls only by a name / member (method group).
+        shown = ("name", "member") if not generic_opts else ("name", "member", "call", "new")
+        if opt_call and (opaque or any(isinstance(a, dict) and a.get("k") in shown for a in node.get("args") or [])):
+            what = opaque or next(receiver_text(a) or call_name(a) or "a method group" for a in node.get("args") or []
+                                  if isinstance(a, dict) and a.get("k") in shown)
             msg = f"{c.name} options are configured by {what} at {file}:{line}, which is not analysed"
             S.reasons.append((msg, None))
             S.blockers.append((msg, None))
@@ -758,10 +837,61 @@ def _build_settings(model: ProjectModel, pipe: Pipeline) -> _Settings:
         name = f.data["name"]
         if name in _ROUTE_CONVENTIONS or name.startswith(("Authorize", "AllowAnonymousTo")):
             continue
+        if name == "Add" and _convention_benign(model, f.data["call"]):
+            continue
         msg = f"Conventions.{name} at {f.file}:{f.line} may change authorization and is not analysed"
         S.reasons.append((msg, _MVC_STYLES))
         S.blockers.append((msg, _MVC_STYLES))
     return S
+
+
+def _body_text(node) -> str:
+    return " ".join(v for n in walk(node) for v in n.values() if isinstance(v, str))
+
+
+def _convention_benign(model: ProjectModel, call: dict, depth: int = 0) -> bool:
+    """`Conventions.Add(new X(..))`: true only when X is a framework route / API-explorer convention, or a
+    solution class whose methods never touch filters, endpoint metadata, attributes or authorization types,
+    never hand the model to another solution method, and whose bases are conventions or analysable the same way."""
+    args = call.get("args") or []
+    new = args[0] if len(args) == 1 else None
+    if not (isinstance(new, dict) and new.get("k") == "new"):
+        return False
+    return _convention_type_benign(model, _simple(new.get("type")), new, depth)
+
+
+def _convention_type_benign(model: ProjectModel, tn: str, new: dict | None, depth: int) -> bool:
+    types = [t for t in model.find_types(tn) if t.kind in ("class", "struct", "record")] if depth < 4 else []
+    if new is not None and any(isinstance(n, dict) and n.get("k") == "lambda" for n in walk(new.get("args"))):
+        return False
+    if not types:
+        return bool(_BENIGN_CONVENTION_TYPES.match(tn)) and depth == 0
+    if new is not None and _AUTHZ_TOUCH.search(_body_text(new.get("args"))):
+        return False
+    solution_methods = {m.name for t in model.types() for m in t.methods}
+    for t in types:
+        for b in t.bases:
+            bn = _simple(b)
+            if bn in _CONVENTION_IFACES or bn in ("object", "Object"):
+                continue
+            if not model.find_types(bn) or not _convention_type_benign(model, bn, None, depth + 1):
+                return False
+        own = {m.name for m in t.methods}
+        for m in t.methods:
+            if _AUTHZ_TOUCH.search(_body_text(m.body)):
+                return False
+            for n in walk(m.body):
+                if n.get("k") != "call":
+                    continue
+                fn = n.get("fn") or {}
+                callee = call_name(n) or ""
+                if fn.get("k") == "name" and callee not in own:
+                    return False        # a helper this module does not see, handed the model
+                if (fn.get("k") == "member" and callee in solution_methods
+                        and receiver_text(fn.get("obj")) not in ("this", "base")
+                        and model.find_types(_simple(receiver_text(fn.get("obj"))))):
+                    return False        # a call into another solution type
+    return True
 
 
 # -- policy / default / fallback verdicts -----------------------------------------------
@@ -1024,10 +1154,12 @@ def _authz_from_args(model: ProjectModel, S: _Settings, link: dict, item: _Item)
 
 
 def _call_items(model: ProjectModel, S: _Settings, sites: dict, ref: CoreRouteRef, calls: list[dict],
-                label: str, file: str, line: int, step: int = 2) -> tuple[list[_Item], list[str]]:
-    """Items and route-level reasons for the fluent calls applied at one level (endpoint, group, Map call)."""
+                label: str, file: str, line: int, step: int = 2) -> tuple[list[_Item], list[str], list[str]]:
+    """Items, reasons that block PROTECTED, and soft reasons (endpoint filters: they can deny or short-circuit
+    but cannot grant or remove authorization metadata) for the fluent calls applied at one level."""
     items: list[_Item] = []
     reasons: list[str] = []
+    soft: list[str] = []
     for link in calls:
         name = call_name(link) or ""
         f, ln = _call_site(sites, link, file, line)
@@ -1052,12 +1184,12 @@ def _call_items(model: ProjectModel, S: _Settings, sites: dict, ref: CoreRouteRe
                         it.conditional = f"{name} applied conditionally" in ref.unknown
                         items.append(it)
         elif name in _ENDPOINT_FILTERS:
-            reasons.append(f"{name} at {f}:{ln} may reject requests or change the endpoint metadata")
+            soft.append(f"{name} at {f}:{ln} may reject requests or change the endpoint metadata")
         elif name in ("Add", "Finally"):
             reasons.append(f"{name}(...) convention at {f}:{ln} may change endpoint metadata and is not analysed")
         elif name not in _BENIGN_CONVENTIONS and not (link.get("sym") or "").startswith("Microsoft."):
             reasons.append(f"{name} at {f}:{ln} is not analysed")
-    return items, reasons
+    return items, reasons, soft
 
 
 # -- Razor Pages conventions ------------------------------------------------------------
@@ -1291,8 +1423,9 @@ def _attr_file(ref: CoreRouteRef, ct: TypeIR, a: Attr) -> str:
 
 
 def _route_items(model: ProjectModel, S: _Settings, pipe: Pipeline, ref: CoreRouteRef,
-                 notes: list[str]) -> tuple[list[_Item], list[str], list[str]]:
-    """(items in specificity order, route-level reasons, reasons that block PROTECTED)."""
+                 notes: list[str]) -> tuple[list[_Item], list[str], list[str], list[str]]:
+    """(items in specificity order, route-level reasons, reasons that block PROTECTED, soft reasons that only
+    matter for a route nothing else protects)."""
     items: list[_Item] = []
     reasons: list[str] = []
     block: list[str] = []
@@ -1314,17 +1447,21 @@ def _route_items(model: ProjectModel, S: _Settings, pipe: Pipeline, ref: CoreRou
             label = (lambda n: f"attribute:{n}") if i == 0 else (lambda n, ct=ct: f"base:{ct.name.split('.')[-1]}")
             # Attributes carry no file of their own: the declaring half is found by identity.
             items += _attr_items(model, ct.attributes, label, _attr_file(ref, ct, ct.attributes[0]) if ct.attributes else ct.file)
-    its, rs = _call_items(model, S, sites, ref, ref.endpoint_calls, "endpoint:", mfile, route.line)
+    soft: list[str] = []
+    its, rs, sf = _call_items(model, S, sites, ref, ref.endpoint_calls, "endpoint:", mfile, route.line)
     items += _relabel(its, "endpoint")
     reasons += rs
+    soft += sf
     for g in reversed(ref.groups):
-        its, rs = _call_items(model, S, sites, ref, g.calls, "group", g.file, g.line)
+        its, rs, sf = _call_items(model, S, sites, ref, g.calls, "group", g.file, g.line)
+        soft += sf
         for it in its:
             it.source = f"group:{g.prefix or '(inherited)'} {it.source.split(' ', 1)[1]}"
         items += its
         reasons += rs
     map_name = {"razorpage": "MapRazorPages()"}.get(ref.style, "MapControllers()")
-    its, rs = _call_items(model, S, sites, ref, ref.convention_calls, map_name, mfile, route.line)
+    its, rs, sf = _call_items(model, S, sites, ref, ref.convention_calls, map_name, mfile, route.line)
+    soft += sf
     for it in its:
         it.source = f"{map_name}.{it.source.split(' ', 1)[1]}"
     items += its
@@ -1338,7 +1475,7 @@ def _route_items(model: ProjectModel, S: _Settings, pipe: Pipeline, ref: CoreRou
         its, blk = _page_items(model, S, ref)
         items += its
         block += blk
-    return items, reasons, block
+    return items, reasons, block, soft
 
 
 def _relabel(items: list[_Item], label: str) -> list[_Item]:
@@ -1359,7 +1496,7 @@ def resolve(model: ProjectModel, ref: CoreRouteRef, pipe: Pipeline) -> CoreAuth:
         return CoreAuth(UNPROTECTED, "middleware (not endpoint-routed; authorization does not apply)",
                         file=route.file, line=route.line)
     notes: list[str] = []
-    items, route_reasons, block = _route_items(model, S, pipe, ref, notes)
+    items, route_reasons, block, soft_reasons = _route_items(model, S, pipe, ref, notes)
     cond = [r for r in ref.unknown if r.endswith("applied conditionally")]
 
     # 1. anonymous beats every other mechanism.
@@ -1442,7 +1579,7 @@ def resolve(model: ProjectModel, ref: CoreRouteRef, pipe: Pipeline) -> CoreAuth:
                     notes.append("fallback policy is not enforced: " + S.issue[0] + " and "
                                  "SuppressCheckForUnhandledSecurityMetadata is true")
                     return CoreAuth(UNPROTECTED, "none", file=fact.file, line=fact.line, notes=notes)
-                blocking = _dedup(blk + S.reasons_for(ref.style) + reasons)
+                blocking = _dedup(blk + S.reasons_for(ref.style) + S.plain_unresolved_for(ref.style) + reasons)
                 if blocking:
                     return CoreAuth(UNKNOWN, "none", roles, pnames, reasons=blocking, notes=notes)
                 return CoreAuth(PROTECTED, "fallback policy", roles, pnames, fact.file, fact.line, notes=notes)
@@ -1451,7 +1588,7 @@ def resolve(model: ProjectModel, ref: CoreRouteRef, pipe: Pipeline) -> CoreAuth:
             notes.append(fb_note)
         elif v == UNK:
             reasons += rs
-    reasons += route_reasons
+    reasons += route_reasons + soft_reasons
     if ref.caller_unknown:
         reasons.append("the method registering this route has no traced caller")
     reasons += S.reasons_for(ref.style)
