@@ -17,6 +17,8 @@ app.MapRazorPages();
 app.MapGet("/m/cmd", (string q) => Process.Start("tool", q));
 app.MapGet("/m/args", ([AsParameters] SearchArgs a) => Process.Start("tool", a.Sql));
 app.MapGet("/m/helper", (HttpContext ctx) => Helpers.Run(ctx));
+app.MapGet("/m/req", (HttpRequest req) => Process.Start("tool", req.Query["q"]));
+app.MapPost("/m/ctx", (HttpContext c) => Process.Start("tool", c.Request.Form["f"]));
 app.Run();
 
 static class Helpers

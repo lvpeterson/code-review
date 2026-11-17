@@ -350,10 +350,36 @@ class _Analysis:
         for s, _, text_re in _SOURCE_RES:
             if text_re and text and text_re.match(text):
                 return self._origin(s.name, line)
+        typed = self._typed_core_source(e)
+        if typed is not None:
+            return typed
         if e.get("k") == "member" and (e.get("name") or "").lower() in T.FIELD_SOURCE_MEMBERS:
             tn = self.type_of(self._recv(e))
             if tn and _FIELD_SRC_RE.match(_simple(tn)):
                 return self._origin(f"{_simple(tn)}.{e.get('name')}", line)
+        return None
+
+    def _typed_core_source(self, e: dict) -> Taint | None:
+        """No-sym Core request read through a receiver whose declared / inferred type is `HttpContext`
+        (`c.Request`, `c.Request.Query`, `c.GetRouteValue`) or `HttpRequest` (`req.Query`), whatever the
+        variable is called. Same members and origin names as the Core rows of the source table."""
+        if e.get("k") != "member":
+            return None
+        proj = self.model.project_of(self.t.file)
+        if proj is None or proj.owner != "dotnet":
+            return None                     # legacy `HttpRequest` is System.Web's: its rows are unchanged
+        name = (e.get("name") or "").lower()
+        recv = self._recv(e)
+        if not isinstance(recv, dict):
+            return None
+        rt = _simple(self.type_of(recv) or "").lower()
+        if rt == "httpcontext":
+            if name == "request":
+                return self._origin("Request", e.get("line", 0))
+            if name == "getroutevalue":
+                return self._origin("RouteValues", e.get("line", 0))
+        elif rt == "httprequest" and name in T.CORE_REQUEST_MEMBERS:
+            return self._origin(T.CORE_REQUEST_MEMBERS[name], e.get("line", 0))
         return None
 
     # -- sink matching ---------------------------------------------------

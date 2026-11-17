@@ -401,6 +401,7 @@ def solve(model) -> dict[tuple[str, str, int], Summary]:
     if cached is not None:
         return cached["summaries"]
     methods = _all_methods(model)
+    bind_seeds = _bind_seeds(model)
     summaries: dict[tuple, Summary] = {}
     ft: dict[str, dict[str, Taint]] = {}
     results: dict[tuple, tuple] = {}
@@ -421,6 +422,8 @@ def solve(model) -> dict[tuple[str, str, int], Summary]:
             lk = t.full_name.lower()
             if lk not in ftc:
                 ftc[lk] = _type_field_taint(model, t, ft)
+                for sk, sv in bind_seeds.get(lk, {}).items():
+                    ftc[lk][sk] = merge(ftc[lk].get(sk), sv)
             try:
                 r = TN.analyze_method(model, t, m, param_taint=_param_seeds(t, m), field_taint=ftc[lk],
                                       summaries=summaries)
@@ -496,7 +499,7 @@ iset ireadonlylist ireadonlycollection ireadonlyset idictionary ireadonlydiction
 ihtmlcontent""".split())
 _EXTERNAL_IFACE = re.compile(r"^I[A-Z][a-z]")
 # An explicit binding source (or [AsParameters]) overrides every type-based exclusion.
-_BIND_SOURCE_ATTRS = ("FromBody", "FromQuery", "FromForm", "FromRoute", "FromHeader", "AsParameters")
+_BIND_SOURCE_ATTRS = ("FromBody", "FromQuery", "FromForm", "FromRoute", "FromHeader", "AsParameters", "ModelBinder")
 _SERVICE_ADDS = ("AddScoped", "AddTransient", "AddSingleton", "AddKeyedScoped", "AddKeyedTransient",
                  "AddKeyedSingleton", "TryAddScoped", "TryAddTransient", "TryAddSingleton", "TryAddKeyedScoped",
                  "TryAddKeyedTransient", "TryAddKeyedSingleton", "AddDbContext", "AddDbContextPool", "AddHttpClient")
@@ -636,6 +639,14 @@ def _core_type_excluded(model, text: str | None, rel: str, ns: str, proj, servic
         t.kind == "interface" or "abstract" in [x.lower() for x in t.modifiers] for t in cands)
 
 
+def _type_has_attr(model, text: str | None, rel: str, ns: str, proj, *names: str) -> bool:
+    """True when a project type this name may refer to carries one of the attributes (a type-level
+    `[ModelBinder]` makes its parameters request input whatever the type looks like)."""
+    full = _type_index(model)["full"]
+    return any(has_attr(t.attributes, *names) for k in _type_keys(model, text, rel, ns, proj, False)
+               if k.startswith("t:") for t in full.get(k[2:].split("<")[0], []))
+
+
 def _owners(model) -> dict[int, TypeIR]:
     own = model.cache.get("taint_owner")
     if own is None:
@@ -656,6 +667,7 @@ def core_param_taint(model, ref) -> dict[int, Taint]:
         if has_attr(p.attributes, "FromServices", "FromKeyedServices"):
             continue
         if not has_attr(p.attributes, *_BIND_SOURCE_ATTRS) \
+                and not _type_has_attr(model, p.type, t.file, ns, ref.project, "ModelBinder") \
                 and _core_type_excluded(model, p.type, t.file, ns, ref.project, services):
             continue
         o = Origin("source", f"request parameter {p.name}", t.file, m.line)
@@ -666,10 +678,12 @@ def core_param_taint(model, ref) -> dict[int, Taint]:
 _ON_GET = re.compile(r"^On(?:Get|Head)(?![a-z])")
 
 
-def _handler_is_get(m: MethodIR) -> bool | None:
-    """True for a GET/HEAD-only handler, False for another verb, None when the verb is unknown."""
-    if re.match(r"^On[A-Z]", m.name):
-        return bool(_ON_GET.match(m.name))
+def _handler_is_get(model, t: TypeIR, m: MethodIR) -> bool | None:
+    """True for a GET/HEAD-only handler, False for another verb, None when the verb is unknown.
+    A page model decides by the `On<Verb>` name, a controller by its verb attributes (a method
+    named `OnGetX` on a controller is an ordinary action)."""
+    if model.derives_from(t, {"PageModel"}):
+        return bool(_ON_GET.match(m.name)) if re.match(r"^On[A-Z]", m.name) else None
     verbs = {attr_key(a.name) for a in m.attributes} & {"httpget", "httphead", "httppost", "httpput", "httpdelete",
                                                         "httppatch", "acceptverbs"}
     if not verbs or "acceptverbs" in verbs:
@@ -678,13 +692,16 @@ def _handler_is_get(m: MethodIR) -> bool | None:
 
 
 def _supports_get(a) -> bool:
-    v = (a.named or {}).get("SupportsGet")
-    return isinstance(v, dict) and v.get("v") is True
+    """Only a literal `false` (or no SupportsGet) leaves GET out; a constant or expression counts as true."""
+    if "SupportsGet" not in (a.named or {}):
+        return False
+    v = a.named["SupportsGet"]
+    return not (isinstance(v, dict) and v.get("k") == "lit" and v.get("v") is False)
 
 
 def _bound(model, t: TypeIR, method: MethodIR, proj) -> dict[str, tuple[str, int]]:
     """Bound property name (lowered) -> (file, line) of its declaration."""
-    get = _handler_is_get(method) is True
+    get = _handler_is_get(model, t, method) is True
     services = core_services(model, proj)
     out: dict[str, tuple[str, int]] = {}
     for d in _chain(model, t):
@@ -708,6 +725,25 @@ def bound_properties(model, t: TypeIR, method: MethodIR, proj=None) -> set[str]:
     GET/HEAD handler only those with `SupportsGet = true`. An unknown verb counts as non-GET.
     `[BindNever]` / `[FromServices]` properties and types the request cannot carry are left out."""
     return set(_bound(model, t, method, proj))
+
+
+def _bind_seeds(model) -> dict[str, dict[str, Taint]]:
+    """Solve-phase field taint of page models and controllers with bound properties: the union a POST
+    handler sees (GET-only `SupportsGet` rules are applied by the entry replay, so a helper called from
+    a GET handler over-reports, accepted). Core projects only."""
+    seeds = model.cache.get("taint_bind_seeds")
+    if seeds is None:
+        seeds = {}
+        for t in model.types():
+            proj = model.project_of(t.file)
+            if proj is None or proj.owner != "dotnet":
+                continue
+            post = MethodIR("OnPost" if model.derives_from(t, {"PageModel"}) else "Post")
+            got = _bound_origins(model, t, post, proj)
+            if got:
+                seeds[t.full_name.lower()] = got
+        model.cache["taint_bind_seeds"] = seeds
+    return seeds
 
 
 def _bound_origins(model, t: TypeIR, method: MethodIR, proj) -> dict[str, Taint]:

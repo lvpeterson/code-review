@@ -5,6 +5,9 @@ using TaintApp.Services;
 [Route("bind")]
 public class BindController : ControllerBase
 {
+    [BindProperty]
+    public string Note { get; set; } = "";
+
     [HttpGet("di")]
     public IActionResult Di(IReport report)
     {
@@ -46,6 +49,28 @@ public class BindController : ControllerBase
     {
         var x = file.FileName;
         System.Diagnostics.Process.Start("tool", x);
+        return Ok();
+    }
+
+    [HttpGet("req")]
+    public IActionResult Req(HttpRequest request)
+    {
+        System.Diagnostics.Process.Start("tool", request.Query["q"]);
+        return Ok();
+    }
+
+    [HttpGet("req2")]
+    public IActionResult Req2(HttpRequest r)
+    {
+        System.Diagnostics.Process.Start("tool", r.Query["q"]);
+        return Ok();
+    }
+
+    // A controller action that merely looks like a Razor Page handler: its verb is the attribute's.
+    [HttpPost("ongetx")]
+    public IActionResult OnGetX()
+    {
+        System.Diagnostics.Process.Start("tool", Note);
         return Ok();
     }
 }

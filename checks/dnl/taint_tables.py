@@ -38,6 +38,14 @@ CORE_REQUEST_TEXT = (rf"(?i)^{_CORE_CTX}request"
                      r"(\.(query|form|headers|cookies|routevalues|body|bodyreader|path|pathbase|querystring|host|"
                      r"method|scheme|contenttype))?$")
 
+# Members of a Core `HttpRequest` (reached through a variable typed HttpRequest, no sym) -> origin name;
+# the same members and names as the Core rows of SOURCES.
+CORE_REQUEST_MEMBERS = {**{m: "Request" for m in ("query", "form", "headers", "cookies", "path", "pathbase",
+                                                   "querystring", "host", "method", "scheme", "contenttype",
+                                                   "readformasync")},
+                        "body": "Request.Body", "bodyreader": "Request.Body", "readfromjsonasync": "Request.Body",
+                        "routevalues": "RouteValues"}
+
 SOURCES: tuple[Source, ...] = (
     Source("Request", rf"^{_REQ}\.(QueryString|Form|Params|Cookies|Headers|ServerVariables|RawUrl|Url|"
                       r"UrlReferrer|Files|InputStream|Item|Unvalidated|Path|PathInfo|UserAgent|ContentType|"

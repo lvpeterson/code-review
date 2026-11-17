@@ -165,5 +165,61 @@ def test_degraded_binding(degraded_app):
     assert len(_route_hits(findings, "DNL-INJ-002", "CommentModel.OnPost")) == 1
     for p in ("/m/cmd", "/m/args"):
         assert _route_hits(findings, "DNL-INJ-002", path=p), p
-    # Known degraded gap: `c.Request.Query` on a parameter named `c` is only a source with symbols
-    # (the text table needs a `context`/`page`/`HttpContext.Current` receiver), so /m/helper has no finding here.
+
+
+# -- declared-type request receivers, same-type helpers, verb rules -----------------------------
+
+def _typed_request_checks(findings):
+    for p in ("/m/helper", "/m/req", "/m/ctx"):
+        assert _route_hits(findings, "DNL-INJ-002", path=p), p
+    for h in ("Req", "Req2"):
+        assert _route_hits(findings, "DNL-INJ-002", f"BindController.{h}"), h
+
+
+def test_typed_request_receivers(app):
+    _typed_request_checks(app[1])
+
+
+def test_typed_request_receivers_degraded(degraded_app):
+    _typed_request_checks(degraded_app[1])
+
+
+def _same_type_helper_checks(findings):
+    got = _route_hits(findings, "DNL-INJ-002", "NotesModel.OnPost")
+    assert len(got) == 1 and got[0].line == _line_of("Pages/Notes.cshtml.cs", '"tool4"')
+    assert "[BindProperty] Text" in got[0].description
+
+
+def test_helper_on_same_type_sees_bound_property(app):
+    _same_type_helper_checks(app[1])
+
+
+def test_helper_on_same_type_sees_bound_property_degraded(degraded_app):
+    _same_type_helper_checks(degraded_app[1])
+
+
+def test_controller_action_named_like_page_handler_uses_its_attribute(app):
+    # `OnGetX` on a controller is an ordinary [HttpPost] action: the bound property is request input.
+    got = _route_hits(app[1], "DNL-INJ-002", "BindController.OnGetX")
+    assert len(got) == 1 and "[BindProperty] Note" in got[0].description
+
+
+def test_supports_get_only_literal_false_drops_the_property():
+    from checks.dnl.ir import Attr
+    assert not taint_solver._supports_get(Attr("BindProperty"))
+    assert not taint_solver._supports_get(Attr("BindProperty", named={"SupportsGet": {"k": "lit", "v": False}}))
+    assert taint_solver._supports_get(Attr("BindProperty", named={"SupportsGet": {"k": "lit", "v": True}}))
+    assert taint_solver._supports_get(Attr("BindProperty", named={"SupportsGet": {"k": "name", "id": "Flag"}}))
+
+
+def test_model_binder_overrides_type_exclusions(app):
+    from types import SimpleNamespace
+    from checks.dnl.ir import Attr
+    model, _ = app
+    t = next(t for t in model.types() if t.name == "BindController")
+
+    def taint(attrs):
+        m = MethodIR("A", params=[ParamIR("a", "IReport", attrs)], line=1)
+        return set(taint_solver.core_param_taint(model, SimpleNamespace(method=m, type=t, project=None)))
+    assert taint([]) == set()
+    assert taint([Attr("ModelBinder")]) == {0}
