@@ -48,7 +48,7 @@ def on(findings, rule):
 def _check(findings):
     # Edit / EditSafe look the record up by id with no ownership check: real IDORs too.
     assert on(findings, "DNL-AUTHZ-005") == {"OrdersController.Get", "/m/users/{id}", "FormsController.Edit",
-                                             "FormsController.EditSafe"}
+                                             "FormsController.EditSafe", "OrdersController.Probe"}
     assert on(findings, "DNL-AUTHZ-006") == {"OrdersController.Put", "FormsController.Edit", "EditOrderModel.OnPost",
                                              "/m/orders"}
     assert on(findings, "DNL-AUTHZ-007") == {"OrdersController.Users", "/m/users/{id}", "AccountsController.Me"}
@@ -60,7 +60,7 @@ def test_entity_types(app):
 
 def test_idor(app):
     got = on(app[2], "DNL-AUTHZ-005")
-    assert {"OrdersController.Get", "/m/users/{id}"} <= got
+    assert {"OrdersController.Get", "/m/users/{id}", "OrdersController.Probe"} <= got
     assert not got & {"OrdersController.Mine", "OrdersController.Authz"}
     assert all(f.confidence == "REVIEW" and f.severity == "low" for f in app[2] if f.check_id == "DNL-AUTHZ-005")
 
@@ -198,6 +198,12 @@ public class ADocController : ControllerBase
     [HttpGet("ak")] public IActionResult Keys() => Ok(db.Accts.ToList());
     [HttpGet("sk")] public IActionResult Sk() => Ok(db.Keys.ToList());
     [HttpGet("hd")] public IActionResult Hd() => Ok(db.Hiddens.ToList());
+    [HttpGet("u1/{id}")] public async Task<IActionResult> Unknown(int id)
+    { var o = db.Docs.Find(id); var r = await authz.AuthorizeAsync(User, o, "p"); if (r == null) return NotFound(); return Ok(o); }
+    [HttpGet("u2/{id}")] public async Task<IActionResult> CondFollow(int id, bool flag)
+    { var o = db.Docs.Find(id); var r = await authz.AuthorizeAsync(User, o, "p"); if (r.Succeeded) return Ok(o); if (flag) return Forbid(); return Ok(o); }
+    [HttpGet("u3/{id}")] public async Task<IActionResult> CondElse(int id, bool flag)
+    { var o = db.Docs.Find(id); var r = await authz.AuthorizeAsync(User, o, "p"); if (r.Succeeded) { Audit(); } else { if (flag) return Forbid(); } return Ok(o); }
     private void Audit() { }
 }
 public class FormBodyController : Controller
@@ -262,7 +268,8 @@ def test_authz_result_must_gate_a_rejection(tmp_path, monkeypatch):
     model, refs = _scan(tmp_path, monkeypatch, {"A.cs": _FIX2})
     idor = on(rules_object.check(model, refs), "DNL-AUTHZ-005")
     # A null-check NotFound next to an AuthorizeAsync whose failure rejects nothing is no guard.
-    assert "ADocController.NullOnly" in idor
+    assert {"ADocController.NullOnly", "ADocController.Unknown", "ADocController.CondFollow",
+            "ADocController.CondElse"} <= idor
     for ok in ("Pos", "Neg", "Else", "Inline", "Um"):
         assert f"ADocController.{ok}" not in idor, ok
     project._CACHE.clear()
@@ -325,11 +332,54 @@ def test_legacy_result_unchanged_in_mixed_solution(tmp_path, monkeypatch):
     monkeypatch.setattr("checks.dnl.helper.sdk_available", lambda *a, **k: False)
     project._CACHE.clear()
     res = enumerator.enumerate_target(root, allow_degraded=True)
-    fs = [f for r in res for f in r.findings if f.check_id == "DNL-AUTHZ-005" and f.route is not None]
     by_lang = {(r.language, f.route.handler_name) for r in res for f in r.findings
                if f.check_id == "DNL-AUTHZ-005" and f.route is not None}
     # Legacy MVC keeps its tables: User.FindFirstValue is not an ownership signal there, so it reports.
     assert ("dotnet_legacy", "DocsController.Show") in by_lang
     # The same shape in the Core project is an ownership check.
     assert ("dotnet", "DocsController.Show") not in by_lang
+    project._CACHE.clear()
+
+
+_IDENT = '''
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
+using Microsoft.AspNetCore.Mvc;
+public class ApplicationUser : IdentityUser { }
+public class ApplicationRole : IdentityRole { }
+public class AppIdentityDb
+    : IdentityDbContext<
+        ApplicationUser,
+        ApplicationRole,
+        string>
+{
+}
+public class Salted { public int Id { get; set; } public string Salt { get; set; } }
+public class Stamped { public int Id { get; set; } public string SecurityStamp { get; set; } }
+public class Tokened { public int Id { get; set; } public string Tokens { get; set; } }
+public class Plain { public int Id { get; set; } public string Name { get; set; } }
+public class Db : DbContext { public DbSet<Salted> Salteds { get; set; } public DbSet<Stamped> Stampeds { get; set; }
+                              public DbSet<Tokened> Tokeneds { get; set; } public DbSet<Plain> Plains { get; set; } }
+[ApiController]
+public class RolesController : ControllerBase
+{
+    private readonly Db db;
+    private readonly RoleManager<ApplicationRole> roles;
+    [HttpGet("r")] public async Task<IActionResult> R(string name) { var role = await roles.FindByNameAsync(name); return Ok(role); }
+    [HttpGet("s")] public IActionResult S() => Ok(db.Salteds.ToList());
+    [HttpGet("t")] public IActionResult T() => Ok(db.Stampeds.ToList());
+    [HttpGet("k")] public IActionResult K() => Ok(db.Tokeneds.ToList());
+    [HttpGet("p")] public IActionResult P() => Ok(db.Plains.ToList());
+}
+'''
+
+
+def test_identity_multiline_bases_and_member_variants(tmp_path, monkeypatch):
+    model, refs = _scan(tmp_path, monkeypatch, {"A.cs": _IDENT})
+    assert {"ApplicationUser", "ApplicationRole"} <= rules_object.entity_types(model)
+    assert {"ApplicationUser", "ApplicationRole"} <= rules_object._sensitive_entities(
+        model, rules_object.entity_types(model))
+    exposed = on(rules_object.check(model, refs), "DNL-AUTHZ-007")
+    assert {"RolesController.R", "RolesController.S", "RolesController.T", "RolesController.K"} <= exposed
+    assert "RolesController.P" not in exposed
     project._CACHE.clear()

@@ -37,6 +37,15 @@ public class OrdersController : ControllerBase
         return Ok(o);
     }
 
+    [HttpGet("probe/{id}")]
+    public async Task<IActionResult> Probe(int id)
+    {
+        var o = db.Orders.Find(id);
+        var r = await authz.AuthorizeAsync(User, o, "Owner");
+        if (r == null) return NotFound();
+        return Ok(o);
+    }
+
     [HttpPut("{id}")]
     public IActionResult Put(int id, Order o)
     {

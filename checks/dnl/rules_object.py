@@ -73,7 +73,7 @@ _AUTHZ_CALLS = {"authorizeasync", "authorize"}
 _SENSITIVE = re.compile(r"(?i)^(password|role)|hash$|tokens?$|secrets?$|apikey|secretkey|salt|securitystamp|^isadmin$")
 # Identity base types that carry PasswordHash / SecurityStamp (the base is external, so its members are unseen).
 _IDENTITY_BASE = re.compile(r"^Identity(User|Role)(?![A-Za-z])")
-_IDENTITY_CTX = re.compile(r"\bIdentityDbContext\s*<([^{;]*)>")
+_IDENTITY_CTX = re.compile(r"\bIdentityDbContext\s*<")
 _TRY_UPDATE = {"tryupdatemodelasync", "tryupdatemodel"}
 # Whether the route being analysed is an ASP.NET Core one: set by check() around each route, read by the
 # user-marker and rejection helpers (legacy routes must see exactly the original tables).
@@ -128,11 +128,21 @@ def _identity_entities(model: ProjectModel, t: TypeIR) -> set[str]:
         lines = (model.root / t.file).read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return set()
-    head = " ".join(lines[max(t.line - 1, 0):t.line + 3])
+    # The whole declaration header, however many lines the base list spans, up to the opening brace.
+    head = ""
+    for ln in lines[max(t.line - 1, 0):]:
+        head += " " + ln
+        if "{" in ln or ";" in ln:
+            break
+    head = re.split(r"[{;]", head, maxsplit=1)[0]
     m = _IDENTITY_CTX.search(head)
     if not m:
         return set()
-    return {_simple(a) for a in _split_args(m.group(1))[:2] if a}
+    depth, end = 1, m.end()
+    while end < len(head) and depth:
+        depth += {"<": 1, ">": -1}.get(head[end], 0)
+        end += 1
+    return {_simple(a) for a in _split_args(head[m.end():end - 1])[:2] if a}
 
 
 def entity_types(model: ProjectModel) -> set[str]:
@@ -325,18 +335,49 @@ def _following(body, node) -> list:
     return []
 
 
+def _stmts(x) -> list:
+    return x if isinstance(x, list) else [x] if isinstance(x, dict) else []
+
+
+def _rejection_stmt(st: dict) -> bool:
+    """A statement that denies by itself: a throw, or a return of a rejecting call / new (not a ternary)."""
+    if st.get("k") == "throw":
+        return True
+    v = st.get("value") if st.get("k") == "return" else st
+    if st.get("k") == "expr":
+        v = st.get("expr")
+    return isinstance(v, dict) and v.get("k") in ("call", "new") and _rejects(v)
+
+
+def _unconditional_denial(x) -> bool:
+    """The branch / block reaches a rejection with no condition in between: walking its top-level
+    statements, the first terminating one (return / throw) is a rejection. A rejection nested in an
+    inner if, loop or try runs only sometimes and never counts. A bare rejecting expression (the arm
+    of a ternary) counts."""
+    if isinstance(x, dict) and x.get("k") in ("call", "new"):
+        return _rejects(x)
+    for st in _stmts(x):
+        if _rejection_stmt(st):
+            return True
+        if st.get("k") in ("return", "throw"):
+            return False
+    return False
+
+
 def _denies_on_failure(body, node, cond, then, other) -> bool:
-    """Does a rejection run when the authorization result fails, given an `if` / ternary on it. A
-    rejection that has nothing to do with the result (a null check) never counts."""
+    """Does a rejection run unconditionally when the authorization result fails, given an `if` / ternary
+    on it. A rejection that has nothing to do with the result (a null check), one nested in another
+    condition, and an unrecognised condition shape never count."""
     pol = _polarity(cond)
     if pol == "fail":
-        return _rejects(then)
+        return _unconditional_denial(then)
     if pol == "pass":
-        if _rejects(other):
+        if _unconditional_denial(other):
             return True
-        # `if (r.Succeeded) { return Ok(o); } return Forbid();`
-        return any(x.get("k") == "return" for x in walk(then)) and _rejects(_following(body, node))
-    return _rejects(then) or _rejects(other)
+        # `if (r.Succeeded) { return Ok(o); } return Forbid();`: the success branch ends the method,
+        # so the statements after the if run only on failure.
+        return any(st.get("k") == "return" for st in _stmts(then)) and _unconditional_denial(_following(body, node))
+    return False
 
 
 def _authz_gates(body: list, record: set[str], principals: set[str]) -> bool:
@@ -731,14 +772,14 @@ _MANAGER_LOOKUPS = {"getuserasync", "findbyidasync", "findbynameasync", "findbye
 
 
 def _manager_lookup(call: dict, ents: set[str], env: dict[str, str]) -> bool:
-    """`userManager.GetUserAsync(User)` / `FindByIdAsync(id)` on a `UserManager<TUser>` with an entity TUser."""
+    """`userManager.GetUserAsync(User)` / `FindByIdAsync(id)` on a `UserManager<TUser>` / `RoleManager<TRole>` with an entity type argument."""
     fn = call.get("fn") or {}
     if (call_name(call) or "").lower() not in _MANAGER_LOOKUPS or fn.get("k") != "member":
         return False
     obj = fn.get("obj") or {}
     nm = obj.get("id") if obj.get("k") == "name" else obj.get("name") if obj.get("k") == "member" else None
     typ = env.get(nm or "", "")
-    return "UserManager" in typ and bool(_entity_hits(typ, ents))
+    return ("UserManager" in typ or "RoleManager" in typ) and bool(_entity_hits(typ, ents))
 
 
 def _entity_expr(expr, ents: set[str], env: dict[str, str], dbsets: dict[str, str], body, depth: int = 3) -> bool:
