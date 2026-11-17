@@ -246,3 +246,42 @@ def test_verdict_uncertain_but_no_bad_value_keeps_last():
     opts = assignments(lam(["o"], body))
     o, uncertain = verdict(opts, "A", bad=lambda x: const(x.value) == 99)
     assert uncertain is True and o.value["v"] == 2
+
+
+# -- opaque_reason -----------------------------------------------------------
+
+def _opaque(*args, named=None):
+    from checks.dnl.options import opaque_reason
+    return opaque_reason(call(None, "AddCookie", list(args), named))
+
+
+def test_opaque_no_args_and_scheme_names_are_not_opaque():
+    assert _opaque() is None
+    assert _opaque(lit("Cookies")) is None
+    assert _opaque(member(name("CookieAuthenticationDefaults"), "AuthenticationScheme")) is None
+
+
+def test_opaque_readable_lambda_and_new_are_not_opaque():
+    assert _opaque(lam(["o"], [assign("o", "Cookie.HttpOnly", lit(False))])) is None
+    assert _opaque(lit("Cookies"), lam(["o"], assign("o", "Cookie.HttpOnly", lit(False)))) is None
+    assert _opaque({"k": "new", "type": "CookiePolicyOptions", "args": [], "init": [], "line": 1}) is None
+
+
+def test_opaque_method_group_variable_and_config_section():
+    assert _opaque(name("ConfigureCookie"))
+    assert _opaque(name("policyVar"))
+    assert _opaque(call(member(name("builder"), "Configuration"), "GetSection", [lit("Cookie")]))
+
+
+def test_opaque_option_parameter_escapes():
+    helper = lam(["o"], [{"k": "expr", "e": call(None, "Configure", [name("o")]), "line": 1}])
+    assert _opaque(helper)
+    assert _opaque(lam(["o"], call(None, "Harden", [member(name("o"), "Cookie")])))
+    assert _opaque(lam(["o"], [{"k": "local", "name": "c", "init": name("o"), "line": 1}]))
+    assert _opaque(lam(["o"], [{"k": "return", "value": name("o"), "line": 1}]))
+
+
+def test_opaque_lambda_that_only_sets_members_is_fine():
+    assert _opaque(lam(["o"], [assign("o", "Cookie.Name", name("cfgName"))])) is None
+    shadow = lam(["o"], [{"k": "expr", "e": call(None, "Each", [lam(["o"], call(None, "F", [name("o")]))]), "line": 1}])
+    assert _opaque(shadow) is None

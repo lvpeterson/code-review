@@ -11,7 +11,7 @@ from checks.dnl import rules_pipeline_auth
 from checks.dnl.auth_core import _sensitive
 from checks.dnl.cfgctx import Ctx, build_ctx
 from checks.dnl.ir import attr_key, call_chain, call_name, const_str, literal_str, receiver_text, walk
-from checks.dnl.options import always_true, const, opt, options_of, verdict, walk_conditional
+from checks.dnl.options import always_true, const, opt, options_of, param_escapes, verdict, walk_conditional
 from checks.dnl.pipeline import PipeCall, Pipeline
 from checks.dnl.project import ProjectModel
 from checks.dnl.routes_core import CoreRouteRef, _chain_types
@@ -538,23 +538,6 @@ class _Policy:
     creds_cond: bool = False    # AllowCredentials() appears, but only under a condition
 
 
-def _escapes(root, param: str, ok_ids: set) -> bool:
-    """True when the builder parameter is used anywhere but as the root of a call chain or a member whose
-    node id is in `ok_ids` (passed to a helper, assigned, read as a property): its policy is then built
-    where this code cannot see."""
-    def uses(n) -> bool:
-        if isinstance(n, list):
-            return any(uses(x) for x in n)
-        if not isinstance(n, dict):
-            return False
-        if n.get("k") == "lambda" and param in (n.get("params") or []):
-            return False        # a nested lambda that redeclares the name shadows it
-        if n.get("k") == "name" and n.get("id") == param and id(n) not in ok_ids:
-            return True
-        return any(uses(v) for v in n.values() if isinstance(v, (dict, list)))
-    return uses(root)
-
-
 def _chain_root(call: dict):
     root, _ = call_chain(call)
     return root
@@ -597,7 +580,7 @@ def _read_policy(pol: _Policy, arg, base_cond: bool) -> None:
                 if isinstance(r, dict) and r.get("k") == "name" and r.get("id") == param:
                     steps.append((n, cd))
                     roots.add(id(r))
-        if _escapes(arg.get("body"), param, roots):
+        if param_escapes(arg.get("body"), param, roots):
             pol.maybe.append(("the policy builder is used outside a call chain (passed to a helper or "
                               "assigned), so its policy is built where this code cannot see", pol.line))
     else:
@@ -706,7 +689,7 @@ def _cors_option_policies(c: PipeCall, conf: str | None) -> tuple[list[_Policy],
             pol = _Policy(name, c.file, line, conf)
             _read_policy(pol, builder, cd)
             pols.append(pol)
-        if _escapes(a.get("body"), param, ok):
+        if param_escapes(a.get("body"), param, ok):
             opaque.append(("the CORS options object is used outside AddPolicy / AddDefaultPolicy (passed to a "
                            "helper), so some policies are built where this code cannot see", c.line))
     return pols, opaque

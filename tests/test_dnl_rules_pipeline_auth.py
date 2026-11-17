@@ -42,7 +42,7 @@ def test_samesite_none(tmp_path, mode):
     f = scan(tmp_path / "b", cookie("o.Cookie.SameSite = SameSiteMode.Lax;"), mode)
     assert not sess(f, "DNL-SESS-009")
     f = scan(tmp_path / "c", cookie("o.Cookie.SameSite = fromCfg;"), mode)
-    assert not sess(f, "DNL-SESS-009")
+    assert sess(f, "DNL-SESS-009") == {("DNL-SESS-009", "low", "REVIEW")}
 
 
 def test_expiry_long_sliding(tmp_path, mode):
@@ -191,3 +191,59 @@ def test_finding_points_at_the_setting(tmp_path, mode):
            "var app = builder.Build();\napp.Run();\n")
     f = [x for x in scan(tmp_path, {"Program.cs": src}, mode) if x.check_id == "DNL-SESS-002"]
     assert len(f) == 1 and f[0].file == "Program.cs" and f[0].line == 4
+
+
+FOUR = {"DNL-SESS-001", "DNL-SESS-002", "DNL-SESS-003", "DNL-SESS-009"}
+
+
+def review_ids(f):
+    return {i[0] for i in ids(f) if i[2] == "REVIEW" and i[0] in FOUR}
+
+
+def test_opaque_option_sources_are_review(tmp_path, mode):
+    shapes = {
+        "helper": "builder.Services.AddAuthentication().AddCookie(o => Configure(o));",
+        "group": "builder.Services.AddAuthentication().AddCookie(ConfigureCookie);",
+        "section": "builder.Services.Configure<CookiePolicyOptions>(builder.Configuration.GetSection(\"Cookie\"));",
+        "variable": "builder.Services.AddSession(sessionSetup);",
+        "session_helper": "builder.Services.AddSession(o => { Harden(o.Cookie); });",
+        "antiforgery": "builder.Services.AddAntiforgery(Setup.Antiforgery);",
+        "middleware": "",
+    }
+    for name, svc in shapes.items():
+        body = "app.UseCookiePolicy(policyVar);" if name == "middleware" else ""
+        f = scan(tmp_path / name, prog(svc, body), mode)
+        assert review_ids(f) == FOUR, name
+        assert all(x.line > 0 for x in f if x.check_id in FOUR)
+
+
+def test_calls_without_options_are_silent(tmp_path, mode):
+    svc = ('builder.Services.AddAuthentication().AddCookie();'
+           'builder.Services.AddAuthentication().AddCookie("Cookies");'
+           'builder.Services.AddAuthentication().AddCookie(CookieAuthenticationDefaults.AuthenticationScheme);'
+           'builder.Services.AddSession();')
+    f = scan(tmp_path, prog(svc), mode)
+    assert not review_ids(f)
+
+
+def test_scheme_name_with_readable_lambda_is_not_opaque(tmp_path, mode):
+    f = scan(tmp_path, prog("builder.Services.AddAuthentication().AddCookie("
+                            "CookieAuthenticationDefaults.AuthenticationScheme, o => { o.Cookie.Name = \"x\"; });"), mode)
+    assert not review_ids(f)
+
+
+def test_non_literal_expiry_is_review(tmp_path, mode):
+    f = scan(tmp_path / "a", cookie("o.ExpireTimeSpan = TimeSpan.FromMinutes(cfgMinutes);"), mode)
+    assert sess(f, "DNL-SESS-003") == {("DNL-SESS-003", "low", "REVIEW")}
+    f = scan(tmp_path / "b", prog("builder.Services.AddSession(o => { o.IdleTimeout = idle; });"), mode)
+    assert sess(f, "DNL-SESS-003") == {("DNL-SESS-003", "low", "REVIEW")}
+    f = scan(tmp_path / "c", prog("builder.Services.AddSession(o => { o.Cookie.MaxAge = null; });"), mode)
+    assert not sess(f, "DNL-SESS-003")
+
+
+def test_configure_filter_matches_type_names_exactly(tmp_path, mode):
+    f = scan(tmp_path / "a", prog("builder.Services.Configure<MyCookiePolicyOptionsX>(o => { o.Secure = CookieSecurePolicy.None; });"), mode)
+    assert not sess(f, "DNL-SESS-001")
+    f = scan(tmp_path / "b", prog("builder.Services.Configure<Microsoft.AspNetCore.Builder.CookiePolicyOptions>("
+                                  "o => { o.Secure = CookieSecurePolicy.None; });"), mode)
+    assert ("DNL-SESS-001", "medium", None) in ids(f)

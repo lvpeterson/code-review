@@ -9,7 +9,7 @@ shared helpers live in auth_core.py.
 from __future__ import annotations
 
 from checks.dnl.cfgctx import Ctx
-from checks.dnl.options import Opt, const, options_of, timespan_minutes, verdict
+from checks.dnl.options import Opt, const, opaque_reason, options_of, timespan_minutes, verdict
 from checks.dnl.pipeline import PipeCall, Pipeline
 
 # -- cookies and session (DNL-SESS-001, DNL-SESS-002, DNL-SESS-003, DNL-SESS-009) ---------------------
@@ -73,7 +73,7 @@ def _cookie_calls(ctx: Ctx, pipe: Pipeline) -> list[tuple[PipeCall, str | None]]
         if c.name != "Configure":
             return True
         targs = (c.node.get("fn") or {}).get("targs") or []
-        return any(t in str(x) for x in targs for t in _COOKIE_OPTION_TYPES)
+        return any(str(x).strip().split(".")[-1] in _COOKIE_OPTION_TYPES for x in targs)
     pairs = ([(c, None) for c in ctx.prod_calls(pipe, *_COOKIE_CALLS)]
              + [(c, "REVIEW") for c in ctx.uncertain_calls(pipe, *_COOKIE_CALLS)])
     return [(c, conf) for c, conf in pairs if wanted(c)]
@@ -93,6 +93,7 @@ def check_cookies(ctx: Ctx) -> None:
 
     for pipe in ctx.pipes:
         for c, conf in _cookie_calls(ctx, pipe):
+            _opaque(c, conf, add)
             opts = options_of(c.node)
             if not opts:
                 continue
@@ -100,6 +101,24 @@ def check_cookies(ctx: Ctx) -> None:
             _httponly(opts, c, conf, add)
             _samesite(opts, c, conf, add)
             _lifetime(opts, c, conf, add)
+
+
+_OPAQUE_IDS = (("DNL-SESS-001", "medium", "Cookie not restricted to HTTPS", "Secure flag"),
+               ("DNL-SESS-002", "low", "Cookie readable by scripts (HttpOnly off)", "HttpOnly flag"),
+               ("DNL-SESS-003", "low", "Cookie or session lifetime over one day", "lifetime"),
+               ("DNL-SESS-009", "low", "Cookie SameSite is None", "SameSite mode"))
+
+
+def _opaque(c: PipeCall, conf, add) -> None:
+    """A cookie call whose options are not all readable (a method group, a variable, a configuration
+    section, an options parameter handed to a helper): REVIEW for every id the settings could affect."""
+    reason = opaque_reason(c.node)
+    if reason is None:
+        return
+    for cid, sev, title, what in _OPAQUE_IDS:
+        add(cid, sev, title, f"The {what} of the cookie set up by {c.name} could not be read: {reason}. "
+                             "Confirm the cookie is Secure, HttpOnly, not SameSite=None and short-lived.",
+            c, c.line, "REVIEW")
 
 
 def _weak_flag(opts: list[Opt], leaves: tuple[str, ...], bad: tuple, good: tuple, bool_bad: bool | None,
@@ -164,8 +183,14 @@ def _httponly(opts, c, conf, add) -> None:
 
 
 def _samesite(opts, c, conf, add) -> None:
-    for o, firm, _k in _weak_flag(opts, ("samesite", "minimumsamesitepolicy"), ("SameSiteMode.None",), (), None,
-                                  False):
+    good = ("SameSiteMode.Lax", "SameSiteMode.Strict", "SameSiteMode.Unspecified")
+    for o, firm, k in _weak_flag(opts, ("samesite", "minimumsamesitepolicy"), ("SameSiteMode.None",), good, None,
+                                 True):
+        if k != "bad":
+            add("DNL-SESS-009", "low", "Cookie SameSite is None",
+                f"{o.path} is not a compile-time SameSiteMode value, so it may be None in Production; confirm "
+                "it is Lax or Strict.", c, o.line, "REVIEW")
+            continue
         desc = (f"{o.path} is SameSiteMode.None, so the browser sends the cookie on every cross-site "
                 "request, which removes its CSRF protection. Use Lax or Strict unless the cookie must be "
                 "embedded cross-site.")
@@ -174,20 +199,30 @@ def _samesite(opts, c, conf, add) -> None:
         add("DNL-SESS-009", "low", "Cookie SameSite is None", desc, c, o.line, conf if firm else "REVIEW")
 
 
-def _minutes_bad(o: Opt) -> bool:
+def _span_kind(o: Opt) -> str:
+    """"bad" (over a day), "good", or "unknown" (not a compile-time TimeSpan; a literal null MaxAge is good)."""
     m = timespan_minutes(o.value)
-    return m is not None and m > _MAX_MINUTES
+    if m is not None:
+        return "bad" if m > _MAX_MINUTES else "good"
+    v = o.value
+    return "good" if isinstance(v, dict) and v.get("k") == "lit" and v.get("v") is None else "unknown"
 
 
 def _lifetime(opts, c, conf, add) -> None:
     """DNL-SESS-003: ExpireTimeSpan over a day while the expiry slides, and a session IdleTimeout or
-    Cookie.MaxAge over a day (AddSession only)."""
+    Cookie.MaxAge over a day (AddSession only). A value that is not a compile-time TimeSpan is REVIEW."""
+    title = "Cookie or session lifetime over one day"
     specs = [("expiretimespan", True)]
     if c.name in ("AddSession", "Configure"):
         specs += [("idletimeout", False), ("cookie.maxage", False)]
     for path, sliding_matters in specs:
-        o, uncertain = verdict(opts, path, bad=_minutes_bad)
-        if o is None or not _minutes_bad(o):
+        o, uncertain = verdict(opts, path, bad=lambda x: _span_kind(x) != "good")
+        if o is None or _span_kind(o) == "good":
+            continue
+        if _span_kind(o) == "unknown":
+            add("DNL-SESS-003", "low", title,
+                f"{o.path} is not a compile-time TimeSpan, so it may be longer than {_MAX_MINUTES} minutes in "
+                "Production; confirm it is not.", c, o.line, "REVIEW")
             continue
         firm = not uncertain
         desc = (f"{o.path} is {timespan_minutes(o.value):g} minutes (over {_MAX_MINUTES}), so a stolen cookie "
@@ -208,5 +243,4 @@ def _lifetime(opts, c, conf, add) -> None:
         desc += "."
         if uncertain:
             desc += " Some assignment to it sits under a condition, so it may not apply; confirm."
-        add("DNL-SESS-003", "low", "Cookie or session lifetime over one day", desc, c, o.line,
-            conf if firm else "REVIEW")
+        add("DNL-SESS-003", "low", title, desc, c, o.line, conf if firm else "REVIEW")

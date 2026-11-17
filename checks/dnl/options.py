@@ -264,6 +264,98 @@ def verdict(opts: list[Opt], path: str, bad=None) -> tuple[Opt | None, bool]:
     return same[-1], uncertain
 
 
+# -- opaque option sources --------------------------------------------------
+
+def param_escapes(root, param: str, ok_ids: set) -> bool:
+    """True when the parameter name is used anywhere but as a name node whose id is in `ok_ids` (the root
+    of a call chain or member read the caller accepts): it is then passed on, stored or returned, and what
+    happens to it is out of sight. A nested lambda that redeclares the name shadows it."""
+    def uses(n) -> bool:
+        if isinstance(n, list):
+            return any(uses(x) for x in n)
+        if not isinstance(n, dict):
+            return False
+        if n.get("k") == "lambda" and param in (n.get("params") or []):
+            return False
+        if n.get("k") == "name" and n.get("id") == param and id(n) not in ok_ids:
+            return True
+        return any(uses(v) for v in n.values() if isinstance(v, (dict, list)))
+    return uses(root)
+
+
+def _rooted_at(e, param: str) -> bool:
+    """`param`, or a member chain starting at it (`param.Cookie.Name`)."""
+    while isinstance(e, dict) and e.get("k") == "member":
+        e = e.get("obj")
+    return isinstance(e, dict) and e.get("k") == "name" and e.get("id") == param
+
+
+def _hands_off(n, param: str) -> bool:
+    """True when the options object (or a member of it) is passed to a call, a `new`, assigned to
+    something, bound to a local, returned, or chosen by a ternary: the code that receives it is not read."""
+    if isinstance(n, list):
+        return any(_hands_off(x, param) for x in n)
+    if not isinstance(n, dict):
+        return False
+    k = n.get("k")
+    if k == "lambda" and param in (n.get("params") or []):
+        return False
+    given: list = []
+    if k == "call":
+        given = list(n.get("args") or []) + list((n.get("named") or {}).values())
+    elif k == "new":
+        given = list(n.get("args") or []) + [e.get("value") for e in n.get("init") or []
+                                             if isinstance(e, dict) and "value" in e]
+    elif k == "assign":
+        given = [n.get("value")]
+    elif k == "local":
+        given = [n.get("init")]
+    elif k == "return":
+        given = [n.get("value")]
+    elif k == "cond":
+        given = [n.get("t"), n.get("f")]
+    if any(_rooted_at(g, param) for g in given):
+        return True
+    return any(_hands_off(v, param) for v in n.values() if isinstance(v, (dict, list)))
+
+
+_SCHEME_NAME = re.compile(r"Defaults\.|Scheme$")
+
+
+def _scheme_like(e: dict) -> bool:
+    """A literal, or a constant such as `CookieAuthenticationDefaults.AuthenticationScheme`: a scheme or
+    option name, never an options source."""
+    if e.get("k") == "lit":
+        return True
+    return e.get("k") == "member" and bool(_SCHEME_NAME.search(receiver_text(e) or ""))
+
+
+def opaque_reason(call: dict, opts_param_names=None) -> str | None:
+    """Why the options of a call cannot be read in full, or None. A call with no options argument (no
+    arguments, or only scheme names) is not opaque: it takes the defaults. Opaque are: an argument that is
+    not a literal, a lambda or a `new` (a method group, a variable, a configuration section), and a lambda
+    whose options parameter is passed to another call, stored or returned. `opts_param_names` limits which
+    lambda parameters count (default: the first one)."""
+    args = list(call.get("args") or []) + list((call.get("named") or {}).values())
+    for a in args:
+        if not isinstance(a, dict):
+            continue
+        k = a.get("k")
+        if k == "lambda":
+            params = [p for p in a.get("params") or [] if isinstance(p, str)]
+            wanted = [p for p in params if opts_param_names is None or p in opts_param_names]
+            for p in (wanted[:1] if opts_param_names is None else wanted):
+                if _hands_off(a.get("body"), p):
+                    return (f"the options parameter {p} is passed to another call, stored or returned, so "
+                            "the settings are applied where this code cannot see")
+        elif k == "new":
+            continue
+        elif not _scheme_like(a):
+            return ("the options come from something that is not a lambda or an initializer (a method "
+                    "group, a variable or a configuration section)")
+    return None
+
+
 # -- values -----------------------------------------------------------------
 
 def const(expr: dict | None):
