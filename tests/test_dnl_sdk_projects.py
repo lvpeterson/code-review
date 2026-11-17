@@ -178,8 +178,10 @@ def test_helper_runs_once_for_both_packages(roslyn_helper, monkeypatch):
     monkeypatch.setattr(helper, "parse_projects", counting)
     results = enumerator.enumerate_target(FX)
     assert len(calls) == 1
-    # The single preparation fed the legacy package's results and holds both views.
-    assert any(r.language == "dotnet_legacy" for r in results)
+    # Both packages ran off that one preparation: each yields a ScanResult of its own.
+    assert {r.language for r in results} >= {"dotnet", "dotnet_legacy"}
+    assert any(r.language == "dotnet" and r.framework == "controllers" for r in results)
+    assert any(r.language == "dotnet_legacy" and r.framework == "mvc" for r in results)
     assert project.get_model(FX, "dotnet").files and project.get_model(FX, "dotnet_legacy").files
     assert len(calls) == 1  # get_model reused the prepared model
 

@@ -1,3 +1,3 @@
-"""dotnet language package. Importing this triggers analyzer registration."""
+"""dotnet language package (ASP.NET Core). Importing this triggers analyzer registration."""
 from . import detector  # noqa: F401
-from . import aspnet_analyzer  # noqa: F401
+from . import analyzers  # noqa: F401

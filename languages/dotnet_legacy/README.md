@@ -5,7 +5,9 @@
 An appsec review analyzer for classic ASP.NET on the .NET Framework, C# and VB
 alike: ASP.NET MVC 5, Web API 2, WebForms (`.aspx` / `.asmx`), WCF services,
 `Web.config` (with XDT transforms) and the dependencies those apps bundle.
-ASP.NET Core (SDK-style projects) stays with `languages/dotnet`. It runs
+ASP.NET Core (SDK-style projects on modern .NET) stays with `languages/dotnet`. DNL is
+the shared C#/.NET engine (project model, Roslyn helper IR, auth and route modules) used by
+both packages; one helper run serves a mixed solution. It runs
 automatically when `main.py` detects such a target, and every finding carries
 OWASP Web Top 10 2025 and 2021 tags plus an API Security Top 10 2023 tag where
 it applies (HTML report OWASP tab, JSON `owasp` field, SARIF rule tags).
@@ -364,7 +366,7 @@ either mode.
 
 | List | Code | Category | Rules |
 |---|---|---|---|
-| 2025 | A01 | Broken Access Control | DNL-AUTHZ-001, DNL-AUTHZ-002, DNL-AUTHZ-003, DNL-AUTHZ-004, DNL-AUTHZ-005, DNL-CSRF-001, DNL-PATH-001, DNL-REDIR-001, DNL-SSRF-001 |
+| 2025 | A01 | Broken Access Control | DNL-AUTHZ-001, DNL-AUTHZ-002, DNL-AUTHZ-003, DNL-AUTHZ-004, DNL-AUTHZ-005, DNL-AUTHZ-008, DNL-CSRF-001, DNL-PATH-001, DNL-REDIR-001, DNL-SSRF-001 |
 | 2025 | A02 | Security Misconfiguration | DNL-CFG-001, DNL-CFG-002, DNL-CFG-003, DNL-CFG-004, DNL-CFG-005, DNL-CFG-006, DNL-CFG-007, DNL-INV-001, DNL-INV-002, DNL-WCF-001, DNL-WCF-002, DNL-WCF-003, DNL-XXE-001, DNL-XXE-002 |
 | 2025 | A03 | Software Supply Chain Failures | DNL-SCA-001, DNL-SCA-002, DNL-SCA-003, DNL-SCA-004, DNL-SCA-005 |
 | 2025 | A04 | Cryptographic Failures | DNL-CRY-001, DNL-CRY-002, DNL-CRY-003, DNL-CRY-004, DNL-CRY-005, DNL-CRY-007, DNL-CRY-008, DNL-SESS-005 |
@@ -374,7 +376,7 @@ either mode.
 | 2025 | A08 | Software or Data Integrity Failures | DNL-CONSUME-001, DNL-CONSUME-002, DNL-CRY-006, DNL-DESER-001, DNL-DESER-002, DNL-DESER-003, DNL-INT-001, DNL-INT-002, DNL-INT-003, DNL-INT-004 |
 | 2025 | A09 | Security Logging and Alerting Failures | DNL-LOG-001, DNL-LOG-002, DNL-LOG-003, DNL-LOG-004 |
 | 2025 | A10 | Mishandling of Exceptional Conditions | DNL-ERR-001, DNL-ERR-002, DNL-ERR-003 |
-| 2021 | A01 | Broken Access Control | DNL-AUTHZ-001, DNL-AUTHZ-002, DNL-AUTHZ-003, DNL-AUTHZ-004, DNL-AUTHZ-005, DNL-CSRF-001, DNL-PATH-001, DNL-REDIR-001 |
+| 2021 | A01 | Broken Access Control | DNL-AUTHZ-001, DNL-AUTHZ-002, DNL-AUTHZ-003, DNL-AUTHZ-004, DNL-AUTHZ-005, DNL-AUTHZ-008, DNL-CSRF-001, DNL-PATH-001, DNL-REDIR-001 |
 | 2021 | A02 | Cryptographic Failures | DNL-CRY-001, DNL-CRY-002, DNL-CRY-003, DNL-CRY-004, DNL-CRY-005, DNL-CRY-007, DNL-CRY-008, DNL-SESS-005 |
 | 2021 | A03 | Injection | DNL-INJ-001, DNL-INJ-002, DNL-INJ-003, DNL-INJ-004, DNL-INJ-005, DNL-INJ-006, DNL-XSS-001, DNL-XSS-002, DNL-XSS-003, DNL-XSS-004 |
 | 2021 | A04 | Insecure Design | DNL-AUTHZ-006, DNL-AUTHZ-007, DNL-DES-001, DNL-ERR-001, DNL-ERR-003, DNL-RES-001, DNL-RES-002, DNL-RES-003, DNL-WCF-004 |
@@ -388,7 +390,7 @@ either mode.
 | api2023 | API2 | Broken Authentication | DNL-SEC-001, DNL-SEC-002, DNL-SEC-003, DNL-SESS-001, DNL-SESS-002, DNL-SESS-003, DNL-SESS-004, DNL-SESS-005, DNL-SESS-006, DNL-SESS-007, DNL-SESS-008 |
 | api2023 | API3 | Broken Object Property Level Authorization | DNL-AUTHZ-006, DNL-AUTHZ-007 |
 | api2023 | API4 | Unrestricted Resource Consumption | DNL-RES-001, DNL-RES-002, DNL-RES-003, DNL-WCF-004 |
-| api2023 | API5 | Broken Function Level Authorization | DNL-AUTHZ-001, DNL-AUTHZ-002, DNL-AUTHZ-003, DNL-AUTHZ-004 |
+| api2023 | API5 | Broken Function Level Authorization | DNL-AUTHZ-001, DNL-AUTHZ-002, DNL-AUTHZ-003, DNL-AUTHZ-004, DNL-AUTHZ-008 |
 | api2023 | API6 | Unrestricted Access to Sensitive Business Flows | DNL-DES-001 |
 | api2023 | API7 | Server Side Request Forgery | DNL-SSRF-001 |
 | api2023 | API8 | Security Misconfiguration | DNL-CFG-001, DNL-CFG-002, DNL-CFG-003, DNL-CFG-004, DNL-CFG-005, DNL-CFG-006, DNL-CFG-007, DNL-ERR-002, DNL-INJ-001, DNL-INJ-002, DNL-INJ-003, DNL-INJ-004, DNL-INJ-005, DNL-INJ-006, DNL-WCF-001, DNL-WCF-002, DNL-XXE-001, DNL-XXE-002 |
@@ -408,6 +410,7 @@ DNL-INV-001, which always carries it.
 | DNL-AUTHZ-002 | medium | `[AllowAnonymous]` action with an explicit mutating verb (REVIEW) | A01:2025 | A01:2021 | API5:2023 |
 | DNL-AUTHZ-003 | high | Custom auth filter whose override never denies a request | A01:2025 | A01:2021 | API5:2023 |
 | DNL-AUTHZ-004 | low | Admin-looking controller / action gated by `[Authorize]` with no Roles / Users (REVIEW) | A01:2025 | A01:2021 | API5:2023 |
+| DNL-AUTHZ-008 | medium/high | ASP.NET Core only (`languages/dotnet`): `UseAuthorization` missing, before `UseRouting` or before `UseAuthentication` in an app with explicit routing; high when `SuppressCheckForUnhandledSecurityMetadata = true` | A01:2025 | A01:2021 | API5:2023 |
 | DNL-CSRF-001 | medium | Mutating MVC action without `[ValidateAntiForgeryToken]` (action, controller, bases, global filters) | A01:2025 | A01:2021 | -- |
 | DNL-CFG-001 | medium | `compilation debug="true"` | A02:2025 | A05:2021 | API8:2023 |
 | DNL-CFG-002 | medium | `customErrors mode="Off"` or `httpErrors errorMode="Detailed"` | A02:2025 | A05:2021 | API8:2023 |

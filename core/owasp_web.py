@@ -74,6 +74,7 @@ _add(["DNL-SEC-001", "DNL-SEC-002"], "A07", "A07", "API2")
 _add(["DNL-INV-001"], "A02", "A05", "API9", "always")
 _add(["DNL-RES-001"], "A06", "A04", "API4")
 _add([f"DNL-AUTHZ-00{n}" for n in range(1, 5)], "A01", "A01", "API5")
+_add(["DNL-AUTHZ-008"], "A01", "A01", "API5")
 _add(["DNL-CSRF-001"], "A01", "A01", None)
 # Taint-analysis rules (Plan 2).
 _add([f"DNL-INJ-00{n}" for n in range(1, 7)], "A05", "A03", "API8")

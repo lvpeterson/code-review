@@ -205,7 +205,8 @@ Currently implemented (route extraction + baseline checks):
 - **java**: spring
 - **javascript**: express, nextjs, hono
 - **go**: gin, net_http
-- **dotnet**: aspnet
+- **dotnet**: controllers, razorpages, minimalapi, config (ASP.NET Core on modern .NET, via the
+  shared Roslyn helper; three-state authorization per route)
 - **dotnet_legacy**: mvc, webapi, webforms, wcf, config, deps (.NET Framework MVC 5,
   Web API 2, WebForms, WCF services and Web.config, C# and VB, via the Roslyn
   helper in `tools/roslyn-ir`; cross-file taint analysis for injection / XSS /

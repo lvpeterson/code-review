@@ -1,31 +1,70 @@
-"""Language + framework detection for .NET (C#) targets."""
+"""Language + framework detection for modern .NET (ASP.NET Core) targets.
+
+Text scans only (no helper): the project files decide ownership (checks.dnl.project.load_projects, the
+same logic the model uses), then the C# / Razor sources of those projects are searched for the
+framework markers. .NET Framework projects belong to dotnet_legacy.
+"""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
-from core.fsutil import iter_files, read_text_safe
+from checks.dnl import project
+from checks.dnl.files import iter_dnl_files, read_source
+
+_FRAMEWORK_ORDER = ["controllers", "razorpages", "minimalapi", "config"]
+_CONTROLLER = re.compile(r"\[\s*(?:[\w.]+\.)?(?:ApiController|Controller)(?:Attribute)?\s*[\](]"
+                         r"|\bclass\s+\w+(?:<[^>]*>)?\s*:[^{;]*?\b(?:Controller|ControllerBase)\b")
+_MINIMAL = re.compile(r"\.Map(?:Get|Post|Put|Patch|Delete|Methods|Group|Hub|GrpcService|HealthChecks|Fallback)\w*\s*[(<]"
+                      r"|\.Map\(\s*[$@]*\"")
+_PAGE_DIRECTIVE = re.compile(r"\A\s*(?:@\*.*?\*@\s*)*@page\b", re.S)
+
+
+def _read(path: Path) -> str:
+    try:
+        return read_source(path)
+    except OSError:
+        return ""
+
+
+def _core_projects(target: Path) -> list[project.Project]:
+    return [p for p in project.load_projects(target.resolve()) if p.profile == "netcore" and p.language == "cs"]
 
 
 def detect_language(target_path: Path) -> bool:
-    if any(True for _ in iter_files(target_path, (".csproj",))):
-        return True
-    return any(True for _ in iter_files(target_path, (".cs",)))
+    return bool(_core_projects(target_path))
+
+
+def _owning(projects: list[project.Project], path: Path) -> project.Project | None:
+    """The deepest real project directory holding path, else the loose project."""
+    here = path.resolve()
+    hits = [p for p in projects if p.path is not None and here.is_relative_to(p.dir.resolve())]
+    if hits:
+        return max(hits, key=lambda p: len(p.dir.resolve().parts))
+    return next((p for p in projects if p.path is None), None)
 
 
 def detect_frameworks(target_path: Path) -> list[str]:
-    """Return every framework detected -- currently just ["aspnet"] or [].
-
-    TODO: this is a stub -- doesn't yet distinguish ASP.NET MVC vs Web API
-    vs Minimal API conventions. All three currently map to "aspnet".
-    """
-    for csproj in iter_files(target_path, (".csproj",)):
-        text = read_text_safe(csproj)
-        if "Microsoft.AspNetCore" in text or "Microsoft.NET.Sdk.Web" in text:
-            return ["aspnet"]
-
-    for cs_file in iter_files(target_path, (".cs",)):
-        text = read_text_safe(cs_file)
-        if "Microsoft.AspNetCore" in text:
-            return ["aspnet"]
-
-    return []
+    target = target_path.resolve()
+    all_projects = project.load_projects(target)
+    core = [p for p in all_projects if p.profile == "netcore" and p.language == "cs"]
+    if not core:
+        return []
+    found = {"config"}
+    for p in core:
+        for f in p.compile_files:
+            text = _read(f)
+            if "Controller" in text and _CONTROLLER.search(text):
+                found.add("controllers")
+            if ".Map" in text and _MINIMAL.search(text):
+                found.add("minimalapi")
+    core_dirs = {id(p) for p in core}
+    for f in iter_dnl_files(target, (".cshtml",)):
+        if "razorpages" in found:
+            break
+        if "pages" not in {part.lower() for part in f.relative_to(target).parts[:-1]}:
+            continue
+        owner = _owning(all_projects, f)
+        if owner is not None and id(owner) in core_dirs and _PAGE_DIRECTIVE.match(_read(f)):
+            found.add("razorpages")
+    return [f for f in _FRAMEWORK_ORDER if f in found]

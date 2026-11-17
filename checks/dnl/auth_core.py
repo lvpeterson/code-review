@@ -104,6 +104,8 @@ class PolicyInfo:
     never_denies: bool
     # Why the policy could not be read (non-empty: neither protective nor never-denying).
     unknown: list[str] = field(default_factory=list)
+    # Why a never-denying policy never denies (empty otherwise).
+    why: str = ""
 
 
 # -- small helpers ---------------------------------------------------------------
@@ -749,7 +751,7 @@ def _build_settings(model: ProjectModel, pipe: Pipeline) -> _Settings:
         pexpr, _r, file, line = certain[-1]
         pol = _policy_expr(model, pexpr)
         S.pols[key] = pol
-        S.policies[pname] = PolicyInfo(pname, file, line, _dedup(pol.roles), pol.never_denies, list(pol.unknown))
+        S.policies[pname] = PolicyInfo(pname, file, line, _dedup(pol.roles), pol.never_denies, list(pol.unknown), pol.why() if pol.never_denies else "")
 
     # Conventions this module cannot read (reasons), for the routes they could affect.
     for f in S.page_convs:
@@ -872,6 +874,17 @@ def _filter_verdict(model: ProjectModel, t: TypeIR) -> tuple[str, str]:
                     and any(isinstance(a, dict) and a.get("k") == "name" and a.get("id") == p for a in n.get("args") or [])):
                 return UNK, f"filter {tn} hands its context to {call_name(n)}, which is not analysed"
     return NEVER, f"filter {tn} never sets context.Result"
+
+
+def never_denying_filters(model: ProjectModel) -> list[TypeIR]:
+    """Project authorization filter types (IAuthorizationFilter / IAsyncAuthorizationFilter) that never set
+    context.Result, whether or not an attribute uses them."""
+    out = []
+    for t in model.types():
+        if t.kind == "class" and _implements(model, t, "iauthorizationfilter", "iasyncauthorizationfilter"):
+            if _filter_verdict(model, t)[0] == NEVER:
+                out.append(t)
+    return out
 
 
 def _derived_data(model: ProjectModel, t: TypeIR, a: Attr, item: _Item) -> None:

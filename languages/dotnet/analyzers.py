@@ -1,0 +1,124 @@
+"""Analyzer registrations for the ASP.NET Core (modern .NET) package.
+
+Four analyzers share one ProjectModel view (the `dotnet` projects of the scan, prepared once by the
+enumerator so the Roslyn helper runs once for both .NET packages): controllers, razorpages and
+minimalapi split the routes and auth findings by route kind, config reports the route-less findings
+(never-denying handlers / policies / filters, middleware order). Route discovery and auth resolution
+happen once per model and are cached on `model.cache`. In degraded mode (no helper) the same rules
+run on the tree-sitter C# IR, so findings can differ in confidence; every result carries the flag.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+from checks.dnl import project, routes_core, rules_auth_core
+from checks.dnl.project import ProjectModel
+from core.base import BaseFrameworkAnalyzer
+from core.models import Finding, Route, ScanResult
+from core.registry import register
+from languages.dotnet import detector
+
+_KINDS = ("controllers", "razorpages", "minimalapi", "config")
+# route.meta["kind"] -> analyzer
+_KIND_OWNER = {"controller": "controllers", "razorpage": "razorpages", "minimalapi": "minimalapi",
+               "hub": "minimalapi", "grpc": "minimalapi", "blazor": "minimalapi", "health": "minimalapi",
+               "fallback": "minimalapi", "openapi": "minimalapi"}
+
+
+def _enumerated(model: ProjectModel) -> list[str]:
+    """Frameworks the enumerator runs for this scan (detector order), cached on the model."""
+    cached = model.cache.get("enumerated")
+    if cached is None:
+        cached = model.cache["enumerated"] = detector.detect_frameworks(model.root)
+    return cached
+
+
+def _code_results(model: ProjectModel) -> dict[str, tuple[list[Route], list[Finding]]]:
+    """{analyzer: (routes, findings)}, computed once per model."""
+    cached = model.cache.get("code_results")
+    if cached is not None:
+        return cached
+    out: dict[str, tuple[list[Route], list[Finding]]] = {k: ([], []) for k in _KINDS}
+    # Deeply nested expressions recurse through the evaluator; give it headroom.
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), 4000))
+    refs = routes_core.discover_all(model)
+    findings: list[Finding] = []
+
+    def guarded(name: str, fn):
+        # One crashing rule module must not hide the others; say so in the report.
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            note = f"{name} failed ({type(exc).__name__}: {exc}); its findings are missing"
+            if note not in model.notes:
+                model.notes.append(note)
+            return []
+
+    findings += guarded("rules_auth_core", lambda: rules_auth_core.check(model, refs))
+    for ref in refs:
+        out[_KIND_OWNER.get(ref.route.meta["kind"], "minimalapi")][0].append(ref.route)
+    running = _enumerated(model)
+    # Route-less findings go to config; without it, the first analyzer that runs takes them.
+    fallback = "config" if "config" in running or not running else running[0]
+    for f in findings:
+        owner = _KIND_OWNER.get(f.route.meta["kind"], "minimalapi") if f.route is not None else fallback
+        out[owner][1].append(f)
+    model.cache["code_results"] = out
+    return out
+
+
+class _CoreAnalyzer(BaseFrameworkAnalyzer):
+    language = "dotnet"
+
+    def __init__(self, target_path: Path):
+        super().__init__(target_path)
+        self._model: ProjectModel | None = None
+
+    @property
+    def model(self) -> ProjectModel:
+        if self._model is None:
+            self._model = project.get_model(self.target_path, "dotnet")
+        return self._model
+
+    def find_routes(self) -> list[Route]:
+        return list(_code_results(self.model)[self.framework][0])
+
+    def run_baseline_checks(self, routes_: list[Route]) -> list[Finding]:
+        return list(_code_results(self.model)[self.framework][1])
+
+    def analyze(self) -> ScanResult:
+        result = super().analyze()
+        result.degraded = self.model.degraded
+        # Model notes describe the whole scan: the first analyzer to report takes them.
+        # The flag lives on the full model: it is shared by every view of the scan.
+        shared = self.model.parent or self.model
+        # The flag is shared with dotnet_legacy: the notes list is one object for both packages.
+        notes = [] if shared.cache.get("notes_taken") else list(self.model.notes)
+        shared.cache["notes_taken"] = True
+        result.notes = notes
+        return result
+
+
+@register("dotnet", "controllers")
+class ControllersAnalyzer(_CoreAnalyzer):
+    framework = "controllers"
+
+
+@register("dotnet", "razorpages")
+class RazorPagesAnalyzer(_CoreAnalyzer):
+    framework = "razorpages"
+
+
+@register("dotnet", "minimalapi")
+class MinimalApiAnalyzer(_CoreAnalyzer):
+    framework = "minimalapi"
+
+
+@register("dotnet", "config")
+class ConfigAnalyzer(_CoreAnalyzer):
+    """Route-less findings; reports even when no route-bearing framework was detected."""
+    framework = "config"
+
+    def find_routes(self) -> list[Route]:
+        return []
