@@ -1351,6 +1351,11 @@ def resolve(model: ProjectModel, ref: CoreRouteRef, pipe: Pipeline) -> CoreAuth:
     S = _settings(model, pipe)
     route = ref.route
     if route.meta.get("middleware"):
+        if route.meta.get("kind") == "branch":
+            return CoreAuth(UNPROTECTED, "middleware branch; endpoint authorization does not apply",
+                            file=route.file, line=route.line,
+                            notes=["a Map(path, branch) pipeline branch is not endpoint-routed; only middleware "
+                                   "inside the branch can authenticate callers (not analysed)"])
         return CoreAuth(UNPROTECTED, "middleware (not endpoint-routed; authorization does not apply)",
                         file=route.file, line=route.line)
     notes: list[str] = []

@@ -129,16 +129,64 @@ def _inherited(chain: list[TypeIR], *names: str) -> list:
     return []
 
 
+def _open_generic(model: ProjectModel, decls: list[TypeIR]) -> bool:
+    """A type declared with type parameters (`class Base<T>`): MVC ignores open generic controllers.
+    The IR drops type parameters, so the declaration is read from the source."""
+    cache = model.cache.setdefault("decl_text", {})
+    for d in decls:
+        simple = re.escape(d.name.split(".")[-1])
+        text = cache.get(d.file)
+        if text is None:
+            try:
+                text = cache[d.file] = read_source(model.root / d.file).splitlines()
+            except OSError:
+                text = cache[d.file] = []
+        head = "\n".join(text[max(d.line - 1, 0): d.line + 11])
+        if re.search(r"\b(?:class|record|struct)\s+" + simple + r"\s*<", head):
+            return True
+    return False
+
+
+def _external_base(model: ProjectModel, t: TypeIR) -> str | None:
+    """The first base type in the chain that is not in the solution and does not look like an interface
+    (`IFoo`), as written; None when every class base resolves or a MVC controller base is in the chain
+    (the framework base is the semantics then)."""
+    chain = model.base_chain(t)
+    if {_simple(b) for b in chain} & _CONTROLLER_BASES:
+        return None
+    for b in chain:
+        simple = b.split("<")[0].split(".")[-1]
+        if not model.find_types(simple) and not re.match(r"^I[A-Z]", simple):
+            return b
+    return None
+
+
+def _routed_methods(t: TypeIR) -> list[MethodIR]:
+    """Public instance methods carrying an Http* / [Route] attribute (overrides included)."""
+    out = []
+    for m in t.methods:
+        mods = {x.lower() for x in m.modifiers}
+        if "public" in mods and "static" not in mods and not has_attr(m.attributes, "NonAction") and any(
+                attr_key(a.name) in _VERB_ATTRS or attr_key(a.name) in ("route", "acceptverbs") for a in m.attributes):
+            out.append(m)
+    return out
+
+
 def _is_controller(model: ProjectModel, t: TypeIR, chain: list[TypeIR]) -> bool:
     mods = {x.lower() for x in t.modifiers}
     if t.kind != "class" or "public" not in mods or "abstract" in mods or "<" in t.name:
+        return False
+    if _open_generic(model, [t]):
         return False
     if any(has_attr(ct.attributes, "NonController") for ct in chain):
         return False
     bases = {_simple(b) for b in model.base_chain(t)}
     return bool(bases & _CONTROLLER_BASES
                 or any(has_attr(ct.attributes, "ApiController", "Controller") for ct in chain)
-                or t.name.split(".")[-1].lower().endswith("controller"))
+                or t.name.split(".")[-1].lower().endswith("controller")
+                # A class whose routed methods sit on a base the solution does not contain (a third-party
+                # endpoint base class): MVC discovers it by its attributes, so it is a controller here.
+                or (_external_base(model, t) is not None and bool(_routed_methods(t))))
 
 
 def _api_surface(model: ProjectModel, t: TypeIR, chain: list[TypeIR]) -> bool:
@@ -338,8 +386,83 @@ def _common_tail(calls: list[PipeCall]) -> tuple[list[dict], str | None]:
     return common, None
 
 
+# -- route prefix conventions ---------------------------------------------------------------------
+# `options.Conventions.Add(new RoutePrefixConvention("api"))` / `options.UseGeneralRoutePrefix("api")` prefix
+# attribute-routed controllers. A convention class in the solution that builds an AttributeRouteModel and is
+# given a literal prefix is applied; anything else is a model note (paths only: it cannot change auth).
+_ROUTEY = re.compile(r"prefix|route|routing|path|namespace", re.IGNORECASE)
+_PREFIX_CALLS = frozenset({"UseGeneralRoutePrefix", "UseCentralRoutePrefix"})
+_PREFIX_NOTE = "controller paths may lack a convention prefix ({})"
+
+
+def _class_touches_routes(model: ProjectModel, simple: str) -> list[TypeIR]:
+    """Solution classes named `simple` whose members build or combine an AttributeRouteModel."""
+    out = []
+    for ct in model.find_types(simple):
+        parts = [m.body for m in ct.methods] + [f.init for f in ct.fields] + [pr.get for pr in ct.properties]
+        if any("AttributeRouteModel" in json.dumps(x, default=str) for x in parts if x):
+            out.append(ct)
+    return out
+
+
+def _inner_prefix(classes: list[TypeIR]) -> str | None:
+    """The one literal a convention class passes to `new RouteAttribute(..)` / `new AttributeRouteModel(..)`."""
+    lits: set[str] = set()
+    for ct in classes:
+        for part in [m.body for m in ct.methods] + [f.init for f in ct.fields]:
+            for n in walk(part):
+                if n.get("k") == "new" and (n.get("type") or "").split(".")[-1] in ("RouteAttribute", "AttributeRouteModel"):
+                    lits.update(v for a in n.get("args") or [] if (v := literal_str(a)))
+    return next(iter(lits)) if len(lits) == 1 else None
+
+
+def _prefix_conventions(model: ProjectModel) -> tuple[str | None, str | None]:
+    """(literal route prefix applied to attribute routes, class of the convention that supplies it);
+    notes for conventions that could not be applied go on model.notes."""
+    if "route_prefix" in model.cache:
+        return model.cache["route_prefix"]
+    prefix: tuple[str, str] | None = None
+    unresolved: list[str] = []
+    for t in model.types():
+        for m in t.methods:
+            for n in walk(m.body):
+                if n.get("k") != "call":
+                    continue
+                name = call_name(n)
+                if name in _PREFIX_CALLS:
+                    unresolved.append(name)
+                elif name == "Add" and receiver_text((n.get("fn") or {}).get("obj")).split(".")[-1] == "Conventions":
+                    args = n.get("args") or []
+                    if not (args and isinstance(args[0], dict) and args[0].get("k") == "new"):
+                        continue
+                    new = args[0]
+                    cls = (new.get("type") or "").split("<")[0].split(".")[-1]
+                    if not cls:
+                        continue
+                    if not model.find_types(cls):
+                        if _ROUTEY.search(cls):
+                            unresolved.append(cls)
+                        continue
+                    classes = _class_touches_routes(model, cls)
+                    if not classes:
+                        continue            # an in-solution convention that does not touch routes
+                    cargs = new.get("args") or []
+                    value = literal_str(cargs[0]) if cargs else _inner_prefix(classes)
+                    if value is not None and prefix is None:
+                        prefix = (value, cls)
+                    else:
+                        unresolved.append(cls)
+    for cls in dict.fromkeys(unresolved):
+        note = _PREFIX_NOTE.format(cls)
+        if note not in model.notes:
+            model.notes.append(note)
+    model.cache["route_prefix"] = (prefix[0], prefix[1]) if prefix else (None, None)
+    return model.cache["route_prefix"]
+
+
 def discover_controllers(model: ProjectModel) -> list[CoreRouteRef]:
     refs: list[CoreRouteRef] = []
+    prefix = _prefix_conventions(model)
     global_maps: list[_Mapping] | None = None
     done: set[tuple[str, int]] = set()
     for first in model.types():
@@ -359,11 +482,24 @@ def discover_controllers(model: ProjectModel) -> list[CoreRouteRef]:
             if global_maps is None:
                 global_maps = _mappings(pipeline_for(model, None).named(*_MAP_NAMES, include_dev=True))
             maps = global_maps
-        refs.extend(_controller_routes(model, t, decls, chain, maps))
+        refs.extend(_controller_routes(model, t, decls, chain, maps, prefix[0]))
+    if prefix[0] is not None and any(r.route.meta.get("route_assumed") or not _attr_routed(r) for r in refs):
+        note = f"route prefix convention {prefix[1]} is not applied to conventionally routed controllers"
+        if note not in model.notes:
+            model.notes.append(note)
     return refs
 
 
-def _controller_routes(model: ProjectModel, t: TypeIR, decls: list[TypeIR], chain: list[TypeIR], maps: list[_Mapping]) -> list[CoreRouteRef]:
+def _attr_routed(r: CoreRouteRef) -> bool:
+    """Whether the action carries a route template (its path came from attributes, not a conventional pattern)."""
+    return r.method is not None and any(
+        attr_key(a.name) in ("route", "acceptverbs") or (attr_key(a.name) in _VERB_ATTRS and _template(a) is not None)
+        for a in r.method.attributes) or any(
+        attr_key(a.name) == "route" for a in (r.type.attributes if r.type else []))
+
+
+def _controller_routes(model: ProjectModel, t: TypeIR, decls: list[TypeIR], chain: list[TypeIR], maps: list[_Mapping],
+                       conv_prefix: str | None = None) -> list[CoreRouteRef]:
     controller, area = _controller_name(t), _area(chain)
     api = _api_surface(model, t, chain)
     proj = model.project_of(t.file)
@@ -406,7 +542,14 @@ def _controller_routes(model: ProjectModel, t: TypeIR, decls: list[TypeIR], chai
 
     simple = t.name.split(".")[-1]
     refs: list[CoreRouteRef] = []
-    for m, decl in action_candidates(model, t):
+    ext = _external_base(model, t)
+    cands = action_candidates(model, t)
+    if ext is not None:
+        # The third-party base declares the actions this class overrides; its routed overrides count.
+        have = {id(m) for m, _d in cands}
+        cands = cands + [(m, t) for m in _routed_methods(t) if id(m) not in have]
+        unknown.append(f"base type {ext} not in solution; controller semantics assumed")
+    for m, decl in cands:
         # An own action of a merged partial type is declared in one of its halves.
         if decl is t:
             decl = next((d for d in decls if any(x is m for x in d.methods)), decl)
@@ -419,7 +562,8 @@ def _controller_routes(model: ProjectModel, t: TypeIR, decls: list[TypeIR], chai
             if (path, tuple(methods)) in seen:
                 return
             seen.add((path, tuple(methods)))
-            meta: dict = {"kind": "controller", "api_surface": api, "controller": t.full_name}
+            surface = api or (ext is not None and any(attr_key(a.name) in _VERB_ATTRS for a in m.attributes))
+            meta: dict = {"kind": "controller", "api_surface": surface, "controller": t.full_name}
             if env is not None:
                 meta["env"] = env
             if assumed:
@@ -446,7 +590,10 @@ def _controller_routes(model: ProjectModel, t: TypeIR, decls: list[TypeIR], chai
             if raws is None:
                 conventional, conv_verbs = True, verbs
                 continue
-            for raw in raws:
+            sel_rooted = sel_tmpl is not None and sel_tmpl.startswith(("/", "~/"))
+            for i, raw in enumerate(raws):
+                if conv_prefix and not sel_rooted and not (class_tmpls and class_tmpls[i].startswith(("/", "~/"))):
+                    raw = _join(conv_prefix, raw)       # a rooted template ignores a prefix convention
                 add(_attribute_path(raw, controller, action, area), verbs, "attr")
         if conventional:
             for cm in conv:
@@ -724,6 +871,9 @@ WithSummary WithDescription Produces ProducesProblem ProducesValidationProblem A
 RequireRateLimiting RequireHost DisableAntiforgery AddEndpointFilter AddEndpointFilterFactory
 ExcludeFromDescription DisableRateLimiting CacheOutput WithRequestTimeout
 """.split())
+# Calls that can grant or deny access: never credited through an unresolved call on a group.
+_AUTH_CALLS = frozenset("RequireAuthorization AllowAnonymous AddEndpointFilter AddEndpointFilterFactory WithMetadata "
+                        "Add Finally".split())
 _SWEEP_MSG = "registration not reached by the pipeline walk"
 _SWEEP_ENV_MSG = "environment and group prefix of this registration were not traced"
 # Map* calls other discovery code handles (controllers, pages) or that register nothing worth listing.
@@ -740,6 +890,10 @@ class _Node:
     notes: list[str] = field(default_factory=list)
     traced: bool = True                 # False: a builder whose group context is not known
     depth: int = 0                      # conditional depth of the code that created it
+    # What an unresolved call (`g.HasApiVersion(1.0)`) made of a group: the prefix chain above it is kept
+    # (paths stay right) but conventions applied above it are not credited to routes registered here.
+    prefix_only: bool = False
+    opaque: str | None = None           # that call's name until a conventional call or a Map* has used the node
 
 
 @dataclass(eq=False)
@@ -775,6 +929,16 @@ class _Frame:
     env_pc: PipeCall | None = None
     returns: list = field(default_factory=list)
     cond: int = 0           # nesting of branches / loops / catches the code runs under
+
+
+def _verb_text(x) -> str | None:
+    """A verb in a MapMethods collection: a string literal, or an `HttpMethods.Post` member."""
+    v = literal_str(x)
+    if v:
+        return v
+    if isinstance(x, dict) and x.get("k") == "member" and receiver_text(x.get("obj")).split(".")[-1] == "HttpMethods":
+        return x.get("name") or None
+    return None
 
 
 def _simple_type(t: str | None) -> str:
@@ -889,6 +1053,11 @@ class _Scan:
                         self.middleware(fr, link, name, None)
                         for e in self.entries[before:]:
                             e.ref.unknown[:0] = [_SWEEP_MSG, _SWEEP_ENV_MSG]
+                    elif self.is_branch(link, name):
+                        before = len(self.entries)
+                        self.branch_route(fr, link, None)
+                        for e in self.entries[before:]:
+                            e.ref.unknown[:0] = [_SWEEP_MSG, _SWEEP_ENV_MSG]
                     elif self.is_map(link, name, False):
                         entry = self.register(fr, link, name, None, None)
                         entry.ref.unknown[:0] = [_SWEEP_MSG, _SWEEP_ENV_MSG]
@@ -902,10 +1071,20 @@ class _Scan:
         while n is not None:
             chain.append(n)
             n = n.parent
+        above: set[int] = set()         # nodes above an unresolved call: prefix only
+        cut = False
+        for n in chain:
+            if cut:
+                above.add(id(n))
+            cut = cut or n.prefix_only
         for n in reversed(chain):
-            if n.group is not None:
-                e.ref.groups.append(n.group)
-            e.ref.groups.extend(n.extras)
+            if id(n) in above:
+                if n.group is not None:
+                    e.ref.groups.append(Group(n.group.prefix, [], n.group.file, n.group.line))
+            else:
+                if n.group is not None:
+                    e.ref.groups.append(n.group)
+                e.ref.groups.extend(n.extras)
             for note in n.notes:
                 if note not in e.ref.unknown:
                     e.ref.unknown.append(note)
@@ -1035,6 +1214,12 @@ class _Scan:
             if prefix is None:
                 g.notes.append("a MapGroup prefix is not a literal")
             return g
+        if name == "NewVersionedApi" and isinstance(state, _Node) and state.kind == "root":
+            # Asp.Versioning's versioned-API builder: routes map onto the same endpoint builder (no prefix).
+            return _Node(None, state, "root", depth=fr.cond)
+        if not arg and self.is_branch(link, name):
+            self.branch_route(fr, link, pc)
+            return state            # `app.Map(path, branch)` hands the application builder back
         if not arg and self.is_map(link, name, known):
             return self.register(fr, link, name, node, pc)
         if not arg and self.is_unmodelled(link, name, known):
@@ -1100,6 +1285,37 @@ class _Scan:
             return True
         return not link.get("sym") and self.shaped(link, name)
 
+    def is_branch(self, link: dict, name: str) -> bool:
+        """`app.Map(path, Action<IApplicationBuilder>)`: a middleware branch, by symbol (MapExtensions) or,
+        with no symbol, a branch-shaped lambda. Not yet registered."""
+        if name != "Map" or id(link) in self.consumed:
+            return False
+        sym = link.get("sym")
+        if sym:
+            return sym.rsplit(".", 1)[0].endswith(".MapExtensions")
+        p = _arg(link, 0, "pattern", "pathmatch")
+        return (_is_branch_lambda(self.handler_arg(link, name))
+                and (const_str(p) is not None or (isinstance(p, dict) and p.get("k") in ("name", "member"))))
+
+    def branch_route(self, fr: _Frame, link: dict, pc: PipeCall | None) -> None:
+        """A middleware branch is served by the pipeline, not by endpoint routing: endpoint authorization
+        (RequireAuthorization, [Authorize]) does not apply to it, so it is listed as a `middleware` route."""
+        env_pc = pc or fr.env_pc
+        line = link.get("line", 0)
+        self.consumed.add(id(link))
+        pattern = const_str(_arg(link, 0, "pattern", "pathmatch"))
+        notes = [] if pattern is not None else ["the path of Map is not a literal"]
+        meta: dict = {"kind": "branch", "api_surface": False, "middleware": True}
+        if env_pc is not None and env_pc.runs_in("Production") is not True and env_pc.env:
+            meta["env"] = env_pc.env
+            if env_pc.runs_in("Production") is False:
+                meta["dev_only"] = True
+        route = Route(path=strip_constraints(_join(pattern if pattern is not None else "{?}")), methods=["ANY"],
+                      handler_name="Map", file=pc.file if pc is not None else fr.type.file, line=line,
+                      source_start_line=line, source_end_line=link.get("end_line", line) or line, meta=meta)
+        self.entries.append(_Entry(CoreRouteRef(route, None, None, self.proj, style="endpoint",
+                                                caller_unknown=not fr.reached, unknown=notes), _Node(None)))
+
     def shaped(self, link: dict, name: str) -> bool:
         """With no symbol and a receiver the value model does not know (a factory-returned app, a
         field, `this`): a call shaped like a registration still counts -- a spurious route costs
@@ -1140,6 +1356,14 @@ class _Scan:
         """A non-Map call chained on a builder, a route, or a followed call's result."""
         if state is None:
             return None
+        if (isinstance(state, _Node) and state.opaque and name in _AUTH_CALLS
+                and (not name.startswith("Map") and self.passes_through(link, name, state))):
+            # `g.HasVersionInfo(1).RequireAuthorization()`: what the unresolved call returned is not provably
+            # `g`, so the convention is not credited to the routes registered on it.
+            msg = f"{name} applied to the result of {state.opaque} could not be traced"
+            if msg not in state.notes:
+                state.notes.append(msg)
+            return state
         if not self.passes_through(link, name, state):
             # A call this engine cannot follow, made on a route or a group: whatever it applies (an
             # anonymous opt-out, say) is unknown, noted now because nothing may be chained after it.
@@ -1165,6 +1389,10 @@ class _Scan:
                         o.notes.append(msg)
                     elif isinstance(o, _Entry) and msg not in o.ref.unknown:
                         o.ref.unknown.append(msg)
+            if isinstance(state, _Node) and state.kind == "group" and not name.startswith("Map"):
+                # The call's own result is unknown, but a group extension returns a builder that routes under
+                # the same prefix: keep the prefix chain for paths (the note above keeps auth at REVIEW).
+                return _Node(None, state, "group", depth=fr.cond, prefix_only=True, opaque=name)
             # Two untraced hops in a row (`g.MapX().Foo().RequireAuthorization()`): the origin stays the
             # first thing that was a group or a route, not the previous untraced result.
             if isinstance(state, _Result) and not state.traced:
@@ -1320,7 +1548,7 @@ class _Scan:
             if name in _VERB_CALLS:
                 methods = [_VERB_CALLS[name]]
             elif name == "MapMethods":
-                verbs = [v.strip().upper() for x in walk(_arg(link, 1, "httpmethods")) if (v := literal_str(x))]
+                verbs = [v.strip().upper() for x in walk(_arg(link, 1, "httpmethods")) if (v := _verb_text(x))]
                 if verbs:
                     methods = list(dict.fromkeys(verbs))
                 else:
