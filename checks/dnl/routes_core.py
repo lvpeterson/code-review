@@ -416,21 +416,39 @@ def _inner_prefix(classes: list[TypeIR]) -> str | None:
     return next(iter(lits)) if len(lits) == 1 else None
 
 
-def _prefix_conventions(model: ProjectModel) -> tuple[str | None, str | None]:
-    """(literal route prefix applied to attribute routes, class of the convention that supplies it);
-    notes for conventions that could not be applied go on model.notes."""
+_COND_KINDS = frozenset({"if", "loop", "try", "switch", "cond", "ternary", "conditional"})
+
+
+def _calls_cond(node, cond: bool = False):
+    """(call node, under a branch / loop / catch) for every call below node."""
+    if isinstance(node, dict):
+        if node.get("k") == "call":
+            yield node, cond
+        inner = cond or node.get("k") in _COND_KINDS
+        for v in node.values():
+            if isinstance(v, (dict, list)):
+                yield from _calls_cond(v, inner)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _calls_cond(v, cond)
+
+
+def _prefix_conventions(model: ProjectModel) -> dict:
+    """Literal route prefix applied to attribute routes, per registering project: {id(project): (prefix, class)}.
+    A convention that cannot be applied (not literal, third party, conditional, a second literal one in the
+    same project) is a note on model.notes instead. The registering projects go in model.cache["route_prefix_at"]."""
     if "route_prefix" in model.cache:
         return model.cache["route_prefix"]
-    prefix: tuple[str, str] | None = None
-    unresolved: list[str] = []
+    found: dict[int, list[tuple[str, str, bool]]] = {}      # id(proj) -> (value, cls, conditional)
+    projs: dict[int, object] = {}
+    notes: list[str] = []
     for t in model.types():
+        proj = model.project_of(t.file)
         for m in t.methods:
-            for n in walk(m.body):
-                if n.get("k") != "call":
-                    continue
+            for n, cond in _calls_cond(m.body):
                 name = call_name(n)
                 if name in _PREFIX_CALLS:
-                    unresolved.append(name)
+                    notes.append(_PREFIX_NOTE.format(name))
                 elif name == "Add" and receiver_text((n.get("fn") or {}).get("obj")).split(".")[-1] == "Conventions":
                     args = n.get("args") or []
                     if not (args and isinstance(args[0], dict) and args[0].get("k") == "new"):
@@ -441,28 +459,39 @@ def _prefix_conventions(model: ProjectModel) -> tuple[str | None, str | None]:
                         continue
                     if not model.find_types(cls):
                         if _ROUTEY.search(cls):
-                            unresolved.append(cls)
+                            notes.append(_PREFIX_NOTE.format(cls))
                         continue
                     classes = _class_touches_routes(model, cls)
                     if not classes:
                         continue            # an in-solution convention that does not touch routes
                     cargs = new.get("args") or []
                     value = literal_str(cargs[0]) if cargs else _inner_prefix(classes)
-                    if value is not None and prefix is None:
-                        prefix = (value, cls)
+                    if value is None:
+                        notes.append(_PREFIX_NOTE.format(cls))
                     else:
-                        unresolved.append(cls)
-    for cls in dict.fromkeys(unresolved):
-        note = _PREFIX_NOTE.format(cls)
+                        found.setdefault(id(proj), []).append((value, cls, cond))
+                        projs[id(proj)] = proj
+    applied: dict = {}
+    for key, items in found.items():
+        if len(items) > 1:
+            notes.extend(_PREFIX_NOTE.format(c) + "; several prefix conventions are registered" for _v, c, _k in items)
+        elif items[0][2]:
+            notes.append(f"route prefix convention {items[0][1]} is applied conditionally; "
+                         + _PREFIX_NOTE.format(items[0][1]))
+        else:
+            applied[key] = (items[0][0], items[0][1])
+    for note in dict.fromkeys(notes):
         if note not in model.notes:
             model.notes.append(note)
-    model.cache["route_prefix"] = (prefix[0], prefix[1]) if prefix else (None, None)
-    return model.cache["route_prefix"]
+    model.cache["route_prefix"] = applied
+    model.cache["route_prefix_at"] = {k: projs[k] for k in found}
+    return applied
 
 
 def discover_controllers(model: ProjectModel) -> list[CoreRouteRef]:
     refs: list[CoreRouteRef] = []
     prefix = _prefix_conventions(model)
+    ctl_projs: set[int] = set()
     global_maps: list[_Mapping] | None = None
     done: set[tuple[str, int]] = set()
     for first in model.types():
@@ -482,11 +511,19 @@ def discover_controllers(model: ProjectModel) -> list[CoreRouteRef]:
             if global_maps is None:
                 global_maps = _mappings(pipeline_for(model, None).named(*_MAP_NAMES, include_dev=True))
             maps = global_maps
-        refs.extend(_controller_routes(model, t, decls, chain, maps, prefix[0]))
-    if prefix[0] is not None and any(r.route.meta.get("route_assumed") or not _attr_routed(r) for r in refs):
-        note = f"route prefix convention {prefix[1]} is not applied to conventionally routed controllers"
-        if note not in model.notes:
-            model.notes.append(note)
+        ctl_projs.add(id(proj))
+        refs.extend(_controller_routes(model, t, decls, chain, maps, prefix.get(id(proj), (None, None))[0]))
+    for key, (_value, cls) in prefix.items():
+        # Only the registering project's controllers are prefixed: controllers elsewhere may lack it.
+        if ctl_projs - {key}:
+            note = _PREFIX_NOTE.format(cls)
+            if note not in model.notes:
+                model.notes.append(note)
+        if any(r.project is not None and id(r.project) == key and (r.route.meta.get("route_assumed") or not _attr_routed(r))
+               for r in refs):
+            note = f"route prefix convention {cls} is not applied to conventionally routed controllers"
+            if note not in model.notes:
+                model.notes.append(note)
     return refs
 
 
