@@ -21,6 +21,9 @@ public static class WeakLooking
     public const string ClientSecret = "client_id_token";
     public const string LongToken = "the_access_token_name_that_goes_on_and_on_forever_x";
 
+    public const string ApiKey = "ProductionKey_Abcdefghijklmnop";
+    public const string AuthToken = "Bearer_tokenvalueabcdef";
+
     public static NetworkCredential Build()
     {
         return new NetworkCredential("u", "correct horse battery");

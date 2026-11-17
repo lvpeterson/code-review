@@ -95,6 +95,9 @@ _WORD_SPLIT = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
 # Words that make a name-shaped literal plausibly the name of a key, header, claim or field.
 _KEY_WORDS = {"token", "key", "id", "name", "header", "claim", "scope", "cookie", "verification", "bearer",
               "grant", "type"}
+# Qualifiers that commonly prefix a key / header / claim name (`access_token`, `__RequestVerificationToken`).
+_FIELD_WORDS = {"access", "refresh", "request", "response", "session", "client", "user", "api", "auth",
+                "csrf", "xsrf", "antiforgery", "forgery", "content", "authorization", "identity", "api"}
 _SECRET_NAMED = re.compile(r"(?i)pass(word|wd)?|pwd|secret|credential")
 
 
@@ -112,7 +115,11 @@ def _names_a_key(text: str, var: str) -> bool:
     is reported low / REVIEW rather than dropped."""
     if len(text) > 40 or _SECRET_NAMED.search(var or ""):
         return False
-    return any(w.lower() in _KEY_WORDS for w in _WORD_SPLIT.findall(text))
+    words = [w.lower() for w in _WORD_SPLIT.findall(text)]
+    # Every word must be a key / field word or a short common word, and at least one a key word:
+    # `ProductionKey_Abcdefghijklmnop` or `Bearer_tokenvalueabcdef` carry a key word AND real-looking content.
+    return (any(w in _KEY_WORDS for w in words)
+            and all(w in _KEY_WORDS or w in _FIELD_WORDS or len(w) <= 4 for w in words))
 
 
 def _in_crypto_ns(*syms: str | None) -> bool:

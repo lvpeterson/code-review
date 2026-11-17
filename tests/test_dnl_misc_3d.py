@@ -49,7 +49,7 @@ def test_n4_key_name_literals_skipped_weak_looking_ones_demoted(findings):
     assert not {7, 8, 9, 10} & set(got)
     assert got[11] == ("high", None)             # real-looking secret unchanged
     # name-shaped literals on a secret-like variable, or too long, or without a key word: never dropped
-    for line in (16, 17, 18, 19, 20, 21, 22, 26):
+    for line in (16, 17, 18, 19, 20, 21, 22, 24, 25, 29):
         assert got[line] == ("low", "REVIEW"), line
 
 
@@ -66,15 +66,35 @@ def test_n4_test_project_findings_demoted(findings):
     assert _of(findings, "DNL-SSRF-001", PROXY) == [(14, "high", None)]
 
 
+FALLBACK = "src/Misc3d/Services/GateFallback.cs"
 GATES = {"src/Misc3d/Services/GateNested.cs", "src/Misc3d/Services/GateStaticUsing.cs",
          "src/Misc3d/Services/GateExtension.cs", "src/Misc3d/Services/GateGeneric.cs"}
 
 
 def test_n7_scoped_resolution_keeps_real_gates(findings):
-    # nested class -> outer method, `using static` helper, extension method via this., generic base
-    assert {f.file for f in findings if f.check_id == "DNL-ERR-001"} == GATES
+    # nested class -> outer method, `using static` helper, extension method via this., generic base,
+    # plus the solution-wide fallback (REVIEW)
+    errs = [f for f in findings if f.check_id == "DNL-ERR-001"]
+    assert {f.file for f in errs} == GATES | {FALLBACK}
+    assert all(f.confidence is None for f in errs if f.file in GATES)
+    assert [f.confidence for f in errs if f.file == FALLBACK] == ["REVIEW"]
 
 
 def test_n7_no_fail_open_catch_for_modelstate_and_service_calls(findings):
     # An unqualified call must not resolve to a same-named method of an unrelated type.
     assert not [f for f in findings if f.check_id == "DNL-ERR-001" and "Checkout" in f.file]
+
+
+def test_n7_truth_evaluation_is_scoped_to_the_owner(roslyn_helper, monkeypatch):
+    """`_Truth` resolves `Lookup()` inside TruthHost; an unrelated TruthDecoy.Lookup must not make the
+    answer ambiguous (core, no symbols)."""
+    from checks.dnl import rules_errors
+    from checks.dnl.ir import walk
+    monkeypatch.setattr("checks.dnl.helper.find_helper", lambda *a, **k: None)
+    monkeypatch.setattr("checks.dnl.helper.sdk_available", lambda *a, **k: False)
+    model = project.prepare(FX, True).view("dotnet")
+    auth = rules_errors._Auth(model)
+    host = next(t for t in model.types() if t.name == "TruthHost")
+    pick = next(m for m in host.methods if m.name == "Pick")
+    call = next(n for n in walk(pick.body) if n.get("k") == "call")
+    assert rules_errors._Truth(auth, host, pick.body, owner=host).of(call) == "true"

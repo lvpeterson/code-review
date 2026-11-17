@@ -200,6 +200,7 @@ class _Auth:
     def __init__(self, model):
         self.model = model
         self._scopes: dict = {}
+        self.strict = False                  # True: no solution-wide fallback for unbound calls
         self.by_name: dict = {}
         self.owner: dict = {}
         for t in model.types():
@@ -261,7 +262,7 @@ class _Auth:
                 hit += [m for m in self._extensions(nm) if m not in hit]
                 # Nothing bound in scope (a base the solution lacks, a framework member): the old
                 # solution-wide candidates, so a real decision is never lost.
-                return hit or [m for _t, m in cands]
+                return hit if hit or self.strict else [m for _t, m in cands]
             return [m for _t, m in cands]
         return []
 
@@ -276,7 +277,7 @@ class _Auth:
                 for m in self._targets(n, owner):
                     if id(m) in seen:
                         continue
-                    key = (id(m), depth, owner is not None)
+                    key = (id(m), depth, owner is not None, self.strict)
                     if key not in self._memo:
                         self._memo[key] = (bool(_DECISION_NAME.search(m.name))
                                            or self.decides(m.body, depth - 1, seen | {id(m)},
@@ -412,8 +413,9 @@ class _Truth:
     """Resolves an expression to "true" / "false" / "?" : literals, `!x`, locals with a single value
     source, consts, and project methods whose every return agrees."""
 
-    def __init__(self, auth: _Auth, t, m_body: list):
+    def __init__(self, auth: _Auth, t, m_body: list, owner=None):
         self.auth = auth
+        self.owner = owner                   # enclosing type when scoped call resolution applies (Core)
         self.srcs = _value_sources(m_body)
         # Only a const is a fixed value: any other field or property can be changed elsewhere.
         self.fields = {f.name.lower(): f.init for f in t.fields if f.is_const and f.init is not None}
@@ -426,7 +428,8 @@ class _Truth:
             v = v.get("e")
         if not isinstance(v, dict) or v.get("k") not in ("call", "member"):
             return False
-        return _is_marker(v) or (v.get("k") == "call" and bool(self.auth._targets(v)) and self.auth.decides([v]))
+        return _is_marker(v) or (v.get("k") == "call" and bool(self.auth._targets(v, self.owner))
+                                                      and self.auth.decides([v], owner=self.owner))
 
     def of(self, e, depth: int = 2, seen: frozenset = frozenset()) -> str:
         if not isinstance(e, dict):
@@ -459,9 +462,10 @@ class _Truth:
             return "?"
         if k == "call" and depth > 0:
             outs = set()
-            targets = self.auth._targets(e)
+            targets = self.auth._targets(e, self.owner)
             for m in targets:
-                inner = _Truth(self.auth, self.auth.owner[id(m)], m.body)
+                inner = _Truth(self.auth, self.auth.owner[id(m)], m.body,
+                               self.auth.owner[id(m)] if self.owner is not None else None)
                 rets = [n.get("value") for n in walk(m.body) if n.get("k") == "return" and n.get("value") is not None]
                 outs |= {inner.of(r, depth - 1) for r in rets} or {"?"}
             return outs.pop() if len(outs) == 1 and targets else "?"
@@ -739,7 +743,7 @@ def check(model, refs=()) -> list:
         core = model.is_core_file(t.file)
         for label, m, body, _scope in iter_bodies(t):
             bool_like = m is None or (m.return_type or "").replace(" ", "").lower() in _BOOLS
-            truth = _Truth(ctx.auth, t, body)
+            truth = _Truth(ctx.auth, t, body, t if core else None)
             mname = (m.name if m else label).lower()
             for tr in _tries(body):
                 truth.skip = {id(n) for n in walk(tr.get("body"))}
@@ -747,6 +751,14 @@ def check(model, refs=()) -> list:
                 named = bool(_DECISION_NAME.search(label)) and bool_like
                 # Core only: legacy keeps the solution-wide bare-name resolution.
                 decision = known or named or ctx.auth.decides(tr.get("body"), owner=t if core else None)
+                via_fallback = False
+                if decision and core and not (known or named):
+                    # Is the decision still found without the solution-wide fallback for unbound calls?
+                    ctx.auth.strict = True
+                    try:
+                        via_fallback = not ctx.auth.decides(tr.get("body"), owner=t)
+                    finally:
+                        ctx.auth.strict = False
                 lines = ctx.catch_lines(t.file, tr)
                 after = _tail(body, tr)
                 for c, line in zip(tr["catches"], lines):
@@ -757,7 +769,7 @@ def check(model, refs=()) -> list:
                         emit(_finding(ctx, t, label, "DNL-ERR-001", "medium",
                                       "Fail-open catch around an authorization decision",
                                       f"The catch ({ctype or 'all exceptions'}) around an authorization decision "
-                                      f"{verdict[0]}", line, verdict[1]))
+                                      f"{verdict[0]}", line, "REVIEW" if via_fallback else verdict[1]))
                     elif not cbody and ctype in _CATCH_ALL:
                         # An empty catch-all always yields ERR-001 or ERR-003, never neither.
                         emit(_finding(ctx, t, label, "DNL-ERR-003", "low", "Swallowed exception",

@@ -301,6 +301,8 @@ class _Facts:
     framework_refs: set[str] = field(default_factory=set)
     usings: list[str] = field(default_factory=list)
     unresolved: list[str] = field(default_factory=list)
+    # File whose only TargetFramework values are conditional (no unconditional value anywhere).
+    cond_only: str | None = None
 
 
 _ABOVE = re.compile(r"GetPathOfFileAbove|GetDirectoryNameOfFileAbove", re.I)
@@ -375,8 +377,8 @@ def _sdk_facts(path: Path, tree, root: Path) -> _Facts:
     refs: list[tuple[str, str | None, str | None]] = []
     usings: list[tuple[str, str]] = []
     fw: set[str] = set()
-    tfms: list[str] = []
-    effective: list[str] = []
+    # Per file with a TargetFramework(s): (name, [(values, conditional)] in order), farthest first.
+    tfm_files: list[tuple[str, list[tuple[list[str], bool]]]] = []
     unresolved: list[str] = []
     for src_name, src in [*_props_layers(path.parent, root), (path.name, tree)]:
         if src is None:
@@ -392,23 +394,19 @@ def _sdk_facts(path: Path, tree, root: Path) -> _Facts:
                 else:
                     props[key] = val
         if file_tfms:
-            # Effective: the unconditional values (all of them when every group is conditional).
-            # Reported: every value, so an end-of-support framework in any group is seen.
-            tfms, effective = [], []
-            has_plain = any(not cond for _v, cond in file_tfms)
+            groups: list[tuple[list[str], bool]] = []
             for val, cond in file_tfms:
+                vals: list[str] = []
                 for tfm in (x.strip() for x in val.split(";")):
                     if not tfm:
                         continue
                     res = _resolve_tfm(tfm, props)
                     if res is None:
                         unresolved.append(f"{src_name}: {tfm}")
-                        continue
-                    if (not cond or not has_plain) and res not in effective:
-                        effective.append(res)
-                    if res not in tfms:
-                        tfms.append(res)
-            tfms = effective + [t for t in tfms if t not in effective]
+                    elif res not in vals:
+                        vals.append(res)
+                groups.append((vals, cond))
+            tfm_files.append((src_name, groups))
         for el in src.iter():
             tag = _local(el.tag)
             if tag == "PackageReference" and el.get("Include"):
@@ -433,6 +431,31 @@ def _sdk_facts(path: Path, tree, root: Path) -> _Facts:
     for el in tree.iter():
         if _local(el.tag) == "Sdk" and el.get("Name") and facts.sdk is None:
             facts.sdk = el.get("Name").strip()
+    # Effective frameworks (profile and owner): the unconditional values of the nearest file that has
+    # any; a file with only conditional values does not override a farther unconditional one. With no
+    # unconditional value anywhere the last conditional group of the nearest file decides (as before),
+    # and a note names the file. Reported frameworks (end of support): the effective ones plus every
+    # value of the files from the one that supplied them down to the project file.
+    plain_at = [i for i, (_n, g) in enumerate(tfm_files) if any(not c for _v, c in g)]
+    if plain_at:
+        k = plain_at[-1]
+        last_plain = [vals for vals, c in tfm_files[k][1] if not c][-1]
+        effective = list(last_plain)
+        start = k
+    elif tfm_files:
+        k = len(tfm_files) - 1
+        effective = list(tfm_files[k][1][-1][0])
+        start = 0
+        if effective:
+            facts.cond_only = tfm_files[k][0]
+    else:
+        effective, start = [], 0
+    tfms = list(effective)
+    for _n, groups in tfm_files[start:]:
+        for vals, _c in groups:
+            for v in vals:
+                if v not in tfms:
+                    tfms.append(v)
     facts.tfms = tfms
     facts.effective = effective
     facts.unresolved = unresolved
@@ -552,6 +575,9 @@ def _load_project(path: Path, notes: list[str], root: Path | None = None) -> Pro
         for u in facts.unresolved:
             notes.append(f"{path.name}: TargetFramework value could not be resolved ({u}); "
                          "end-of-support checks may miss it")
+        if facts.cond_only:
+            notes.append(f"{path.name}: TargetFramework is set only under a Condition ({facts.cond_only}); "
+                         "the project's package is inferred from the last conditional value")
         if facts.effective:
             proj.profile = profile_for(facts.effective)
         else:

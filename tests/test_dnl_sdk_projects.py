@@ -289,7 +289,7 @@ def test_conditional_tfms_are_a_union(tmp_path):
         "<PropertyGroup Condition=\"'$(A)' != 'x'\"><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>")
     _sdk_csproj(tmp_path / "App")
     app = _by_name(load_projects(tmp_path), "App")
-    assert app.target_frameworks == ["net6.0", "net8.0"]
+    assert sorted(app.target_frameworks) == ["net6.0", "net8.0"]
 
 
 def test_unresolved_tfm_value_adds_a_note(tmp_path):
@@ -376,3 +376,21 @@ def test_unconditional_modern_tfm_with_conditional_old_one_stays_core(tmp_path):
     _sdk_csproj(tmp_path / "App")
     app = _by_name(load_projects(tmp_path), "App")
     assert app.owner == "dotnet" and app.target_frameworks == ["net8.0", "net472"]
+
+
+def test_conditional_only_csproj_tfm_does_not_override_unconditional_props(tmp_path):
+    (tmp_path / "Directory.Build.props").write_text(
+        "<Project><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>")
+    _sdk_csproj(tmp_path / "App", "<PropertyGroup Condition=\"'$(Old)' == 'true'\">"
+                                  "<TargetFramework>net48</TargetFramework></PropertyGroup>")
+    app = _by_name(load_projects(tmp_path), "App")
+    assert app.owner == "dotnet" and app.profile == "netcore"
+    assert app.target_frameworks == ["net8.0", "net48"]
+
+
+def test_only_conditional_tfms_keep_old_owner_and_add_a_note(tmp_path):
+    _sdk_csproj(tmp_path / "App", "<PropertyGroup Condition=\"'$(X)' == 'a'\"><TargetFramework>net48</TargetFramework></PropertyGroup>")
+    notes: list[str] = []
+    app = _by_name(load_projects(tmp_path, notes), "App")
+    assert app.owner == "dotnet_legacy"
+    assert any("App.csproj" in n and "Condition" in n for n in notes)
