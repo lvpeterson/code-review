@@ -1,16 +1,23 @@
 """Authentication-related ASP.NET Core configuration rules, called from the rules_pipeline aggregator.
 
-Groups: cookies and session (DNL-SESS-001/002/003 reused, DNL-SESS-009). Later tasks add antiforgery,
-token validation and Identity groups to this module.
+Groups: cookies and session (DNL-SESS-001/002/003 reused, DNL-SESS-009) and antiforgery (DNL-CSRF-001
+reused, DNL-CSRF-002). Later tasks add token validation and Identity groups to this module.
 
 Like the other rules_pipeline* modules it must not import rules_auth_core (static inventory test);
 shared helpers live in auth_core.py.
 """
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass, field
+
+from checks.dnl.auth_core import _NON_AUTHZ_EXTENSIONS
 from checks.dnl.cfgctx import Ctx
-from checks.dnl.options import Opt, const, opaque_reason, options_of, timespan_minutes, verdict
+from checks.dnl.ir import attr_key, call_name, receiver_text
+from checks.dnl.options import (Opt, const, lambda_args, opaque_reason, options_of, timespan_minutes, verdict,
+                                walk_conditional)
 from checks.dnl.pipeline import PipeCall, Pipeline
+from checks.dnl.routes_core import CoreRouteRef, _chain_types
 
 # -- cookies and session (DNL-SESS-001, DNL-SESS-002, DNL-SESS-003, DNL-SESS-009) ---------------------
 
@@ -257,3 +264,316 @@ def _lifetime(opts, c, conf, add) -> None:
         if uncertain:
             desc += " Some assignment to it sits under a condition, so it may not apply; confirm."
         add("DNL-SESS-003", "low", title, desc, c, o.line, conf if firm else "REVIEW")
+
+
+# -- antiforgery (DNL-CSRF-001 reused for ASP.NET Core, DNL-CSRF-002) -----------------------------------
+
+_MUTATING = {"POST", "PUT", "DELETE", "PATCH"}
+_VERB_ATTRS = {f"http{v}" for v in ("get", "post", "put", "delete", "patch", "head", "options")} | {"acceptverbs"}
+# Calls whose options lambda can register global filters; `Configure<T>` counts only for the option types below.
+_MVC_CALLS = ("AddControllers", "AddControllersWithViews", "AddMvc", "AddMvcCore", "AddMvcOptions", "AddRazorPages",
+              "AddRazorPagesOptions", "Configure")
+_MVC_OPTION_TYPES = ("MvcOptions", "RazorPagesOptions")
+_COOKIE_REGISTRATIONS = ("AddCookie", "AddIdentity", "AddDefaultIdentity")
+_VALIDATE_NAMES = {"validateantiforgerytoken", "validateantiforgerytokenattribute",
+                   "autovalidateantiforgerytoken", "autovalidateantiforgerytokenattribute"}
+_IGNORE_NAMES = {"ignoreantiforgerytoken", "ignoreantiforgerytokenattribute"}
+_FORM_TYPES = {"iformfile", "iformfilecollection", "iformcollection"}
+_TYPEOF = re.compile(r"\s*typeof\s*\(\s*([\w.<>,\s?]+?)\s*\)\s*")
+_PAGE_ATTR = re.compile(r"(IgnoreAntiforgeryToken|(?:Auto)?ValidateAntiforgeryToken)", re.IGNORECASE)
+
+
+@dataclass
+class _Af:
+    """What one pipeline says about cookie authentication and global antiforgery filters."""
+    cookie: str = "no"                                     # "yes" | "maybe" | "no"
+    cookie_why: list = field(default_factory=list)         # why "maybe"
+    protect: str = "no"                                    # a global validating filter: "yes" | "maybe" | "no"
+    protect_why: list = field(default_factory=list)
+    ignore: list = field(default_factory=list)             # [(file, line, firm)] global ignoring filters
+    opaque: list = field(default_factory=list)             # [(call, reason)] MVC option calls that cannot be read
+
+    def maybe_protect(self, why: str) -> None:
+        if self.protect != "yes":
+            self.protect = "maybe"
+        self.protect_why.append(why)
+
+
+def _calls(ctx: Ctx, pipe: Pipeline, *names: str) -> list[tuple[PipeCall, str | None]]:
+    """[(call, confidence)]: firm for calls that certainly run in Production, REVIEW under an unparsed guard."""
+    return ([(c, None) for c in ctx.prod_calls(pipe, *names)]
+            + [(c, "REVIEW") for c in ctx.uncertain_calls(pipe, *names)])
+
+
+def _cookie_scheme(a) -> bool:
+    """An AddAuthentication argument that names the cookie scheme."""
+    if not isinstance(a, dict):
+        return False
+    if a.get("k") == "lit":
+        return str(a.get("v")).lower() == "cookies"
+    text = receiver_text(a) or ""
+    return text.endswith(("CookieAuthenticationDefaults.AuthenticationScheme", "IdentityConstants.ApplicationScheme"))
+
+
+def _af_kind(ctx: Ctx, name: str) -> str | None:
+    """"validate" | "ignore" | None for an attribute or filter type name, including project types derived
+    from the framework ones."""
+    key = attr_key(name)
+    if key in _VALIDATE_NAMES:
+        return "validate"
+    if key in _IGNORE_NAMES:
+        return "ignore"
+    simple = name.split("<")[0].split(".")[-1]
+    for n in (simple, simple + "Attribute"):
+        for t in ctx.model.find_types(n):
+            if ctx.model.derives_from(t, _VALIDATE_NAMES):
+                return "validate"
+            if ctx.model.derives_from(t, _IGNORE_NAMES):
+                return "ignore"
+    return None
+
+
+def _filter_add(n: dict) -> tuple[list[str], bool] | None:
+    """(filter type names, some argument is not readable) for a Filters.Add(...) / AddService /
+    ConfigureFilter call; None for any other call."""
+    fn = n.get("fn") if isinstance(n.get("fn"), dict) else {}
+    name = call_name(n)
+    if name in ("Add", "AddService"):
+        if (receiver_text(fn.get("obj")) or "").split(".")[-1] != "Filters":
+            return None
+    elif name != "ConfigureFilter":
+        return None
+    types = [str(t) for t in fn.get("targs") or []]
+    unreadable = False
+    for a in n.get("args") or []:
+        if not isinstance(a, dict) or a.get("k") == "lit":
+            continue            # the order argument
+        if a.get("k") == "new" and a.get("type"):
+            types.append(str(a["type"]))
+            continue
+        m = _TYPEOF.fullmatch(str(a.get("text") or "")) if a.get("k") == "unknown" else None
+        if m:
+            types.append(m.group(1))
+        else:
+            unreadable = True
+    return types, unreadable
+
+
+def _mvc_option_calls(ctx: Ctx, pipe: Pipeline) -> list[tuple[PipeCall, str | None]]:
+    def wanted(c: PipeCall) -> bool:
+        if c.name != "Configure":
+            return True
+        targs = (c.node.get("fn") or {}).get("targs") or []
+        return any(str(x).strip().split(".")[-1] in _MVC_OPTION_TYPES for x in targs)
+    return [(c, conf) for c, conf in _calls(ctx, pipe, *_MVC_CALLS) if wanted(c)]
+
+
+def _af_state(ctx: Ctx, pipe: Pipeline) -> _Af:
+    st = _Af()
+    # -- is cookie authentication in play? A guess in either direction is REVIEW, never "no".
+    present = maybe = False
+    for c, conf in _calls(ctx, pipe, *_COOKIE_REGISTRATIONS, "AddAuthentication"):
+        if c.name == "AddAuthentication":
+            reason = opaque_reason(c.node)
+            if reason is not None:
+                maybe = True
+                st.cookie_why.append(f"the options of AddAuthentication at {c.file}:{c.line} could not be read ({reason})")
+            args = list(c.node.get("args") or []) + list((c.node.get("named") or {}).values())
+            if not any(_cookie_scheme(a) for a in args):
+                continue
+        if conf is None:
+            present = True
+        else:
+            maybe = True
+            st.cookie_why.append(f"{c.name} at {c.file}:{c.line} sits under an environment condition that could not be parsed")
+    for c in pipe.unresolved():
+        if c.kind == "services" and c.name not in _NON_AUTHZ_EXTENSIONS and c.runs_in("Production") is not False:
+            maybe = True
+            st.cookie_why.append(f"{c.name} at {c.file}:{c.line} is not resolved and may register cookie authentication")
+    st.cookie = "yes" if present else "maybe" if maybe else "no"
+    # -- global filters
+    for c, conf in _mvc_option_calls(ctx, pipe):
+        reason = opaque_reason(c.node)
+        if reason is not None:
+            st.opaque.append((c, reason))
+            st.maybe_protect(f"the options of {c.name} at {c.file}:{c.line} could not be read ({reason})")
+        for lam in lambda_args(c.node):
+            for n, cd in walk_conditional(lam):
+                added = _filter_add(n) if n.get("k") == "call" else None
+                if added is None:
+                    continue
+                types, unreadable = added
+                kinds = {_af_kind(ctx, t) for t in types}
+                firm = conf is None and not cd
+                line = n.get("line") or c.line
+                if "ignore" in kinds:
+                    st.ignore.append((c.file, line, firm))
+                if "validate" in kinds and call_name(n) != "ConfigureFilter":
+                    if firm:
+                        st.protect = "yes"
+                    else:
+                        st.maybe_protect(f"a validating filter at {c.file}:{line} is added only under a condition")
+                if unreadable:
+                    st.maybe_protect(f"the filter added at {c.file}:{line} is not a new expression or typeof, so "
+                                     "it may validate antiforgery tokens")
+    return st
+
+
+def _merge_states(states: list[_Af]) -> _Af:
+    """The state a route sees when its project has no pipeline of its own (a controllers library): cookies
+    when any host has them, protection only when every host has it."""
+    out = _Af()
+    out.cookie = ("yes" if any(s.cookie == "yes" for s in states)
+                  else "maybe" if any(s.cookie == "maybe" for s in states) else "no")
+    out.cookie_why = [w for s in states for w in s.cookie_why]
+    if states and all(s.protect == "yes" for s in states):
+        out.protect = "yes"
+    elif any(s.protect != "no" for s in states):
+        out.protect = "maybe"
+        out.protect_why = [w for s in states for w in s.protect_why] or ["only some hosting projects add the filter"]
+    out.ignore = [i for s in states for i in s.ignore]
+    return out
+
+
+def _policy(ctx: Ctx, attrs) -> str | None:
+    """"ignore" | "validate" | None from a list of attributes (ignore wins when both are present)."""
+    kinds = {_af_kind(ctx, a.name) for a in attrs}
+    return "ignore" if "ignore" in kinds else "validate" if "validate" in kinds else None
+
+
+def _route_policy(ctx: Ctx, ref: CoreRouteRef) -> tuple[str | None, bool]:
+    """(policy, on the action itself): the nearest antiforgery attribute: the action or handler, then the
+    controller / PageModel class and its base classes, then a page's @attribute directives."""
+    if ref.method is not None:
+        p = _policy(ctx, ref.method.attributes)
+        if p:
+            return p, True
+    if ref.type is not None:
+        for t in _chain_types(ctx.model, ref.type):
+            p = _policy(ctx, t.attributes)
+            if p:
+                return p, False
+    kinds = set()
+    for raw in ref.route.meta.get("page_attributes") or []:
+        for m in _PAGE_ATTR.finditer(str(raw)):
+            kinds.add("ignore" if m.group(1).lower().startswith("ignore") else "validate")
+    return ("ignore" if "ignore" in kinds else "validate" if kinds else None), False
+
+
+def _env_state(env: str | None) -> str:
+    """"firm" (no environment condition, or one that runs in Production), "skip" (Development only) or
+    "review" (any other condition, including one that could not be parsed)."""
+    if env is None or env == "!Development":
+        return "firm"
+    return "skip" if env == "Development" else "review"
+
+
+def _explicit_mutating(ref: CoreRouteRef) -> bool:
+    """A verb attribute names a mutating verb (the GET+POST / name-prefix defaults do not count)."""
+    return (ref.method is not None
+            and any(attr_key(a.name) in _VERB_ATTRS for a in ref.method.attributes)
+            and bool(_MUTATING & {v.upper() for v in ref.route.methods}))
+
+
+def _form_bound(m) -> str:
+    """"yes" | "no" | "maybe" for a minimal-API handler: a [FromForm] / IFormFile / IFormCollection parameter,
+    or an [AsParameters] holder that could contain one; "maybe" too when the handler was not resolved."""
+    if m is None:
+        return "maybe"
+    out = "no"
+    for p in m.params:
+        simple = (p.type or "").split("<")[0].strip().rstrip("?").split(".")[-1].lower()
+        keys = {attr_key(a.name) for a in p.attributes}
+        if "fromform" in keys or simple in _FORM_TYPES:
+            return "yes"
+        if "asparameters" in keys:
+            out = "maybe"
+    return out
+
+
+def check_antiforgery(ctx: Ctx) -> None:
+    seen: set = set()
+    states = {id(p): _af_state(ctx, p) for p in ctx.pipes}
+
+    def state_for(ref: CoreRouteRef) -> _Af:
+        own = [states[id(p)] for p in ctx.pipes if ref.project is not None and p.project is ref.project]
+        return own[0] if own else _merge_states(list(states.values()))
+
+    def add(cid: str, title: str, desc: str, ref: CoreRouteRef, conf: str | None) -> None:
+        r = ref.route
+        key = (cid, r.file, r.line, r.handler_name)
+        if key not in seen:
+            seen.add(key)
+            ctx.add(cid, "medium", title, desc, r.file, r.line, route=r, confidence=conf)
+
+    for pipe in ctx.pipes:      # an options call that cannot be read could add a global ignoring filter
+        for c, reason in states[id(pipe)].opaque:
+            key = ("DNL-CSRF-002", c.file, c.line)
+            if key not in seen:
+                seen.add(key)
+                ctx.add("DNL-CSRF-002", "medium", "Antiforgery filters could not be read",
+                        f"The options of {c.name} could not be read ({reason}), so a global "
+                        "IgnoreAntiforgeryTokenAttribute filter may be registered there. Confirm none is.",
+                        c.file, c.line, confidence="REVIEW")
+
+    for ref in ctx.refs:
+        r = ref.route
+        st = state_for(ref)
+        verbs = {v.upper() for v in r.methods}
+        env = _env_state(r.meta.get("env"))
+        if ref.style in ("controller", "razorpage"):
+            if ref.type is None or (ref.style == "controller" and ref.method is None):
+                continue
+            pol, on_action = _route_policy(ctx, ref)
+            where = f"{r.handler_name} ({', '.join(r.methods)} {r.path})"
+            global_ignore = [i for i in st.ignore if pol is None]
+            firm_global = any(i[2] for i in global_ignore)
+            # CSRF-002: the route opts out of token validation.
+            mutating = bool(verbs & _MUTATING)
+            if env != "skip" and ((pol == "ignore" and (mutating or (on_action and "ANY" in verbs)))
+                                  or (global_ignore and mutating)):
+                local = pol == "ignore"
+                conf = None if (mutating and (local or firm_global) and env == "firm") else "REVIEW"
+                src = ("[IgnoreAntiforgeryToken] on the " + ("action" if on_action else "class or page")
+                       if local else "a global IgnoreAntiforgeryTokenAttribute filter")
+                desc = (f"{where} accepts a mutating request with antiforgery validation switched off by {src}, so a "
+                        "page on another site can submit it with the visitor's cookies. Remove the opt-out, or "
+                        "authenticate with a header token instead of a cookie.")
+                if not mutating:
+                    desc += " The action names no HTTP verb, so it accepts POST."
+                if not (local or firm_global):
+                    desc += " The global filter is registered only under a condition."
+                if env == "review":
+                    desc += " The route is mapped under an environment condition that is not plain Production."
+                add("DNL-CSRF-002", f"Antiforgery validation disabled on {r.handler_name}", desc, ref, conf)
+            # CSRF-001: an MVC form post nothing protects. [ApiController] and Razor Pages validate on their own.
+            if (ref.style == "controller" and not r.meta.get("api_surface") and pol is None and not firm_global
+                    and _explicit_mutating(ref) and st.cookie != "no" and st.protect != "yes"):
+                why = (st.cookie_why if st.cookie == "maybe" else []) + st.protect_why
+                desc = (f"{where} accepts a mutating request but no [ValidateAntiForgeryToken] covers it (action, "
+                        "controller, base classes) and no global AutoValidateAntiforgeryTokenAttribute filter is "
+                        "registered, while cookie authentication is in use, so another site can post to it with "
+                        "the visitor's cookies.")
+                if why:
+                    desc += " Not certain: " + "; ".join(dict.fromkeys(why)) + "."
+                add("DNL-CSRF-001", f"State-changing MVC action {r.handler_name} lacks anti-forgery validation",
+                    desc, ref, "REVIEW" if why else None)
+        elif ref.style == "minimalapi":
+            calls = list(ref.endpoint_calls) + list(ref.convention_calls) + [c for g in ref.groups for c in g.calls]
+            if not any(call_name(c) == "DisableAntiforgery" for c in calls if isinstance(c, dict)):
+                continue
+            form = _form_bound(ref.method)
+            if form == "no" or st.cookie == "no" or env == "skip" or verbs <= {"GET", "HEAD", "OPTIONS"}:
+                continue
+            soft = (form == "maybe" or st.cookie == "maybe" or env == "review"
+                    or any("DisableAntiforgery applied conditionally" in u for u in ref.unknown))
+            desc = (f"{r.handler_name} ({', '.join(r.methods)} {r.path}) binds form data and calls "
+                    "DisableAntiforgery(), so a page on another site can post to it with the visitor's cookies.")
+            if form == "maybe":
+                desc += " Its handler could not be read, so form binding is assumed."
+            if st.cookie == "maybe":
+                desc += " Cookie authentication could not be ruled out: " + "; ".join(st.cookie_why) + "."
+            if env == "review":
+                desc += " The route is registered under an environment condition that is not plain Production."
+            add("DNL-CSRF-002", f"Antiforgery validation disabled on {r.handler_name}", desc, ref,
+                "REVIEW" if soft else None)

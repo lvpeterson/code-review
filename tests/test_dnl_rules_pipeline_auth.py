@@ -1,4 +1,4 @@
-"""rules_pipeline_auth: cookie and session configuration (DNL-SESS-001/002/003/009)."""
+"""rules_pipeline_auth: cookie and session configuration (DNL-SESS-001/002/003/009) and antiforgery (DNL-CSRF-001/002)."""
 from cfgutil import ids, mode, scan  # noqa: F401
 
 BUILDER = ("var builder = WebApplication.CreateBuilder(args);\n{services}\nvar app = builder.Build();\n"
@@ -278,3 +278,213 @@ def test_review_ids_follow_the_call_type(tmp_path, mode):
     assert review_ids(f) == FOUR
     f = scan(tmp_path / "e", prog("builder.Services.ConfigureApplicationCookie(setup);"), mode)
     assert review_ids(f) == FOUR
+
+
+# -- antiforgery (DNL-CSRF-001 reused for ASP.NET Core, DNL-CSRF-002) ----------------------------------
+
+AF = "using Microsoft.AspNetCore.Mvc;\nnamespace App;\n"
+COOKIES = "builder.Services.AddAuthentication().AddCookie();\n"
+
+
+def mvc(services: str = COOKIES, body: str = "app.MapDefaultControllerRoute();", ctl: str = "",
+        mvc_opts: str = "") -> dict:
+    """An MVC app: `ctl` is the body of `HomeController : Controller`; `mvc_opts` the AddControllersWithViews args."""
+    files = prog(f"builder.Services.AddControllersWithViews({mvc_opts});\n{services}", body)
+    files["HomeController.cs"] = AF + f"public class HomeController : Controller {{\n{ctl}\n}}\n"
+    return files
+
+
+def af(found, *cids):
+    return {(f.check_id, f.severity, f.confidence) for f in found if f.check_id in (cids or ("DNL-CSRF-001", "DNL-CSRF-002"))}
+
+
+def n_of(found, cid):
+    return len([x for x in found if x.check_id == cid])
+
+
+SAVE = "[HttpPost] public IActionResult Save() => Ok();"
+FILTER = "o => { o.Filters.Add(new AutoValidateAntiforgeryTokenAttribute()); }"
+
+
+def test_csrf001_mvc_post_without_filter(tmp_path, mode):
+    f = scan(tmp_path, mvc(ctl=SAVE), mode)
+    assert ("DNL-CSRF-001", "medium", None) in ids(f)
+    hits = [x for x in f if x.check_id == "DNL-CSRF-001"]
+    assert len(hits) == 1 and hits[0].route is not None
+
+
+def test_csrf001_global_filter_clears(tmp_path, mode):
+    assert not af(scan(tmp_path / "a", mvc(ctl=SAVE, mvc_opts=FILTER), mode))
+    f = scan(tmp_path / "b", mvc(ctl=SAVE, mvc_opts="o => { o.Filters.Add<AutoValidateAntiforgeryTokenAttribute>(); }"), mode)
+    assert not af(f)
+    f = scan(tmp_path / "c", mvc(ctl=SAVE, mvc_opts="o => { o.Filters.Add(new ValidateAntiForgeryTokenAttribute()); }"), mode)
+    assert not af(f)
+    f = scan(tmp_path / "d", mvc(ctl=SAVE, services=COOKIES + "builder.Services.Configure<MvcOptions>(" + FILTER + ");"), mode)
+    assert not af(f)
+
+
+def test_csrf001_attribute_on_action_class_or_base(tmp_path, mode):
+    assert not af(scan(tmp_path / "a", mvc(ctl="[HttpPost, ValidateAntiForgeryToken] public IActionResult Save() => Ok();"), mode))
+    src = {"HomeController.cs": AF + "[AutoValidateAntiforgeryToken]\npublic class HomeController : Controller {\n"
+                                + SAVE + "\n}\n"}
+    assert not af(scan(tmp_path / "b", {**mvc(), **src}, mode))
+    src = {"HomeController.cs": AF + "[AutoValidateAntiforgeryToken]\npublic abstract class BaseCtl : Controller { }\n"
+                                "public class HomeController : BaseCtl {\n" + SAVE + "\n}\n"}
+    assert not af(scan(tmp_path / "c", {**mvc(), **src}, mode))
+
+
+def test_csrf001_not_for_token_only_app(tmp_path, mode):
+    f = scan(tmp_path, mvc(ctl=SAVE, services="builder.Services.AddAuthentication().AddJwtBearer();\n"), mode)
+    assert not af(f)
+
+
+def test_csrf001_not_for_api_controller_or_get_or_no_verb(tmp_path, mode):
+    api = {"HomeController.cs": AF + "[ApiController]\npublic class HomeController : ControllerBase {\n" + SAVE + "\n}\n"}
+    assert not af(scan(tmp_path / "a", {**mvc(), **api}, mode))
+    assert not af(scan(tmp_path / "b", mvc(ctl="[HttpGet] public IActionResult Show() => Ok();"), mode))
+    assert not af(scan(tmp_path / "c", mvc(ctl="public IActionResult Save() => Ok();"), mode))
+
+
+def razor(model_src: str, services: str = COOKIES) -> dict:
+    files = prog("builder.Services.AddRazorPages();\n" + services, "app.MapRazorPages();")
+    files["Pages/Index.cshtml"] = "@page\n@model IndexModel\n"
+    files["Pages/Index.cshtml.cs"] = ("using Microsoft.AspNetCore.Mvc;\nusing Microsoft.AspNetCore.Mvc.RazorPages;\n"
+                                      "namespace App;\n" + model_src)
+    return files
+
+
+def test_razor_page_post_is_not_csrf001(tmp_path, mode):
+    f = scan(tmp_path, razor("public class IndexModel : PageModel { public void OnPost() { } }"), mode)
+    assert not af(f)
+
+
+def test_csrf002_ignore_on_action(tmp_path, mode):
+    f = scan(tmp_path, mvc(ctl="[HttpPost, IgnoreAntiforgeryToken] public IActionResult Save() => Ok();"), mode)
+    assert af(f) == {("DNL-CSRF-002", "medium", None)}
+    assert all(x.route is not None for x in f if x.check_id == "DNL-CSRF-002")
+
+
+def test_csrf002_ignore_on_controller_class_and_base(tmp_path, mode):
+    src = {"HomeController.cs": AF + "[IgnoreAntiforgeryToken]\npublic class HomeController : Controller {\n"
+                                + SAVE + "\n[HttpGet] public IActionResult Show() => Ok();\n}\n"}
+    f = scan(tmp_path / "a", {**mvc(), **src}, mode)
+    assert af(f) == {("DNL-CSRF-002", "medium", None)} and n_of(f, "DNL-CSRF-002") == 1
+    src = {"HomeController.cs": AF + "[IgnoreAntiforgeryToken]\npublic abstract class BaseCtl : Controller { }\n"
+                                "public class HomeController : BaseCtl {\n" + SAVE + "\n}\n"}
+    assert af(scan(tmp_path / "b", {**mvc(), **src}, mode)) == {("DNL-CSRF-002", "medium", None)}
+
+
+def test_csrf002_validate_on_action_beats_class_ignore(tmp_path, mode):
+    src = {"HomeController.cs": AF + "[IgnoreAntiforgeryToken]\npublic class HomeController : Controller {\n"
+                                "[HttpPost, ValidateAntiForgeryToken] public IActionResult Save() => Ok();\n}\n"}
+    assert not af(scan(tmp_path, {**mvc(), **src}, mode))
+
+
+def test_csrf002_ignore_on_razor_page_class_and_handler(tmp_path, mode):
+    f = scan(tmp_path / "a", razor("[IgnoreAntiforgeryToken]\npublic class IndexModel : PageModel { public void OnPost() { } "
+                                   "public void OnGet() { } }"), mode)
+    assert af(f) == {("DNL-CSRF-002", "medium", None)} and n_of(f, "DNL-CSRF-002") == 1
+    f = scan(tmp_path / "b", razor("public class IndexModel : PageModel { [IgnoreAntiforgeryToken] public void OnPost() { } }"), mode)
+    assert af(f) == {("DNL-CSRF-002", "medium", None)}
+
+
+def test_csrf002_global_ignore_filter(tmp_path, mode):
+    opts = "o => { o.Filters.Add(new IgnoreAntiforgeryTokenAttribute()); }"
+    f = scan(tmp_path / "a", mvc(ctl=SAVE + "\n[HttpGet] public IActionResult Show() => Ok();", mvc_opts=opts), mode)
+    assert af(f) == {("DNL-CSRF-002", "medium", None)} and n_of(f, "DNL-CSRF-002") == 1
+    # an explicit [ValidateAntiForgeryToken] on the action is the nearer policy
+    f = scan(tmp_path / "b", mvc(ctl="[HttpPost, ValidateAntiForgeryToken] public IActionResult Save() => Ok();",
+                                 mvc_opts=opts), mode)
+    assert not af(f)
+    # a global ignore that sits under a condition is only REVIEW
+    cond = "o => { if (flag) { o.Filters.Add(new IgnoreAntiforgeryTokenAttribute()); } }"
+    f = scan(tmp_path / "c", mvc(ctl=SAVE, mvc_opts=cond), mode)
+    assert ("DNL-CSRF-002", "medium", "REVIEW") in af(f)
+
+
+FORM = 'app.MapPost("/up", ([FromForm] IFormFile f) => 1).DisableAntiforgery();'
+
+
+def minimal(body: str, services: str = COOKIES) -> dict:
+    return prog(services, body)
+
+
+def test_csrf002_minimal_api_disable_antiforgery_with_form(tmp_path, mode):
+    f = scan(tmp_path / "a", minimal(FORM), mode)
+    assert af(f) == {("DNL-CSRF-002", "medium", None)}
+    f = scan(tmp_path / "b", minimal('app.MapPost("/up", (IFormCollection c) => 1).DisableAntiforgery();'), mode)
+    assert af(f) == {("DNL-CSRF-002", "medium", None)}
+    # no form binding: antiforgery does not apply, so nothing is switched off
+    f = scan(tmp_path / "c", minimal('app.MapPost("/up", (int id) => 1).DisableAntiforgery();'), mode)
+    assert not af(f)
+    # form binding but antiforgery stays on
+    f = scan(tmp_path / "d", minimal('app.MapPost("/up", ([FromForm] IFormFile f) => 1);'), mode)
+    assert not af(f)
+    # token-only app: no cookie to ride on
+    f = scan(tmp_path / "e", minimal(FORM, "builder.Services.AddAuthentication().AddJwtBearer();\n"), mode)
+    assert not af(f)
+
+
+def test_csrf002_minimal_api_group_and_unresolved_handler(tmp_path, mode):
+    grp = 'var g = app.MapGroup("/g").DisableAntiforgery();\ng.MapPost("/up", ([FromForm] IFormFile f) => 1);'
+    assert af(scan(tmp_path / "a", minimal(grp), mode)) == {("DNL-CSRF-002", "medium", None)}
+    f = scan(tmp_path / "b", minimal('app.MapPost("/up", Handlers.Upload).DisableAntiforgery();'), mode)
+    assert af(f) == {("DNL-CSRF-002", "medium", "REVIEW")}
+
+
+def test_csrf002_development_guard(tmp_path, mode):
+    dev = "if (app.Environment.IsDevelopment()) {\n" + FORM + "\n}"
+    assert not af(scan(tmp_path / "a", minimal(dev), mode))
+    odd = "if (Flag()) {\n" + FORM + "\n}"
+    assert af(scan(tmp_path / "b", minimal(odd), mode)) == {("DNL-CSRF-002", "medium", "REVIEW")}
+    src = {"HomeController.cs": AF + "[IgnoreAntiforgeryToken]\npublic class HomeController : Controller {\n" + SAVE + "\n}\n"}
+    f = scan(tmp_path / "c", {**mvc(body="if (app.Environment.IsDevelopment()) { app.MapDefaultControllerRoute(); }"), **src}, mode)
+    assert not af(f, "DNL-CSRF-002")
+
+
+def test_csrf001_unresolved_services_call_is_review(tmp_path, mode):
+    f = scan(tmp_path, mvc(ctl=SAVE, services="builder.Services.AddCompanyAuth();\n"), mode)
+    assert af(f) == {("DNL-CSRF-001", "medium", "REVIEW")}
+
+
+def test_csrf001_opaque_add_authentication_is_review(tmp_path, mode):
+    f = scan(tmp_path, mvc(ctl=SAVE, services="builder.Services.AddAuthentication(SetupAuth).AddJwtBearer();\n"), mode)
+    assert af(f) == {("DNL-CSRF-001", "medium", "REVIEW")}
+
+
+def test_csrf001_other_cookie_registrations(tmp_path, mode):
+    for i, svc in enumerate(("builder.Services.AddDefaultIdentity<IdentityUser>();\n",
+                             "builder.Services.AddIdentity<IdentityUser, IdentityRole>();\n",
+                             "builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme);\n")):
+        f = scan(tmp_path / str(i), mvc(ctl=SAVE, services=svc), mode)
+        assert ("DNL-CSRF-001", "medium", None) in af(f), svc
+
+
+def test_csrf001_cookie_under_unparsed_guard_is_review(tmp_path, mode):
+    svc = "if (Flag()) { builder.Services.AddAuthentication().AddCookie(); }\n"
+    f = scan(tmp_path, mvc(ctl=SAVE, services=svc), mode)
+    assert af(f) == {("DNL-CSRF-001", "medium", "REVIEW")}
+
+
+def test_csrf001_conditional_or_guarded_global_filter_is_review(tmp_path, mode):
+    cond = "o => { if (flag) { o.Filters.Add(new AutoValidateAntiforgeryTokenAttribute()); } }"
+    assert af(scan(tmp_path / "a", mvc(ctl=SAVE, mvc_opts=cond), mode)) == {("DNL-CSRF-001", "medium", "REVIEW")}
+    guarded = COOKIES + "if (Flag()) { builder.Services.Configure<MvcOptions>(" + FILTER + "); }\n"
+    assert af(scan(tmp_path / "b", mvc(ctl=SAVE, services=guarded), mode)) == {("DNL-CSRF-001", "medium", "REVIEW")}
+    # a filter that only runs in Development never clears it
+    dev = COOKIES + "if (builder.Environment.IsDevelopment()) { builder.Services.Configure<MvcOptions>(" + FILTER + "); }\n"
+    assert af(scan(tmp_path / "c", mvc(ctl=SAVE, services=dev), mode)) == {("DNL-CSRF-001", "medium", None)}
+
+
+def test_csrf_opaque_mvc_options(tmp_path, mode):
+    f = scan(tmp_path, mvc(ctl=SAVE, mvc_opts="ConfigureMvc"), mode)
+    assert af(f, "DNL-CSRF-001") == {("DNL-CSRF-001", "medium", "REVIEW")}
+    assert ("DNL-CSRF-002", "medium", "REVIEW") in af(f)
+    f = scan(tmp_path / "b", mvc(ctl=SAVE, mvc_opts="o => Harden(o)"), mode)
+    assert af(f, "DNL-CSRF-001") == {("DNL-CSRF-001", "medium", "REVIEW")}
+    assert ("DNL-CSRF-002", "medium", "REVIEW") in af(f)
+
+
+def test_csrf_no_opaque_review_for_default_mvc_calls(tmp_path, mode):
+    f = scan(tmp_path, mvc(ctl="[HttpGet] public IActionResult Show() => Ok();"), mode)
+    assert not af(f)
