@@ -12,7 +12,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from checks.dnl import project, routes_core, rules_auth_core
+from checks.dnl import project, routes_core, rules_auth_core, rules_taint
 from checks.dnl.project import ProjectModel
 from core.base import BaseFrameworkAnalyzer
 from core.models import Finding, Route, ScanResult
@@ -61,6 +61,7 @@ def _code_results(model: ProjectModel) -> dict[str, tuple[list[Route], list[Find
             return []
 
     findings += guarded("rules_auth_core", lambda: rules_auth_core.check(model, refs))
+    findings += guarded("rules_taint", lambda: rules_taint.check(model, refs))
     running = _running(model)
 
     def owner_of(kind: str) -> str:

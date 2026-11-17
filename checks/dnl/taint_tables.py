@@ -29,6 +29,15 @@ REQUEST_TEXT = (r"(?i)^((this|me)\.)?(((system\.web\.)?httpcontext\.current|cont
                 r"(\.(querystring|form|params|cookies|headers|servervariables|rawurl|url|files|unvalidated|path|pathinfo|"
                 r"useragent|contenttype|apprelativecurrentexecutionfilepath|currentexecutionfilepath|filepath|inputstream))?$")
 
+# ASP.NET Core request type and the receiver spellings the text fallbacks accept: `Request`,
+# `HttpContext.Request`, `Context.Request`, `context.Request`, `ctx.Request`, `httpContext.Request`.
+_CORE_REQ = r"Microsoft\.AspNetCore\.Http\.HttpRequest"
+_CORE_CTX = r"((this|base)\.)?((http)?context\.|ctx\.)?"
+# Core request spelling used where only a shape check is needed (an indexed receiver without a sym).
+CORE_REQUEST_TEXT = (rf"(?i)^{_CORE_CTX}request"
+                     r"(\.(query|form|headers|cookies|routevalues|body|bodyreader|path|pathbase|querystring|host|"
+                     r"method|scheme|contenttype))?$")
+
 SOURCES: tuple[Source, ...] = (
     Source("Request", rf"^{_REQ}\.(QueryString|Form|Params|Cookies|Headers|ServerVariables|RawUrl|Url|"
                       r"UrlReferrer|Files|InputStream|Item|Unvalidated|Path|PathInfo|UserAgent|ContentType|"
@@ -39,6 +48,24 @@ SOURCES: tuple[Source, ...] = (
     Source("HiddenField.Value", r"^System\.Web\.UI\.WebControls\.HiddenField\.Value$", None),
     Source("ListControl.Selected", r"^System\.Web\.UI\.WebControls\.ListControl\.(SelectedValue|SelectedItem)$", None),
     Source("HtmlInputText.Value", r"^System\.Web\.UI\.HtmlControls\.HtmlInput(Text|Control|Hidden)\.Value$", None),
+    # -- ASP.NET Core. A resolved sym is authoritative (see taint.py `_source`), so every request member
+    # the helper can resolve needs a row here: a missing row would read as "not a source" (a false safe).
+    Source("Request", rf"^{_CORE_REQ}\.(Query|Form|Headers|Cookies|Path|PathBase|QueryString|Host|Method|"
+                      r"Scheme|ContentType|ReadFormAsync)$",
+           rf"(?i)^{_CORE_CTX}request\.(query|form|headers|cookies|path|pathbase|querystring|host|method|"
+           r"scheme|contenttype|readformasync)$"),
+    Source("Request", r"^Microsoft\.AspNetCore\.Http\.IFormCollection\.Item$", None),
+    # Bare `HttpContext.Request` without a sym (sym-only members are above): text only, `(?!)` never matches.
+    Source("Request", r"(?!)", rf"(?i)^{_CORE_CTX}request$"),
+    Source("Request.Body", rf"^{_CORE_REQ}\.(Body|BodyReader)$|"
+                           r"^Microsoft\.AspNetCore\.Http\.HttpRequestJsonExtensions\.ReadFromJsonAsync$",
+           rf"(?i)^{_CORE_CTX}request\.(body|bodyreader|readfromjsonasync)$"),
+    # GetRouteValue lives in Microsoft.AspNetCore.Routing (the helper reports that namespace); Http kept too.
+    Source("RouteValues", rf"^{_CORE_REQ}\.RouteValues$|^Microsoft\.AspNetCore\.Routing\.RouteData\.Values$|"
+                          r"^Microsoft\.AspNetCore\.(Http|Routing)\.RoutingHttpContextExtensions\.GetRouteValue$",
+           rf"(?i)^{_CORE_CTX}request\.routevalues$|(^|\.)(http)?context\.getroutevalue$|"
+           r"(^|\.)ctx\.getroutevalue$"),
+    Source("IFormFile", r"^Microsoft\.AspNetCore\.Http\.IFormFile\.(FileName|Name|ContentType|OpenReadStream)$", None),
 )
 
 # Fallback for the WebForms rows above when `sym` is missing: a `.Text` / `.Value`
@@ -320,8 +347,10 @@ PARSER_TYPES = frozenset({"jobject", "jarray", "jtoken", "xdocument", "xelement"
 
 # Receivers that are the INCOMING request, not an outbound response: `Request.Content.ReadAsStringAsync()` in a
 # Web API action reads what the client sent, so it is never an `external` source.
-INCOMING_REQUEST_TEXT = (r"(?i)^((this|base)\.)?((actioncontext|controllercontext)\.|httpcontext\.current\.)?"
+INCOMING_REQUEST_TEXT = (r"(?i)^((this|base)\.)?((actioncontext|controllercontext)\.|httpcontext\.current\.|"
+                         r"(http)?context\.|ctx\.)?"
                          r"request(\.(content|inputstream))?$")
 # Reading the incoming Web API request body is request input (a taint source), not an outbound response.
 INCOMING_BODY_READS = frozenset({"readasstringasync", "readasasync", "readasformdataasync", "readasbytearrayasync",
-                                 "readasstreamasync", "readasmultipartasync"})
+                                 "readasstreamasync", "readasmultipartasync",
+                                 "readfromjsonasync", "readformasync"})

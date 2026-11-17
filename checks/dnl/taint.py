@@ -101,6 +101,7 @@ _COMPARE_OPS = frozenset({
 })
 _SOURCE_RES = [(s, re.compile(s.sym), re.compile(s.text) if s.text else None) for s in T.SOURCES]
 _REQUEST_RE = re.compile(T.REQUEST_TEXT)
+_CORE_REQUEST_RE = re.compile(T.CORE_REQUEST_TEXT)
 _FIELD_SRC_RE = re.compile(T.FIELD_SOURCE_TYPES)
 _EXT_SYM_RE = re.compile(T.EXTERNAL_SYM)
 _INCOMING_RE = re.compile(T.INCOMING_REQUEST_TEXT)
@@ -491,7 +492,8 @@ class _Analysis:
         obj = e.get("obj")
         for a in e.get("args") or []:
             self.ev(a)
-        if not e.get("sym") and _REQUEST_RE.match(self._text(obj) or ""):
+        if not e.get("sym") and (_REQUEST_RE.match(self._text(obj) or "")
+                                 or _CORE_REQUEST_RE.match(self._text(obj) or "")):
             return self._origin("Request", e.get("line", 0))
         src = self._source(e)
         if src is not None:
