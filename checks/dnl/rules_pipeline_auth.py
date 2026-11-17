@@ -1202,7 +1202,17 @@ def _identity_calls(ctx: Ctx, pipe: Pipeline) -> list[tuple[PipeCall, str | None
         if c.name not in ("Configure", "PostConfigure"):
             return True
         targs = (c.node.get("fn") or {}).get("targs") or []
-        return any(str(x).strip().split(".")[-1] == "IdentityOptions" for x in targs)
+        if any(str(x).strip().split(".")[-1] == "IdentityOptions" for x in targs):
+            return True
+        # services.AddOptions<IdentityOptions>().Configure(o => ...): the type argument sits on the receiver.
+        obj = (c.node.get("fn") or {}).get("obj")
+        while isinstance(obj, dict) and obj.get("k") == "call":
+            fn = obj.get("fn") if isinstance(obj.get("fn"), dict) else {}
+            if call_name(obj) == "AddOptions" and any(
+                    str(x).strip().split(".")[-1] == "IdentityOptions" for x in fn.get("targs") or []):
+                return True
+            obj = fn.get("obj")
+        return False
     return [(c, conf) for c, conf in _calls(ctx, pipe, *_IDENTITY_CALLS) if wanted(c)]
 
 
@@ -1254,11 +1264,19 @@ def _password(opts: list[Opt], c: PipeCall, conf, add) -> None:
     for path, what in _COMPLEXITY.items():
         same = [x for x in opts if x.path.lower() == path]
         for i, x in enumerate(same):
-            if _flag_kind(x) != "bad":
-                continue        # a non-literal flag is not reported (the framework default requires it)
+            kind = _flag_kind(x)
+            if kind == "good":
+                continue
             later = same[i + 1:]
             if any(_flag_kind(y) == "good" and not y.conditional for y in later):
                 continue        # switched on again unconditionally
+            if kind == "unknown":
+                # Not a compile-time value: unknown is never clean, so it is REVIEW (a literal false
+                # assigned earlier is reported on its own line).
+                add("DNL-SEC-005", "low", title,
+                    f"{x.path} is set from {_text(x.value)}, which is not a compile-time value, so passwords "
+                    f"may not need {what} in Production; confirm it is true.", c, x.line, "REVIEW")
+                continue
             firm = not x.conditional and not any(_flag_kind(y) == "good" for y in later)
             desc = f"{x.path} is false, so passwords need not contain {what}."
             if not firm:
@@ -1299,9 +1317,16 @@ def _lockout(opts: list[Opt], c: PipeCall, conf, add) -> None:
 def _confirmed(opts: list[Opt], c: PipeCall, conf, add) -> None:
     sev, title, _ = _IDENTITY_META["DNL-SEC-007"]
     for path, name in _CONFIRMED.items():
-        o, uncertain = verdict(opts, path, bad=lambda x: _flag_kind(x) == "bad")
-        if o is None or _flag_kind(o) != "bad":
-            continue            # absent, true or not a literal: explicit false only
+        # A conditional good value never clears a bad one; a known false followed by an unknown value
+        # leaves the unknown as the effective one, which is REVIEW (unknown is never clean).
+        o, uncertain = verdict(opts, path, bad=lambda x: _flag_kind(x) != "good")
+        if o is None or _flag_kind(o) == "good":
+            continue            # absent (not reported) or true
+        if _flag_kind(o) == "unknown":
+            add("DNL-SEC-007", sev, title,
+                f"SignIn.{name} is set from {_text(o.value)}, which is not a compile-time value, so it may be "
+                "false in Production; confirm it is true.", c, o.line, "REVIEW")
+            continue
         desc = (f"SignIn.{name} is false, so an account can sign in before its owner proves control of the "
                 "address. Set it true.")
         if uncertain:

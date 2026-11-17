@@ -874,9 +874,14 @@ def test_password_complexity_flags(tmp_path, mode):
                   " o.Password.RequireNonAlphanumeric = false;")
     f = scan(tmp_path / "c", three, mode)
     assert len([x for x in f if x.check_id == "DNL-SEC-005"]) == 3
-    # non-literal complexity flags are not reported; unique chars are ignored
+    # a non-literal complexity flag is REVIEW (unknown is never clean); unique chars are ignored
     f = scan(tmp_path / "d", ident("o.Password.RequireDigit = cfg; o.Password.RequiredUniqueChars = 0;"), mode)
+    assert sec(f, *IDS_ID) == {("DNL-SEC-005", "low", "REVIEW")}
+    f = scan(tmp_path / "d2", ident("o.Password.RequiredUniqueChars = 0;"), mode)
     assert not sec(f, *IDS_ID)
+    # a known false followed by an unknown value stays reported
+    f = scan(tmp_path / "d3", ident("o.Password.RequireDigit = false; o.Password.RequireDigit = cfg;"), mode)
+    assert ("DNL-SEC-005", "low", "REVIEW") in ids(f) or ("DNL-SEC-005", "low", None) in ids(f)
     f = scan(tmp_path / "e", ident("if (flag) { o.Password.RequireDigit = false; }"), mode)
     assert sec(f, "DNL-SEC-005") == {("DNL-SEC-005", "low", "REVIEW")}
 
@@ -979,6 +984,11 @@ def test_sign_in_confirmation_options(tmp_path, mode):
     f = scan(tmp_path / "c", ident("o.SignIn.RequireConfirmedAccount = true;"), mode)
     assert not sec(f, *IDS_ID)
     f = scan(tmp_path / "d", ident("o.SignIn.RequireConfirmedAccount = cfg;"), mode)
+    assert sec(f, *IDS_ID) == {("DNL-SEC-007", "low", "REVIEW")}
+    # a known false followed by an unknown value is never dropped
+    f = scan(tmp_path / "d2", ident("o.SignIn.RequireConfirmedAccount = false; o.SignIn.RequireConfirmedAccount = cfg;"), mode)
+    assert sec(f, *IDS_ID) == {("DNL-SEC-007", "low", "REVIEW")}
+    f = scan(tmp_path / "d3", ident("o.SignIn.RequireConfirmedEmail = false; o.SignIn.RequireConfirmedEmail = true;"), mode)
     assert not sec(f, *IDS_ID)
     f = scan(tmp_path / "e", ident("if (flag) { o.SignIn.RequireConfirmedEmail = false; }"), mode)
     assert sec(f, "DNL-SEC-007") == {("DNL-SEC-007", "low", "REVIEW")}
@@ -1022,3 +1032,24 @@ def test_identity_weak_options_in_development(tmp_path, mode):
     assert sec(f, "DNL-SEC-005") == {("DNL-SEC-005", "medium", "REVIEW")}
     f = scan(tmp_path / "d", ident("if (!builder.Environment.IsDevelopment()) { o.Password.RequiredLength = 4; }"), mode)
     assert ("DNL-SEC-005", "medium", None) in ids(f)
+
+
+def test_sign_in_in_minimal_api_lambda_and_local_function(tmp_path, mode):
+    call = "await signIn.PasswordSignInAsync(u, p, remember, lockoutOnFailure: false)"
+    top = ("app.MapPost('/login', async (SignInManager<IdentityUser> signIn, IdentityUser u, string p, bool remember) => {\n"
+           "    var r = " + call + ";\n    return Results.Ok();\n});").replace("'/login'", '"/login"')
+    f = scan(tmp_path / "a", prog("", top), mode)
+    assert ("DNL-SEC-006", "medium", None) in ids(f)
+    local = ("async Task Login(SignInManager<IdentityUser> signIn, IdentityUser u, string p, bool remember)\n"
+             "{\n    var r = " + call + ";\n}\nawait Login(null, null, null, false);")
+    f = scan(tmp_path / "b", prog("", local), mode)
+    assert ("DNL-SEC-006", "medium", None) in ids(f)
+    f = scan(tmp_path / "c", prog("", top.replace("lockoutOnFailure: false", "lockoutOnFailure: true")), mode)
+    assert not sec(f, "DNL-SEC-006")
+
+
+def test_identity_options_via_add_options_and_configure_options(tmp_path, mode):
+    f = scan(tmp_path / "a", prog("builder.Services.AddOptions<IdentityOptions>().Configure(o => { o.Password.RequiredLength = 4; });"), mode)
+    assert ("DNL-SEC-005", "medium", None) in ids(f)
+    f = scan(tmp_path / "b", prog("builder.Services.AddOptions<OtherOptions>().Configure(o => { o.Password.RequiredLength = 4; });"), mode)
+    assert not sec(f, *IDS_ID)
