@@ -151,9 +151,13 @@ def test_no_failed_notes(mode, monkeypatch):
     assert not [n for r in results for n in r.notes if "failed (" in n]
 
 
-def test_taint_flag_matches_wiring():
+def test_taint_flag_matches_wiring(monkeypatch):
+    from checks.dnl import rules_taint
     from languages.dotnet import analyzers
-    assert analyzers.CORE_RUNS_TAINT == hasattr(analyzers, "rules_taint"), (
+    called = []
+    monkeypatch.setattr(rules_taint, "check", lambda *a, **k: called.append(1) or [])
+    _dotnet(CARRIED_APP, allow_degraded=False)
+    assert bool(called) == analyzers.CORE_RUNS_TAINT, (
         "CORE_RUNS_TAINT and the rules_taint wiring drifted: set the flag to True in the same change "
-        "that imports and runs rules_taint in languages/dotnet/analyzers.py (and back), otherwise "
+        "that runs rules_taint.check in languages/dotnet/analyzers.py (and back), otherwise "
         "DESER-001 / XXE-001 on tainted lines are lost or doubled")
