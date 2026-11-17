@@ -206,8 +206,10 @@ Currently implemented (route extraction + baseline checks):
 - **javascript**: express, nextjs, hono
 - **go**: gin, net_http
 - **dotnet**: controllers, razorpages, minimalapi, config (ASP.NET Core on modern .NET, on the
-  shared C# engine; three-state authorization per route; needs the Roslyn helper,
-  `--allow-degraded` applies)
+  shared C# engine; three-state authorization per route; request-to-sink taint
+  (injection, redirect, path, SSRF, logging, XSS in Razor views and pages),
+  IDOR / over-posting / excessive exposure; needs the Roslyn helper,
+  `--allow-degraded` applies) -- see `languages/dotnet/README.md`
 - **dotnet_legacy**: mvc, webapi, webforms, wcf, config, deps (.NET Framework MVC 5,
   Web API 2, WebForms, WCF services and Web.config, C# and VB, via the Roslyn
   helper in `tools/roslyn-ir`; cross-file taint analysis for injection / XSS /

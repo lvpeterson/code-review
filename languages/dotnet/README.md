@@ -10,8 +10,9 @@ keeps .NET Framework apps. In a mixed solution each package takes its own
 projects and the helper runs once for both. The earlier tree-sitter analyzer
 (`aspnet`) is retired; `--framework aspnet` is no longer valid.
 
-Plan 1 (this foundation) covers route discovery and authorization. Taint,
-config and dependency rules for Core come later.
+The package covers route discovery, authorization, request-to-sink taint,
+Razor template XSS and object-level rules. Config and dependency rules for
+Core come later.
 
 ## Frameworks reported as separate results
 
@@ -64,6 +65,44 @@ This package emits:
 `--allow-path` suppresses DNL-AUTHZ-001 for matching route paths
 (case-insensitive).
 
+## Taint, templates and object rules
+
+The shared taint engine runs on Core routes (`checks/dnl/rules_taint.py`,
+`rules_xss.py`, `rules_object.py`); rule ids and OWASP tags are the ones in the
+dotnet_legacy table.
+
+- **Sources**: query, form, route values, headers, cookies, body and
+  `IFormFile` members of `HttpRequest` (reached through `HttpContext`,
+  `Request`, a parameter or `GetTypedHeaders()`), request URL helpers, and
+  bound input (below).
+- **Binding**: a parameter is request input unless it is `[FromServices]` /
+  `[FromKeyedServices]`, a framework type (`HttpContext`, `ILogger<T>`,
+  `IConfiguration`, `UserManager<T>`, ...), a type registered as a service, a
+  `DbContext`, or an interface / abstract type other than `IFormFile`,
+  `IFormFileCollection`, `IFormCollection`. `[ModelBinder]` overrides the
+  exclusions. DTOs, `[AsParameters]` types and files are tainted. In Razor
+  Pages and controllers a `[BindProperty]` property (or every settable
+  property under `[BindProperties]`) is input for non-GET handlers, and for GET
+  only with `SupportsGet = true`. Minimal-API lambdas are analysed as the
+  route handler, including the helpers they call.
+- **Sinks**: SQL (`FromSqlRaw`, `ExecuteSqlRaw`, ADO.NET commands), command
+  and path APIs, redirects (including `Location` headers), SSRF
+  (`HttpClient`, `HttpClientJson*`, `HttpRequestMessage`), deserialization,
+  XXE, header and cookie writes, `ILogger` message templates (not placeholder
+  arguments), and HTML responses (`Content`, `Results.Content`,
+  `Results.Text`, `WriteAsync`, `MarkupString`, `Html.Raw`).
+- **Templates**: DNL-XSS-003 reads Razor views, layouts and Razor Pages
+  (`.cshtml`) and ties each output to the controller action or page handler
+  that renders it; HTML encoders cleanse, `Html.Raw` and `HtmlString` do not.
+- **Object rules**: DNL-AUTHZ-005 (IDOR: a record looked up by a request id
+  with no ownership or `AuthorizeAsync` check that can reject), DNL-AUTHZ-006
+  (over-posting: a bound entity or model with sensitive members reaching the context without a `[Bind]` allow-list),
+  DNL-AUTHZ-007 (an entity with a sensitive-looking member returned directly).
+
+Findings without proof are REVIEW. Degraded mode (`--allow-degraded`) finds
+the same proven findings on the bundled controller, Razor Pages and
+minimal-API samples; it matches framework types by name instead of symbol.
+
 ## Requirements and degraded mode
 
 The Roslyn helper (`tools/roslyn-ir`, .NET 8 SDK) is required, exactly as for
@@ -98,3 +137,22 @@ findings can be less precise.
   cannot be read), as is a `[Route]` whose template is not a constant.
 - Behaviour change in dotnet_legacy (intended): modern C# lowering removes a false positive on a
   constant-only `switch`.
+- `IdentityUser` / `IdentityRole` are matched by exact base name (generic
+  arguments ignored); `IdentityUserLogin`, `IdentityUserClaim` and similar
+  are not user records. `UserManager`-style lookups (`FindByIdAsync`) are
+  recognised as record lookups by name.
+- `[BindProperties]` counts every settable property as input, including ones
+  the page never reads.
+- A helper method of a type with bound properties is analysed as if the
+  non-GET properties were set, so GET-only helpers may over-report.
+- Kestrel rejects CR/LF in header values, so header-injection findings are
+  defence in depth rather than an exploitable response split.
+- EF Core, SqlClient, Npgsql and other NuGet types are matched by name: the
+  helper resolves framework types only. A same-named type from another
+  library can match, and a renamed wrapper is missed.
+- Not recognised: exposure through `Created*` results, helper methods or a
+  bare `DbSet`; `[BindProperty]` over-posting is reported on any non-GET
+  handler; a `View("/Views/...")` path with a leading slash is not resolved;
+  layouts, partials and view components are REVIEW at most.
+- Two lambdas on one source line share a key, so findings may be attributed to
+  both.

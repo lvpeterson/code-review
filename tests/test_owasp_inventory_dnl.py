@@ -15,6 +15,14 @@ def test_dotnet_counts_reachable_dnl_ids():
     assert "DNL-CFG-001" not in ids
 
 
+def test_inventory_counts_plan2_ids():
+    ids = inv.dnl_ids_for_dotnet()
+    for rid in ("DNL-INJ-001", "DNL-XSS-003", "DNL-AUTHZ-005", "DNL-AUTHZ-006", "DNL-AUTHZ-007"):
+        assert rid in ids, rid
+    assert "DNL-WCF-001" not in ids
+    assert "DNL-CFG-001" not in ids
+
+
 def test_dotnet_row_nonempty_and_api5():
     row = next(r for r in inv.coverage_rows(RULES) if r.startswith("| dotnet |"))
     cells = [c.strip() for c in row.strip("|").split("|")]
