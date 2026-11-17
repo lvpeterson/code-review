@@ -221,6 +221,8 @@ RESOURCES_EXPECTED = {
     ("DNL-RES-003", "Controllers/UploadController.cs", 17, "medium"),  # IFormFile.CopyToAsync, no Length check
     ("DNL-INV-002", "Controllers/UploadController.cs", 47, "low"),    # DiagnosticsController shipped
     ("DNL-INV-002", "Program.cs", 11, "low"),                         # UseSwagger() in every environment
+    ("DNL-INV-002", "Program.cs", 15, "low"),                         # guard on a config value: unknown -> Production
+    ("DNL-INV-002", "Program.cs", 19, "low"),                         # IsDevelopment() || StartsWith(..): unknown
 }
 
 
@@ -230,6 +232,9 @@ def test_resources_inventory_on_core(mode, monkeypatch):
     # SaveChecked (file.Length guard), the capped Take(Math.Min(..)) page and the swagger UI under
     # IsDevelopment() stay silent
     assert _family(results, ("DNL-RES-", "DNL-INV-")) == RESOURCES_EXPECTED
+    # only the proven Development guard (line 8) is suppressed; the text names the Core remedy
+    sw = next(f for r in results for f in r.findings if f.check_id == "DNL-INV-002" and f.line == 11)
+    assert "Development" in sw.description and "web.config" not in sw.description
 
 
 @pytest.mark.parametrize("mode", ["helper", "degraded"])

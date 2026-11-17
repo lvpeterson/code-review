@@ -732,9 +732,10 @@ def check_inv002(ctx: Ctx, configs) -> list[Finding]:
     if True:
         seen: set = set()
         # ASP.NET Core: the route of a `UseSwagger()` call records the environment the pipeline runs it in;
-        # one that cannot run in Production (`if (env.IsDevelopment())`) does not publish the document there.
+        # one that definitely cannot run in Production (`if (env.IsDevelopment())`) does not publish the document
+        # there; a guard that could not be parsed is never trusted (the environment is assumed Production).
         dev_only = {(r.route.file, r.route.line) for r in ctx.refs
-                    if r.route.meta.get("kind") == "openapi" and r.route.meta.get("env")}
+                    if r.route.meta.get("kind") == "openapi" and r.route.meta.get("dev_only")}
         for t in model.types():
             for m in t.methods:
                 prefix = _swagger_prefix(m.body)
@@ -748,8 +749,11 @@ def check_inv002(ctx: Ctx, configs) -> list[Finding]:
                             t, m.name, "DNL-INV-002", "low", "Swagger UI reachable without authentication",
                             f"{call_name(n)}(..) publishes the API description (routes, parameters, models) to "
                             "any caller. The UI is served by a message handler, so a global authorize filter "
-                            "does not cover it; only a web.config <location path=\"swagger\"> deny rule, "
-                            "authentication middleware or removal from production does", n.get("line") or 0))
+                            "does not cover it; " + (
+                                "only restricting it to Development or requiring authorization does"
+                                if (model.project_of(t.file) is not None and not model.project_of(t.file).is_legacy) else
+                                "only a web.config <location path=\"swagger\"> deny rule, "
+                                "authentication middleware or removal from production does"), n.get("line") or 0))
 
     # Test and debug controllers in non-test projects.
     for t in model.types():
