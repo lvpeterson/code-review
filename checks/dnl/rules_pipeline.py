@@ -356,10 +356,12 @@ def _url_sites(text: str) -> tuple[bool, bool]:
     return https, http
 
 
-def _kestrel_code(pipe: Pipeline) -> tuple[bool, bool, list[tuple[str, int, str | None]]]:
-    """(https present, something unreadable, [(file, line, confidence)] of HTTP-only listeners) from
+def _kestrel_code(pipe: Pipeline) -> tuple[bool, list[str], bool, list[tuple[str, int, str | None]]]:
+    """(https certainly present, where an https listener sits under an unparsed environment guard,
+    something unreadable, [(file, line, confidence)] of HTTP-only listeners) from
     ConfigureKestrel / UseKestrel option lambdas and UseUrls calls that can run in Production."""
     https = unreadable = False
+    maybe_https: list[str] = []
     sites: list[tuple[str, int, str | None]] = []
     seen: set = set()
     for c in pipe.calls:
@@ -381,7 +383,10 @@ def _kestrel_code(pipe: Pipeline) -> tuple[bool, bool, list[tuple[str, int, str 
                 for lam in lams:
                     inner = [x for x in walk(lam) if x.get("k") == "call"]
                     if any(call_name(x) in _HTTPS_CALLS for x in inner):
-                        https = True
+                        if run:
+                            https = True
+                        else:
+                            maybe_https.append(f"{c.file}:{line}")
                         continue
                     listens = [x for x in inner if call_name(x) in _LISTEN_CALLS]
                     if listens:
@@ -393,10 +398,14 @@ def _kestrel_code(pipe: Pipeline) -> tuple[bool, bool, list[tuple[str, int, str 
                         unreadable = True
                         continue
                     h, p = _url_sites(text)
-                    https = https or h
+                    if h:
+                        if run:
+                            https = True
+                        else:
+                            maybe_https.append(f"{c.file}:{line}")
                     if p:
                         sites.append((c.file, line, conf))
-    return https, unreadable, sites
+    return https, maybe_https, unreadable, sites
 
 
 def _kestrel_settings(ctx: Ctx, pipe: Pipeline) -> tuple[bool, list]:
@@ -423,13 +432,18 @@ def _kestrel_settings(ctx: Ctx, pipe: Pipeline) -> tuple[bool, list]:
 
 
 def _http_only(ctx: Ctx, pipe: Pipeline, add) -> None:
-    code_https, unreadable, sites = _kestrel_code(pipe)
+    code_https, maybe_https, unreadable, sites = _kestrel_code(pipe)
     cfg_https, bad = _kestrel_settings(ctx, pipe)
     if code_https or cfg_https:
         return
     desc = ("The app listens on plain HTTP only: no HTTPS endpoint is configured in code or in the Production "
             "settings, so traffic and cookies cross the network unencrypted." + _PROXY_NOTE)
-    if unreadable:
+    if maybe_https:
+        # An HTTPS listener under an unparsed guard downgrades the finding; it never clears it.
+        unreadable = True
+        desc += (f" An HTTPS listener at {', '.join(maybe_https)} sits under an environment condition that "
+                 "could not be parsed; confirm it runs in Production.")
+    elif unreadable:
         desc += " Some listener configuration is not a compile-time value, so an HTTPS endpoint may exist; confirm it."
     for file, line, conf in sites:
         add("DNL-CFG-013", "low", "Listens on HTTP only", desc, file, line, "REVIEW" if unreadable else conf)

@@ -467,3 +467,23 @@ def test_allowed_hosts_wildcard_only_in_development_file_is_clean(tmp_path, mode
     found = _scan(tmp_path, mode, "app.UseRouting();",
                   extra={"appsettings.Development.json": '{"AllowedHosts": "*"}'})
     assert not _of(found, "DNL-CFG-014")
+
+
+HTTPS_LISTENER = "builder.WebHost.ConfigureKestrel(o => o.ListenAnyIP(8443, l => l.UseHttps()));"
+
+
+def test_https_listener_under_unparsed_guard_is_review(tmp_path, mode):
+    services = HTTP_ONLY + "\nif (Flags.Check()) { " + HTTPS_LISTENER + " }"
+    hits = _of(_scan(tmp_path, mode, "app.UseRouting();", services=services), "DNL-CFG-013")
+    assert [(f.severity, f.confidence) for f in hits] == [("low", "REVIEW")]
+    assert "could not be parsed" in hits[0].description
+
+
+def test_https_listener_unguarded_clears(tmp_path, mode):
+    services = HTTP_ONLY + "\n" + HTTPS_LISTENER
+    assert not _of(_scan(tmp_path, mode, "app.UseRouting();", services=services), "DNL-CFG-013")
+
+
+def test_https_listener_in_development_only_does_not_clear(tmp_path, mode):
+    services = HTTP_ONLY + "\nif (builder.Environment.IsDevelopment()) { " + HTTPS_LISTENER + " }"
+    assert ("DNL-CFG-013", "low", None) in ids(_scan(tmp_path, mode, "app.UseRouting();", services=services))
