@@ -822,19 +822,30 @@ def _cors(ctx: Ctx) -> None:
     wild = {n for n, ps in policies.items() if any(p.bad for p in ps)}
     unnamed = None in policies
 
-    def undefined(name: str | None) -> bool:
-        """True when nothing defines the policy and nothing could be it (an unreadable options set, or a
-        policy whose own name is not a literal)."""
-        if opaque or unnamed or name == _DEFAULT_POLICY:
-            return False
-        return name not in policies if name is not None else not policies
+    def problem(name: str | None) -> str | None:
+        """Why a used policy name cannot be trusted: None when it is positively matched by a readable
+        definition (a wild one is reported at its definition), the default policy, or when an unreadable
+        options set was already reported. Otherwise "undefined", "unnamed" (a policy whose own name is not
+        a literal might define it) or "unreadable" (the definition could not be read)."""
+        if opaque or name == _DEFAULT_POLICY:
+            return None
+        if name is None:
+            return None if policies else "undefined"
+        if name in policies:
+            defs = policies[name]
+            return "unreadable" if any(p.maybe for p in defs) and not any(p.bad for p in defs) else None
+        return "unnamed" if unnamed else "undefined"
 
-    def report_undefined(name, file, line, where):
+    def report_problem(name, kind, file, line, where, track=True):
         text = repr(name) if name is not None else "a policy whose name is not a literal"
-        review(file, line, f"{where} uses {text}, but no AddPolicy / AddDefaultPolicy defines it in code, so its "
-                           "origins cannot be read. Confirm it does not allow any origin.",
-               "CORS policy is used but not defined")
-        reported_undefined.add(name)
+        why = {"undefined": "no AddPolicy / AddDefaultPolicy defines it in code",
+               "unnamed": "no policy with that literal name is defined, and a policy whose name is not a literal "
+                          "(a name that is not a compile-time string) might define it",
+               "unreadable": "its definition could not be read"}[kind]
+        review(file, line, f"{where} uses {text}, but {why}, so its origins cannot be read. Confirm it does not "
+                           "allow any origin.", "CORS policy is used but not defined")
+        if track:
+            reported_undefined.add(name)
 
     for ref in ctx.refs:        # RequireCors on endpoints and groups: names to resolve, inline policies to read
         for node in _require_cors_calls(ref):
@@ -844,8 +855,14 @@ def _cors(ctx: Ctx) -> None:
     # (an inline policy is reported by `use`; a shared group call is visited once)
 
     for name, file, line in named_uses:
-        if undefined(name):
-            report_undefined(name, file, line, "UseCors / RequireCors")
+        kind = problem(name)
+        if kind:
+            report_problem(name, kind, file, line, "UseCors / RequireCors")
+    for ref in ctx.refs:        # [EnableCors("x")] on any route: the policy must be defined and readable
+        for name, how, line in _route_cors_names(ctx, ref):
+            kind = problem(name)
+            if kind:
+                report_problem(name, kind, ref.route.file, line, how, track=False)
 
     # Route-bound: CFG-015 on a sensitive or mutating handler that opts into CORS.
     for ref in ctx.refs:
@@ -862,7 +879,9 @@ def _cors(ctx: Ctx) -> None:
         for name, how, _line in names:
             if name in wild or name in reported_undefined:
                 continue            # CFG-007 already reports the policy
-            why = ("; the named policy is not defined in code" if undefined(name) else
+            kind = problem(name)
+            why = ("; the named policy is not defined in code" if kind in ("undefined", "unnamed") else
+                   "; the named policy could not be read" if kind == "unreadable" else
                    "; its policy name is not a literal" if name is None else "")
             key = ("DNL-CFG-015", r.file, r.line, name, how)
             if key in seen:

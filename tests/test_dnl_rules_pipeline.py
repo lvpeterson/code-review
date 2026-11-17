@@ -750,3 +750,36 @@ def test_require_cors_through_group_under_wildcard_is_cfg007_only(tmp_path, mode
     body = 'var g = app.MapGroup("/admin").RequireCors("tight");\ng.MapPost("/reset", () => "ok");'
     found = _cors(tmp_path, mode, _add_policy("b.AllowAnyOrigin()", "tight"), body=body)
     assert not _of(found, "DNL-CFG-015") and ("DNL-CFG-007", "medium", None) in ids(found)
+
+
+# -- CORS fix round: attribute names are resolved for every route; non-literal-named policies -------------
+
+GET_CTL = ('using Microsoft.AspNetCore.Cors;\nusing Microsoft.AspNetCore.Mvc;\npublic class ItemsController : Controller\n'
+           '{\n    [EnableCors("x")]\n    [HttpGet]\n    public IActionResult List() => Ok();\n}\n')
+HELPER_CS = "public static class CorsHelper { public static void Open(object b) { } }\n"
+
+
+def test_enable_cors_on_get_with_unreadable_policy_is_review(tmp_path, mode):
+    found = _admin(tmp_path, mode, _add_policy("CorsHelper.Open(b)", "x"), controller=GET_CTL)
+    assert not _of(found, "DNL-CFG-015")
+    uses = [f for f in _of(found, "DNL-CFG-007") if f.file == "AdminController.cs"]
+    assert [(f.severity, f.confidence) for f in uses] == [("medium", "REVIEW")]
+
+
+def test_enable_cors_on_get_with_undefined_policy_is_review(tmp_path, mode):
+    found = _admin(tmp_path, mode, _add_policy('b.WithOrigins("https://a.example.test")', "other"), controller=GET_CTL)
+    assert ("DNL-CFG-007", "medium", "REVIEW") in ids(found)
+
+
+def test_enable_cors_on_get_with_benign_policy_is_clean(tmp_path, mode):
+    found = _admin(tmp_path, mode, _add_policy('b.WithOrigins("https://a.example.test")', "x"), controller=GET_CTL)
+    assert not _of(found, "DNL-CFG-007") and not _of(found, "DNL-CFG-015")
+
+
+def test_used_ghost_name_with_const_named_policy_is_review(tmp_path, mode):
+    policy = ('o.AddPolicy(Names.Tight, b => b.WithOrigins("https://a.example.test"));')
+    extra = {"Names.cs": 'public static class Names { public const string Tight = "tight"; }\n'}
+    found = _cors(tmp_path, mode, policy, body='app.UseCors("ghost");', extra=extra)
+    hits = _of(found, "DNL-CFG-007")
+    assert [(f.severity, f.confidence) for f in hits] == [("medium", "REVIEW")]
+    assert "name is not a literal" in hits[0].description

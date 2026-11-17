@@ -7,7 +7,6 @@ the environment is Development get no AUTHZ finding.
 """
 from __future__ import annotations
 
-import re
 
 from checks.dnl import auth_core
 from checks.dnl.auth_core import ANONYMOUS, PROTECTED, UNKNOWN, _sensitive
