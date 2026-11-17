@@ -351,7 +351,10 @@ class _Analysis:
                     return self._origin(s.name, line)
             return None
         text = text if text is not None else self._text(e)
+        core = self._is_core_project()
         for s, _, text_re in _SOURCE_RES:
+            if s.core_text and not core:
+                continue                    # a legacy `request.Method` is some other library's, not Core's
             if text_re and text and text_re.match(text):
                 return self._origin(s.name, line)
         typed = self._typed_core_source(e)
@@ -630,7 +633,8 @@ class _Analysis:
         for a in e.get("args") or []:
             self.ev(a)
         if not e.get("sym") and (_REQUEST_RE.match(self._text(obj) or "")
-                                 or _CORE_REQUEST_RE.match(self._text(obj) or "")):
+                                 or (self._is_core_project()
+                                     and _CORE_REQUEST_RE.match(self._text(obj) or ""))):
             return self._origin("Request", e.get("line", 0))
         src = self._source(e)
         if src is not None:

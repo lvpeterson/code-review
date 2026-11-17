@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-14-aspnetcore-design.md` (Taint; Object-level and property-level; Report; Testing; Decision 8). Plan 1 (`docs/superpowers/plans/2026-11-15-aspnetcore-foundation.md`) is done on `feature/aspnetcore-foundation`; this plan's branch `feature/aspnetcore-taint` is stacked on it.
 
-**Reference:** an interface map of the taint engine written for this plan is at `.superpowers/plan2-notes/taint-map.md` (gitignored scratch; table formats, matching rules, file:line of every legacy-only assumption). Implementers read the section their task names.
+**Reference:** an interface map of the taint engine (table formats, matching rules, every legacy-only assumption) was produced as working notes for this plan and is not part of the repository. Implementers read the section their task names.
 
 ## Global Constraints
 

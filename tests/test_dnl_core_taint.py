@@ -690,3 +690,67 @@ def test_legacy_findings_unchanged_degraded(monkeypatch):
     for name in ("mvc5_app", "webapi_global"):
         assert _legacy_run(name, True) == set(), name
     project._CACHE.clear()
+
+
+_LEGACY_REQUEST_SHAPES = """using System.Diagnostics;
+using System.Net;
+using System.Web.Mvc;
+
+namespace LegacyShapes
+{
+    public class ShapesController : Controller
+    {
+        public ActionResult Rest(string id)
+        {
+            var request = new RestSharp.RestRequest("x");
+            Process.Start(request.Method.ToString());
+            return Content("ok");
+        }
+
+        public ActionResult Web(string id)
+        {
+            var request = (HttpWebRequest)WebRequest.Create("http://example.test/");
+            Process.Start(request.Method);
+            return Content("ok");
+        }
+    }
+}
+"""
+
+_LEGACY_CSPROJ = """<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="15.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <TargetFrameworkVersion>v4.7.2</TargetFrameworkVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System.Web" />
+    <Reference Include="System.Web.Mvc, Version=5.2.7.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="Shapes.cs" />
+  </ItemGroup>
+</Project>
+"""
+
+
+def _legacy_shapes_findings(tmp_path):
+    from checks.dnl import routes
+    (tmp_path / "Shapes.cs").write_text(_LEGACY_REQUEST_SHAPES)
+    (tmp_path / "Shapes.csproj").write_text(_LEGACY_CSPROJ)
+    project._CACHE.clear()
+    model = project.prepare(tmp_path, True)
+    refs = routes.discover_mvc_webapi(model)
+    assert refs                                   # the actions are discovered, so the engine really ran
+    out = [f for f in rules_taint.check(model, refs) if f.check_id == "DNL-INJ-002"]
+    project._CACHE.clear()
+    return out
+
+
+def test_legacy_request_shaped_locals_are_not_core_sources_with_helper(roslyn_helper, tmp_path):
+    assert _legacy_shapes_findings(tmp_path) == []
+
+
+def test_legacy_request_shaped_locals_are_not_core_sources_degraded(monkeypatch, tmp_path):
+    monkeypatch.setattr("checks.dnl.helper.find_helper", lambda *a, **k: None)
+    monkeypatch.setattr("checks.dnl.helper.sdk_available", lambda *a, **k: False)
+    assert _legacy_shapes_findings(tmp_path) == []

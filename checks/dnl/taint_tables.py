@@ -21,6 +21,7 @@ class Source:
     name: str
     sym: str            # regex over the full `sym` ("Type.Member")
     text: str | None    # regex over the receiver/member text when sym is absent
+    core_text: bool = False   # the text regex is an ASP.NET Core spelling: applied in Core projects only
 
 
 _REQ = r"System\.Web\.(HttpRequest|HttpRequestBase|HttpRequestWrapper)"
@@ -64,24 +65,24 @@ SOURCES: tuple[Source, ...] = (
     Source("Request", rf"^{_CORE_REQ}\.(Query|Form|Headers|Cookies|Path|PathBase|QueryString|Host|Method|"
                       r"Scheme|ContentType|ReadFormAsync|Protocol|ContentLength)$",
            rf"(?i)^{_CORE_CTX}request\.(query|form|headers|cookies|path|pathbase|querystring|host|method|"
-           r"scheme|contenttype|readformasync|protocol|contentlength)$"),
+           r"scheme|contenttype|readformasync|protocol|contentlength)$", True),
     # Extension methods that rebuild request data (the URL, typed headers). `GetTypedHeaders` serves
     # both request and response, and the sym cannot tell them apart: it stays a source.
     Source("Request", r"^Microsoft\.AspNetCore\.Http\.Extensions\.UriHelper\.(GetDisplayUrl|GetEncodedUrl|"
                       r"GetEncodedPathAndQuery)$|^Microsoft\.AspNetCore\.Http\.HeaderDictionaryTypeExtensions\."
                       r"GetTypedHeaders$",
-           rf"(?i)^{_CORE_CTX}request\.(getdisplayurl|getencodedurl|getencodedpathandquery|gettypedheaders)$"),
+           rf"(?i)^{_CORE_CTX}request\.(getdisplayurl|getencodedurl|getencodedpathandquery|gettypedheaders)$", True),
     Source("Request", r"^Microsoft\.AspNetCore\.Http\.IFormCollection\.Item$", None),
     # Bare `HttpContext.Request` without a sym (sym-only members are above): text only, `(?!)` never matches.
-    Source("Request", r"(?!)", rf"(?i)^{_CORE_CTX}request$"),
+    Source("Request", r"(?!)", rf"(?i)^{_CORE_CTX}request$", True),
     Source("Request.Body", rf"^{_CORE_REQ}\.(Body|BodyReader)$|"
                            r"^Microsoft\.AspNetCore\.Http\.HttpRequestJsonExtensions\.ReadFromJsonAsync$",
-           rf"(?i)^{_CORE_CTX}request\.(body|bodyreader|readfromjsonasync)$"),
+           rf"(?i)^{_CORE_CTX}request\.(body|bodyreader|readfromjsonasync)$", True),
     # GetRouteValue lives in Microsoft.AspNetCore.Routing (the helper reports that namespace); Http kept too.
     Source("RouteValues", rf"^{_CORE_REQ}\.RouteValues$|^Microsoft\.AspNetCore\.Routing\.RouteData\.Values$|"
                           r"^Microsoft\.AspNetCore\.(Http|Routing)\.RoutingHttpContextExtensions\.GetRouteValue$",
            rf"(?i)^{_CORE_CTX}request\.routevalues$|(^|\.)(http)?context\.getroutevalue$|"
-           r"(^|\.)ctx\.getroutevalue$"),
+           r"(^|\.)ctx\.getroutevalue$", True),
     Source("IFormFile", r"^Microsoft\.AspNetCore\.Http\.IFormFile\.(FileName|Name|ContentType|OpenReadStream|"
                                   r"Length|ContentDisposition|Headers)$", None),
 )
