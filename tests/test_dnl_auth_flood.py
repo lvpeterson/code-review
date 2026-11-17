@@ -90,6 +90,34 @@ def test_n11_configure_of_an_auth_relevant_type_still_blocks(tmp_path, mode, stm
     assert a.state == UNKNOWN and a.reasons, stmt
 
 
+def test_i2_alias_and_chained_options_types(tmp_path, mode):
+    strip = "public partial class Program { static void Strip(object o) { } }\n"
+    prog = "using Opts = Microsoft.AspNetCore.Mvc.MvcOptions;\n" + _program(
+        "builder.Services.Configure<Opts>(o => Strip(o));\n", extra=CONTROLLERS + strip)
+    assert _state(tmp_path / "a", mode, prog).state == UNKNOWN
+    chained = _program("builder.Services.AddOptions<MvcOptions>().Configure<IFoo>((o, f) => Strip(o));\n"
+                       "builder.Services.AddOptions<MvcOptions>().PostConfigure<IFoo>((o, f) => Strip(o));\n",
+                       extra=CONTROLLERS + "public interface IFoo { }\n" + strip)
+    assert _state(tmp_path / "b", mode, chained).state == UNKNOWN
+
+
+def test_i2_solution_options_class_deriving_from_an_auth_type_and_unresolved_t(tmp_path, mode):
+    strip = "public partial class Program { static void Strip(object o) { } }\n"
+    derived = _program("builder.Services.Configure<MyMvcOptions>(builder.Configuration);\n",
+                       extra=CONTROLLERS + "public class MyMvcOptions : Microsoft.AspNetCore.Mvc.MvcOptions { }\n")
+    assert _state(tmp_path / "a", mode, derived).state == UNKNOWN
+    handed = _program("builder.Services.Configure<VendorOptions>(o => Strip(o));\n", extra=CONTROLLERS + strip)
+    assert _state(tmp_path / "b", mode, handed).state == UNKNOWN
+    quiet = _program("builder.Services.Configure<VendorOptions>(o => o.Name = \"x\");\n")
+    assert _state(tmp_path / "c", mode, quiet).state == PROTECTED
+
+
+@pytest.mark.parametrize("t", ["OpenIdConnectOptions", "IdentityOptions", "CookiePolicyOptions", "HubOptions", "T1", "TOptions"])
+def test_m6_more_auth_relevant_option_types(tmp_path, mode, t):
+    prog = _program(f"builder.Services.Configure<{t}>(builder.Configuration);\n")
+    assert _state(tmp_path, mode, prog).state == UNKNOWN, t
+
+
 # -- N1.2 Conventions.Add(new X()) --------------------------------------------------------------
 
 CONV_BASE = ("using Microsoft.AspNetCore.Mvc.ApplicationModels;\n"
@@ -122,6 +150,30 @@ def test_n12_solution_convention_touching_authorization_blocks(tmp_path, mode, b
     files = _conv("OpenConvention", body)
     a = _with_convention(tmp_path, mode, "new OpenConvention()", files)
     assert a.state == UNKNOWN and any("Conventions.Add" in r for r in a.reasons), body
+
+
+@pytest.mark.parametrize("body, extra", [
+    # C1: an in-solution extension does the work
+    ("foreach (var c in application.Controllers) { c.OpenUp(); }",
+     {"Ext.cs": "using Microsoft.AspNetCore.Mvc.ApplicationModels;\npublic static class Ext { public static void OpenUp(this ControllerModel c) { c.Filters.Add(new AllowAnonymousFilter()); } }\n"}),
+    # C2: a helper object receives the model
+    ("var h = new Opener(); h.Run(application);",
+     {"Opener.cs": "using Microsoft.AspNetCore.Mvc.ApplicationModels;\npublic class Opener { public void Run(ApplicationModel m) { foreach (var c in m.Controllers) { c.Filters.Add(new AllowAnonymousFilter()); } } }\n"}),
+    # C3: an unresolved third-party static
+    ("VendorHelpers.Tweak(application);", {}),
+    # C4: an unresolved extension
+    ("application.Tweak();", {}),
+])
+def test_n12_indirection_cannot_hide_an_anonymous_opt_out(tmp_path, mode, body, extra):
+    files = _conv("SneakyConvention", body)
+    files.update(extra)
+    a = _with_convention(tmp_path, mode, "new SneakyConvention()", files)
+    assert a.state == UNKNOWN and any("Conventions.Add" in r for r in a.reasons), body
+
+
+def test_n12_exact_names_only_for_framework_conventions(tmp_path, mode):
+    for i, name in enumerate(("ApiExplorerAnythingConvention", "ApiVersionSneakyConvention")):
+        assert _with_convention(tmp_path / str(i), mode, f"new {name}()").state == UNKNOWN
 
 
 def test_n12_unresolved_convention_blocks_and_framework_one_does_not(tmp_path, mode):
@@ -249,6 +301,31 @@ STARTUP_MAIN = ("Host.CreateDefaultBuilder(args).ConfigureWebHostDefaults(w => w
 STARTUP_CLASS = (USINGS + "public class Startup\n{\n    public void ConfigureServices(IServiceCollection services)\n    {\n"
                  "        services.AddControllers();\n    }\n    public void Configure(IApplicationBuilder app)\n    {\n"
                  "        app.UseRouting();\n        app.UseEndpoints(e => e.MapControllers());\n    }\n}\n")
+
+
+def test_i3_destructive_or_privileged_names_are_not_anonymous_by_design(tmp_path, mode):
+    ctl = '''
+[ApiController, Route("api/admin")]
+public class AdminController : ControllerBase
+{
+    [HttpPost("a"), AllowAnonymous] public IActionResult ResetUserPassword() => Ok();
+    [HttpPost("b"), AllowAnonymous] public IActionResult ResetDatabase() => Ok();
+    [HttpPost("c"), AllowAnonymous] public IActionResult TokenPurge() => Ok();
+}
+[ApiController, Route("api/ops")]
+public class OpsController : ControllerBase
+{
+    [HttpPost("reset-database"), AllowAnonymous] public IActionResult Run1() => Ok();
+    [HttpPost("token-purge"), AllowAnonymous] public IActionResult Run2() => Ok();
+    [HttpPost("confirm-email"), AllowAnonymous] public IActionResult Run3() => Ok();
+    [HttpPost("reset-password"), AllowAnonymous] public IActionResult Run4() => Ok();
+    [HttpPost("login"), AllowAnonymous] public IActionResult Run5() => Ok();
+}
+'''
+    fs = _findings(tmp_path, mode, _program(extra=ctl))
+    flagged = {f.route.handler_name for f in fs if f.check_id == "DNL-AUTHZ-002"}
+    assert flagged == {"AdminController.ResetUserPassword", "AdminController.ResetDatabase", "AdminController.TokenPurge",
+                       "OpsController.Run1", "OpsController.Run2"}
 
 
 def test_d9_minimal_hosting_adds_authorization_middleware_itself(tmp_path, mode):

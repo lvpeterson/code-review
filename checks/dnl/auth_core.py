@@ -79,16 +79,18 @@ _CONFIGURE_CALLS = frozenset({"Configure", "PostConfigure", "ConfigureOptions"})
 _GENERIC_OPTION_CALLS = _CONFIGURE_CALLS | {"AddOptions", "Bind", "BindConfiguration"}
 _AUTH_OPTION_TYPES = frozenset("""
 AuthorizationOptions MvcOptions MvcCoreOptions RazorPagesOptions AuthenticationOptions CookieAuthenticationOptions
-JwtBearerOptions RouteOptions
+JwtBearerOptions RouteOptions OpenIdConnectOptions IdentityOptions CookiePolicyOptions HubOptions
 """.split())
-_TYPE_PARAM = re.compile(r"^T([A-Z]\w*)?$")
+_TYPE_PARAM = re.compile(r"^T(\d|[A-Z]\w*)?$")
 # Unresolved registrations whose name, generic arguments or lambda look like authorization keep an
 # otherwise unprotected route UNKNOWN; the rest cannot turn it into anything but a definite finding.
 _AUTH_LOOKING = re.compile(r"auth|polic|identity|permission|security|claim|jwt|openid|oidc|cookie|session|access|role|acl",
                            re.IGNORECASE)
 # Framework MVC / Razor Pages conventions that only edit routes, names or API explorer data.
-_BENIGN_CONVENTION_TYPES = re.compile(
-    r"^(RouteTokenTransformerConvention|PageRouteTransformerConvention|ApiExplorer\w*Convention|(Default)?ApiVersion\w*Convention)$")
+_BENIGN_CONVENTION_TYPES = frozenset("""
+RouteTokenTransformerConvention PageRouteTransformerConvention ApiExplorerVisibilityConvention
+ApiExplorerGroupConvention ApiVersionConvention DefaultApiVersionConvention
+""".split())
 _CONVENTION_IFACES = frozenset("""
 IApplicationModelConvention IControllerModelConvention IActionModelConvention IParameterModelConvention
 IParameterModelBaseConvention IPageApplicationModelConvention IPageRouteModelConvention IPageHandlerModelConvention
@@ -96,6 +98,13 @@ IPageConvention
 """.split())
 # What in a convention body could add, remove or replace authorization.
 _AUTHZ_TOUCH = re.compile(r"filter|metadata|authoriz|anonymous|polic|requirement|permission|\battributes\b", re.IGNORECASE)
+# BCL string / collection / LINQ / route-model members a route-only convention uses; anything else is a blocker.
+_CONVENTION_SAFE_CALLS = frozenset("""
+ToLower ToLowerInvariant ToUpper ToUpperInvariant Trim TrimStart TrimEnd Replace StartsWith EndsWith Contains Split
+Substring Insert Remove IndexOf Join Concat Format IsNullOrEmpty IsNullOrWhiteSpace Equals ToString Add AddRange Any All
+Where Select First FirstOrDefault Single SingleOrDefault Count ToList ToArray Last LastOrDefault
+CombineAttributeRouteModel
+""".split())
 _POLICY_DEFS = frozenset({"AddPolicy", "AddDefaultPolicy", "AddFallbackPolicy"})
 _KNOWN_DENY_REQS = frozenset("""
 DenyAnonymousAuthorizationRequirement RolesAuthorizationRequirement ClaimsAuthorizationRequirement
@@ -590,8 +599,21 @@ def _targs_of(call: dict) -> list[str]:
     return [_simple(t) for t in (call.get("fn") or {}).get("targs") or []]
 
 
-def _auth_options_type(name: str) -> bool:
-    return name in _AUTH_OPTION_TYPES or name.endswith("AuthorizationOptions") or bool(_TYPE_PARAM.match(name))
+def _usings_aliases(model: ProjectModel, file: str) -> dict[str, str]:
+    """`using Alias = Ns.Type;` of one source file, as {Alias: Type}."""
+    try:
+        text = (model.root / file).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    return {m.group(1): _simple(m.group(2)) for m in re.finditer(r"\busing\s+(\w+)\s*=\s*([\w.<>?]+)\s*;", text)}
+
+
+def _auth_options_type(model: ProjectModel, name: str, depth: int = 0) -> bool:
+    if name in _AUTH_OPTION_TYPES or name.endswith("AuthorizationOptions") or _TYPE_PARAM.match(name):
+        return True
+    # A solution class deriving from an authorization options type.
+    return depth < 5 and any(_auth_options_type(model, _simple(b), depth + 1)
+                             for t in model.find_types(name) for b in t.bases)
 
 
 def _target_name(target) -> str:
@@ -736,13 +758,20 @@ def _build_settings(model: ProjectModel, pipe: Pipeline) -> _Settings:
         if c.kind != "services":
             continue
         # Options type of a generic options registration: its own argument, or the AddOptions<T>() it continues.
-        otargs = targs or next((_targs_of(x) for x in reversed(c.chain[:idx]) if call_name(x) == "AddOptions"), [])
+        # The T of `AddOptions<T>()` wins over the type arguments of a Configure<TDep> chained onto it.
+        otargs = next((_targs_of(x) for x in reversed(c.chain[:idx]) if call_name(x) == "AddOptions"), None) or targs
+        aliases = _usings_aliases(model, c.file)
+        otargs = [aliases.get(t, t) for t in otargs]
         auth_ctx = (c.name in ("AddAuthorization", "AddAuthorizationCore", "AddAuthorizationBuilder")
                     or (c.name in _CONFIGURE_CALLS and "AuthorizationOptions" in otargs))
         # Configure<T> and friends are an options call only for an authorization-relevant (or unknown) T.
         generic_opts = c.name in _GENERIC_OPTION_CALLS
-        opts_relevant = any(_auth_options_type(t) for t in otargs) or (c.name in _CONFIGURE_CALLS and not otargs)
+        opts_relevant = any(_auth_options_type(model, t) for t in otargs) or (c.name in _CONFIGURE_CALLS and not otargs)
+        # A T nothing in the solution declares and no known list covers: harmless unless the options object
+        # (or a method group) is handed to code this module does not read.
+        t_unknown = generic_opts and not opts_relevant and any(not model.find_types(t) for t in otargs)
         opt_call = opts_relevant if generic_opts else c.name in _OPTION_CALLS
+        track = opt_call or t_unknown
         builder_ctx = "AddAuthorizationBuilder" in prior
         file, line = c.file, node.get("line") or c.line
 
@@ -800,7 +829,7 @@ def _build_settings(model: ProjectModel, pipe: Pipeline) -> _Settings:
                     S.filters.append(_Fact({"call": ev}, runs is True, file, eline))
                 elif recv.endswith("Conventions"):
                     S.page_convs.append(_Fact({"call": ev, "name": name}, runs is True, file, eline))
-                if (opt_call and p
+                if (track and p
                         and any(isinstance(a, dict) and a.get("k") == "name" and a.get("id") == p
                                 for a in ev.get("args") or [])):
                     opaque = name
@@ -808,7 +837,10 @@ def _build_settings(model: ProjectModel, pipe: Pipeline) -> _Settings:
         # A generic registration of a relevant T is blocked by any non-lambda argument (a configuration
         # section may bind anything the type has); other calls only by a name / member (method group).
         shown = ("name", "member") if not generic_opts else ("name", "member", "call", "new")
-        if opt_call and (opaque or any(isinstance(a, dict) and a.get("k") in shown for a in node.get("args") or [])):
+        if not opt_call:
+            shown = ("name", "member") if t_unknown else ()
+        if (opt_call or t_unknown) and (opaque or any(isinstance(a, dict) and a.get("k") in shown
+                                                       for a in node.get("args") or [])):
             what = opaque or next(receiver_text(a) or call_name(a) or "a method group" for a in node.get("args") or []
                                   if isinstance(a, dict) and a.get("k") in shown)
             msg = f"{c.name} options are configured by {what} at {file}:{line}, which is not analysed"
@@ -865,10 +897,9 @@ def _convention_type_benign(model: ProjectModel, tn: str, new: dict | None, dept
     if new is not None and any(isinstance(n, dict) and n.get("k") == "lambda" for n in walk(new.get("args"))):
         return False
     if not types:
-        return bool(_BENIGN_CONVENTION_TYPES.match(tn)) and depth == 0
+        return tn in _BENIGN_CONVENTION_TYPES and depth == 0
     if new is not None and _AUTHZ_TOUCH.search(_body_text(new.get("args"))):
         return False
-    solution_methods = {m.name for t in model.types() for m in t.methods}
     for t in types:
         for b in t.bases:
             bn = _simple(b)
@@ -885,12 +916,14 @@ def _convention_type_benign(model: ProjectModel, tn: str, new: dict | None, dept
                     continue
                 fn = n.get("fn") or {}
                 callee = call_name(n) or ""
-                if fn.get("k") == "name" and callee not in own:
-                    return False        # a helper this module does not see, handed the model
-                if (fn.get("k") == "member" and callee in solution_methods
-                        and receiver_text(fn.get("obj")) not in ("this", "base")
-                        and model.find_types(_simple(receiver_text(fn.get("obj"))))):
-                    return False        # a call into another solution type
+                recv = receiver_text(fn.get("obj")) if fn.get("k") == "member" else ""
+                if callee in _CONVENTION_SAFE_CALLS:
+                    continue
+                # Any other call may carry the model (or something taken from it) into code this module does
+                # not read: only the convention's own methods, which are scanned here, are followed.
+                if callee in own and (fn.get("k") == "name" or recv in ("this", "base", t.name)):
+                    continue
+                return False
     return True
 
 

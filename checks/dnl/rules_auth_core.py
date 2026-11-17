@@ -22,11 +22,15 @@ _MUTATING = {"POST", "PUT", "DELETE", "PATCH"}
 _SENSITIVE_CONTROLLER = re.compile(r"(?i)admin|manage|role|permission|setting|config")
 _SENSITIVE_ACTION = re.compile(r"(?i)^(delete|remove|purge|approve|grant|revoke|reset)")
 _HANDLER_PREFIX = re.compile(r"(?i)^on(get|post|put|delete|patch|head|options)")
-# Actions that are anonymous by design (sign-in, registration, token exchange, password recovery): a public
-# state-changing handler named or routed like this is not an AUTHZ-002 item. Matched on the action name and
-# on the last literal segment of the path, as a prefix, so `/reset-password` and `ForgotPassword` count but a
-# `Delete` under `/login/` does not.
-_ANON_BY_DESIGN = re.compile(r"^(login|signin|register|signup|logout|signout|token|refresh|callback|forgot|reset|confirm)")
+# Credential-flow actions that are anonymous by design (sign-in, registration, token exchange, password
+# recovery). Anchored on the whole normalised name, so `ResetDatabase` or `TokenPurge` do not qualify, and
+# never applied to a privileged-looking controller or to a name / path that mentions a destructive or
+# user-management word. Matched on the action name and on the last literal path segment.
+_ANON_BY_DESIGN = re.compile(
+    r"^(login|signin|register|signup|logout|signout|callback|forgot\w*password|reset\w*password"
+    r"|confirm\w*(email|account)|refresh\w*token)|^(token|refresh)(async)?$")
+_DANGEROUS_TOKENS = frozenset("delete remove purge wipe drop all database db manage management admin".split())
+_FLOW_TOKENS = frozenset("login signin register signup logout signout".split())
 _UNPROTECTED = ("No [Authorize], RequireAuthorization (endpoint, group or Map call), global filter, "
                 "Razor Pages convention or fallback policy covers this route.")
 
@@ -35,7 +39,13 @@ def _mutating_verbs(route) -> str:
     return ", ".join(sorted(_MUTATING & {v.upper() for v in route.methods}))
 
 
+def _tokens(name: str) -> list[str]:
+    return [t.lower() for t in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+", name)]
+
+
 def _anonymous_by_design(ref: CoreRouteRef) -> bool:
+    if _sensitive(ref):
+        return False
     r = ref.route
     action = ref.method.name if ref.method else (r.handler_name or "").split(".")[-1]
     if ref.style == "razorpage":
@@ -44,7 +54,14 @@ def _anonymous_by_design(ref: CoreRouteRef) -> bool:
     segs = [x for x in (r.path or "").split("/") if x and not x.startswith("{") and not x.startswith("[")]
     if segs:
         names.append(segs[-1])
-    return any(_ANON_BY_DESIGN.match(re.sub(r"[^a-z]", "", n.lower())) for n in names if n)
+    for n in names:
+        toks = _tokens(n)
+        bad = _DANGEROUS_TOKENS & set(toks)
+        if ({"user", "users"} & set(toks)) and not (_FLOW_TOKENS & set(toks)):
+            bad = bad | {"user"}
+        if n and not bad and _ANON_BY_DESIGN.match(re.sub(r"[^a-z]", "", n.lower())):
+            return True
+    return False
 
 
 def _sensitive(ref: CoreRouteRef) -> bool:
