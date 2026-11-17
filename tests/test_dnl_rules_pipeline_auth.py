@@ -488,3 +488,53 @@ def test_csrf_opaque_mvc_options(tmp_path, mode):
 def test_csrf_no_opaque_review_for_default_mvc_calls(tmp_path, mode):
     f = scan(tmp_path, mvc(ctl="[HttpGet] public IActionResult Show() => Ok();"), mode)
     assert not af(f)
+
+
+# -- antiforgery fix round 1 -----------------------------------------------------------------------------
+
+def test_csrf001_unresolved_services_call_may_add_a_global_filter(tmp_path, mode):
+    f = scan(tmp_path, mvc(ctl=SAVE, services=COOKIES + "builder.Services.AddCompanyMvc();\n"), mode)
+    got = af(f, "DNL-CSRF-001")
+    assert got == {("DNL-CSRF-001", "medium", "REVIEW")}
+    assert "AddCompanyMvc" in [x for x in f if x.check_id == "DNL-CSRF-001"][0].description
+
+
+def test_csrf001_route_environment(tmp_path, mode):
+    dev = "if (app.Environment.IsDevelopment()) { app.MapDefaultControllerRoute(); }"
+    assert not af(scan(tmp_path / "a", mvc(ctl=SAVE, body=dev), mode), "DNL-CSRF-001")
+    odd = "if (Flag()) { app.MapDefaultControllerRoute(); }"
+    assert af(scan(tmp_path / "b", mvc(ctl=SAVE, body=odd), mode), "DNL-CSRF-001") == {("DNL-CSRF-001", "medium", "REVIEW")}
+
+
+def test_csrf001_no_host_project_is_review(tmp_path, mode):
+    files = {"HomeController.cs": AF + "public class HomeController : Controller {\n" + SAVE + "\n}\n"}
+    f = scan(tmp_path, files, mode, sdk="Microsoft.NET.Sdk")
+    assert af(f, "DNL-CSRF-001") == {("DNL-CSRF-001", "medium", "REVIEW")}
+    assert "no host project" in [x for x in f if x.check_id == "DNL-CSRF-001"][0].description
+
+
+def test_csrf002_form_types_in_arrays_and_generics(tmp_path, mode):
+    for i, t in enumerate(("IFormFile[]", "List<IFormFile>", "IEnumerable<IFormFile>", "IFormFileCollection")):
+        body = f'app.MapPost("/up", ({t} f) => 1).DisableAntiforgery();'
+        assert af(scan(tmp_path / str(i), minimal(body), mode)) == {("DNL-CSRF-002", "medium", None)}, t
+
+
+def test_csrf002_untraced_disable_antiforgery_is_review(tmp_path, mode):
+    body = 'app.MapPost("/up", ([FromForm] IFormFile f) => 1).Foo().DisableAntiforgery();'
+    assert af(scan(tmp_path / "a", minimal(body), mode)) == {("DNL-CSRF-002", "medium", "REVIEW")}
+    body = 'app.MapPost("/up", (int id) => 1).Foo().DisableAntiforgery();'
+    assert not af(scan(tmp_path / "b", minimal(body), mode))
+
+
+def test_csrf002_page_attribute_directive(tmp_path, mode):
+    files = prog("builder.Services.AddRazorPages();\n" + COOKIES, "app.MapRazorPages();")
+    files["Pages/Index.cshtml"] = "@page\n@model MissingModel\n@attribute [IgnoreAntiforgeryToken]\n"
+    assert af(scan(tmp_path / "a", files, mode)) == {("DNL-CSRF-002", "medium", "REVIEW")}
+    f = razor("public class IndexModel : PageModel { public void OnPost() { } }")
+    f["Pages/Index.cshtml"] = "@page\n@model IndexModel\n@attribute [IgnoreAntiforgeryToken]\n"
+    assert af(scan(tmp_path / "b", f, mode)) == {("DNL-CSRF-002", "medium", None)}
+
+
+def test_csrf001_expression_bodied_options_lambda_clears(tmp_path, mode):
+    f = scan(tmp_path, mvc(ctl=SAVE, mvc_opts="o => o.Filters.Add(new AutoValidateAntiforgeryTokenAttribute())"), mode)
+    assert not af(f)

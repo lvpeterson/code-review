@@ -292,6 +292,7 @@ class _Af:
     protect_why: list = field(default_factory=list)
     ignore: list = field(default_factory=list)             # [(file, line, firm)] global ignoring filters
     opaque: list = field(default_factory=list)             # [(call, reason)] MVC option calls that cannot be read
+    unresolved: list = field(default_factory=list)         # unresolved services calls that could add a filter
 
     def maybe_protect(self, why: str) -> None:
         if self.protect != "yes":
@@ -390,6 +391,7 @@ def _af_state(ctx: Ctx, pipe: Pipeline) -> _Af:
         if c.kind == "services" and c.name not in _NON_AUTHZ_EXTENSIONS and c.runs_in("Production") is not False:
             maybe = True
             st.cookie_why.append(f"{c.name} at {c.file}:{c.line} is not resolved and may register cookie authentication")
+            st.unresolved.append(f"{c.name} at {c.file}:{c.line} is not resolved and may register a global antiforgery filter")
     st.cookie = "yes" if present else "maybe" if maybe else "no"
     # -- global filters
     for c, conf in _mvc_option_calls(ctx, pipe):
@@ -423,6 +425,11 @@ def _merge_states(states: list[_Af]) -> _Af:
     """The state a route sees when its project has no pipeline of its own (a controllers library): cookies
     when any host has them, protection only when every host has it."""
     out = _Af()
+    if not states:      # controllers in a library with no host project in the scan: nothing to read
+        out.cookie = out.protect = "maybe"
+        out.cookie_why = ["no host project in the scan, so cookie authentication could not be read"]
+        out.protect_why = ["no host project in the scan, so global filters could not be read"]
+        return out
     out.cookie = ("yes" if any(s.cookie == "yes" for s in states)
                   else "maybe" if any(s.cookie == "maybe" for s in states) else "no")
     out.cookie_why = [w for s in states for w in s.cookie_why]
@@ -432,6 +439,7 @@ def _merge_states(states: list[_Af]) -> _Af:
         out.protect = "maybe"
         out.protect_why = [w for s in states for w in s.protect_why] or ["only some hosting projects add the filter"]
     out.ignore = [i for s in states for i in s.ignore]
+    out.unresolved = [u for s in states for u in s.unresolved]
     return out
 
 
@@ -482,9 +490,9 @@ def _form_bound(m) -> str:
         return "maybe"
     out = "no"
     for p in m.params:
-        simple = (p.type or "").split("<")[0].strip().rstrip("?").split(".")[-1].lower()
+        words = set(re.findall(r"\w+", (p.type or "").lower()))     # IFormFile[], List<IFormFile>, ...
         keys = {attr_key(a.name) for a in p.attributes}
-        if "fromform" in keys or simple in _FORM_TYPES:
+        if "fromform" in keys or words & _FORM_TYPES:
             return "yes"
         if "asparameters" in keys:
             out = "maybe"
@@ -522,6 +530,14 @@ def check_antiforgery(ctx: Ctx) -> None:
         verbs = {v.upper() for v in r.methods}
         env = _env_state(r.meta.get("env"))
         if ref.style in ("controller", "razorpage"):
+            if ref.type is None and ref.style == "razorpage":
+                # The PageModel was not found: a page-level directive is all there is to read.
+                if _route_policy(ctx, ref)[0] == "ignore" and env != "skip":
+                    add("DNL-CSRF-002", f"Antiforgery validation disabled on {r.handler_name}",
+                        f"{r.handler_name} ({r.path}) carries @attribute [IgnoreAntiforgeryToken], so its POST "
+                        "handlers skip token validation, but the page model could not be resolved to confirm "
+                        "which handlers exist.", ref, "REVIEW")
+                continue
             if ref.type is None or (ref.style == "controller" and ref.method is None):
                 continue
             pol, on_action = _route_policy(ctx, ref)
@@ -548,8 +564,10 @@ def check_antiforgery(ctx: Ctx) -> None:
                 add("DNL-CSRF-002", f"Antiforgery validation disabled on {r.handler_name}", desc, ref, conf)
             # CSRF-001: an MVC form post nothing protects. [ApiController] and Razor Pages validate on their own.
             if (ref.style == "controller" and not r.meta.get("api_surface") and pol is None and not firm_global
-                    and _explicit_mutating(ref) and st.cookie != "no" and st.protect != "yes"):
-                why = (st.cookie_why if st.cookie == "maybe" else []) + st.protect_why
+                    and _explicit_mutating(ref) and st.cookie != "no" and st.protect != "yes" and env != "skip"):
+                why = (st.cookie_why if st.cookie == "maybe" else []) + st.protect_why + st.unresolved
+                if env == "review":
+                    why.append("the controllers are mapped under an environment condition that is not plain Production")
                 desc = (f"{where} accepts a mutating request but no [ValidateAntiForgeryToken] covers it (action, "
                         "controller, base classes) and no global AutoValidateAntiforgeryTokenAttribute filter is "
                         "registered, while cookie authentication is in use, so another site can post to it with "
@@ -560,15 +578,22 @@ def check_antiforgery(ctx: Ctx) -> None:
                     desc, ref, "REVIEW" if why else None)
         elif ref.style == "minimalapi":
             calls = list(ref.endpoint_calls) + list(ref.convention_calls) + [c for g in ref.groups for c in g.calls]
-            if not any(call_name(c) == "DisableAntiforgery" for c in calls if isinstance(c, dict)):
+            direct = any(call_name(c) == "DisableAntiforgery" for c in calls if isinstance(c, dict))
+            # A convention this engine could not follow may be (or hide) a DisableAntiforgery call.
+            hidden = any("DisableAntiforgery" in u or "may change this endpoint's metadata" in u
+                         or "applied to the result of" in u for u in ref.unknown)
+            if not direct and not hidden:
                 continue
             form = _form_bound(ref.method)
             if form == "no" or st.cookie == "no" or env == "skip" or verbs <= {"GET", "HEAD", "OPTIONS"}:
                 continue
-            soft = (form == "maybe" or st.cookie == "maybe" or env == "review"
+            soft = (not direct or form == "maybe" or st.cookie == "maybe" or env == "review"
                     or any("DisableAntiforgery applied conditionally" in u for u in ref.unknown))
             desc = (f"{r.handler_name} ({', '.join(r.methods)} {r.path}) binds form data and calls "
                     "DisableAntiforgery(), so a page on another site can post to it with the visitor's cookies.")
+            if not direct:
+                desc = desc.replace("and calls DisableAntiforgery()", "and passes through a call that could not "
+                                    "be followed, which may be DisableAntiforgery()")
             if form == "maybe":
                 desc += " Its handler could not be read, so form binding is assumed."
             if st.cookie == "maybe":
