@@ -107,6 +107,8 @@ _EXT_SYM_RE = re.compile(T.EXTERNAL_SYM)
 _INCOMING_RE = re.compile(T.INCOMING_REQUEST_TEXT)
 _EXT_SYM_ONLY_RE = re.compile(T.EXTERNAL_SYM_ONLY_RE)
 _SAN_RES = [(s, re.compile(s.member)) for s in T.SANITIZERS]
+# A variable that holds an exception, by name (`ex`, `err`, `ioEx`, `sqlException`), for log-call argument order.
+_EXC_NAME_RE = re.compile(r"^(e|ex|exc|err|error|exception|[a-z]\w*(Ex|Exception))$")
 _GUARD = {g.shape: g for g in T.GUARDS}
 _REQUEST_PROP_RE = re.compile(r"(?i)^((this|me)\.)?((httpcontext\.current|context|page)\.)?request$")
 _HELPER_RES = [(h, re.compile(h.member)) for h in T.STRING_HELPERS]
@@ -392,12 +394,34 @@ class _Analysis:
         self.hits[k] = SinkHit(sink.kind, sink.name, self.t.file, line,
                                merge(old.taint, value) if old else value, self.method_name)
 
+    def _is_core_project(self) -> bool:
+        proj = self.model.project_of(self.t.file)
+        return proj is not None and proj.owner == "dotnet"
+
+    def _sink_applies(self, sink: T.Sink) -> bool:
+        """Rows tied to one family: `legacy_only` (System.Web) skips Core projects, `core_only` skips the rest."""
+        if sink.legacy_only or sink.core_only:
+            return self._is_core_project() == sink.core_only
+        return True
+
+    def _recv_gate_ok(self, sink: T.Sink, recv: Any) -> bool:
+        """`recv_gate`: the receiver must look like the sink's own object (declared Core type or receiver text),
+        for rows whose resolved sym names a generic type (`IDictionary.Add` on a response header dictionary)."""
+        if recv is None:
+            return False
+        if sink.recv_text and re.search(sink.recv_text, self._text(recv) or ""):
+            return True
+        return _simple(self.type_of(recv)) in {_simple(x) for x in sink.types if x.startswith("Microsoft.")}
+
     def _sink_matches(self, sink: T.Sink, member: str, sym: str | None, recv: Any, bare: bool) -> bool:
-        if sink.member.lower() != member.lower():
+        if sink.member.lower() != member.lower() or not self._sink_applies(sink):
             return False
         if sym:
             stype, smem = _split_sym(sym)
-            return smem.lower() == member.lower() and stype in sink.types
+            return (smem.lower() == member.lower() and stype in sink.types
+                    and (not sink.recv_gate or self._recv_gate_ok(sink, recv)))
+        if sink.recv_gate and not self._recv_gate_ok(sink, recv):
+            return False
         if sink.unresolved_ok and not bare:
             return True
         if recv is not None:
@@ -409,6 +433,46 @@ class _Analysis:
         if sink.derives and (recv is None or (self._text(recv) or "").lower() in ("this", "me", "base")):
             return self.model.derives_from(self.t, set(sink.derives))
         return False
+
+    # -- log message argument / content-type condition (Core sinks) -------------------------------
+
+    def _not_log_message(self, a: Any) -> bool:
+        """An argument that is certainly not the message template: LogLevel, EventId, an exception, null or a
+        number. An unknown-typed variable counts as an exception only when it is named like one."""
+        if not isinstance(a, dict):
+            return True
+        k = a.get("k")
+        if k == "lit":
+            return literal_str(a) is None
+        if k == "new":
+            tn = _simple(a.get("type_full") or a.get("type"))
+            return tn == "eventid" or tn.endswith("exception")
+        sym = a.get("sym") or ""
+        if sym.startswith("Microsoft.Extensions.Logging.LogLevel.") or re.search(r"(?i)(^|\.)loglevel\.\w+$", self._text(a)):
+            return True
+        tn = _simple(self.type_of(a))
+        if tn in ("eventid", "loglevel") or tn.endswith("exception"):
+            return True
+        return k == "name" and not tn and bool(_EXC_NAME_RE.match(a.get("id") or ""))
+
+    def _log_message_index(self, args: list, skip_first: bool) -> int | None:
+        """Index of the message-template argument: the first one that is not a level / event id / exception.
+        `skip_first` drops the logger of a static `LoggerExtensions.LogX(logger, ..)` call."""
+        for i, a in enumerate(args):
+            if i == 0 and skip_first:
+                continue
+            if not self._not_log_message(a):
+                return i
+        return None
+
+    @staticmethod
+    def _content_type_arg(call: dict, args: list, idx: int) -> Any:
+        if idx < len(args):
+            return args[idx]
+        for k, v in (call.get("named") or {}).items():
+            if k.lower() == "contenttype":
+                return v
+        return None
 
     def _arg_ok(self, sink: T.Sink, arg: Any) -> bool:
         """Path sinks take a string in arg slots that overloads reuse for streams / bytes."""
@@ -425,6 +489,17 @@ class _Analysis:
                 continue
             if not self._sink_matches(sink, name, call.get("sym"), recv, bare):
                 continue
+            if sink.ct_arg is not None and not T.html_content_type(self._content_type_arg(call, args, sink.ct_arg)):
+                continue
+            if sink.msg_arg:
+                # Only the message template is a sink; placeholder arguments are structured values.
+                i = self._log_message_index(args, bool(names & {"loggerextensions"}))
+                if i is not None and i < len(vals):
+                    self._record(sink, vals[i], call.get("line", 0))
+                for k, v in zip((call.get("named") or {}).keys(), nvals):
+                    if k.lower() in ("message", "state"):
+                        self._record(sink, v, call.get("line", 0))
+                continue
             # `Type.Member(recv, ..)`: only a receiver that names the sink's own type shifts the index
             static = sink.static_args is not None and bool(names & {_simple(x) for x in sink.types})
             idx = range(len(vals)) if sink.all_args else (sink.static_args if static else sink.args)
@@ -440,7 +515,7 @@ class _Analysis:
         tname = tf or e.get("type") or ""
         hit_type = False
         for sink in T.SINKS:
-            if sink.member != ".ctor":
+            if sink.member != ".ctor" or not self._sink_applies(sink):
                 continue
             if tf:
                 ok = tf in sink.types
@@ -459,7 +534,7 @@ class _Analysis:
     def _check_assign_sinks(self, member_name: str, sym: str | None, recv: Any, type_full: str | None,
                             value: Taint | None, line: int) -> None:
         for sink in T.SINKS:
-            if not sink.assign or sink.member.lower() != member_name.lower():
+            if not sink.assign or sink.member.lower() != member_name.lower() or not self._sink_applies(sink):
                 continue
             if sym:
                 stype, _ = _split_sym(sym)
@@ -468,6 +543,8 @@ class _Analysis:
                 ok = type_full in sink.types or _simple(type_full) in {_simple(x) for x in sink.types}
             else:
                 ok = self._sink_matches(sink, member_name, None, recv, False)
+            if ok and sink.recv_gate:
+                ok = self._recv_gate_ok(sink, recv)
             if ok:
                 self._record(sink, value, line)
 
@@ -843,7 +920,8 @@ class _Analysis:
                 if bare:
                     if not s.bare_ok:
                         continue
-                elif not (names & {_simple(x) for x in s.types}):
+                elif not (names & {_simple(x) for x in s.types}
+                          or (s.recv_text and re.search(s.recv_text, self._text(recv) or ""))):
                     continue
             if s.name == "ldap-escape":
                 # A project method merely named like an escaper must actually rewrite something.
@@ -1342,6 +1420,11 @@ class _Analysis:
                 self.env[self.key(text)] = value
                 self._note_write(text, value)
         elif k == "index":
+            # `Response.Headers["X"] = v`: an indexer assignment is the `Item` member of the receiver.
+            obj = target.get("obj")
+            if obj is not None:
+                self._check_assign_sinks("Item", target.get("sym"), obj,
+                                         None if target.get("sym") else self._assign_type(obj), value, line)
             text = self._text(target.get("obj"))
             if text:
                 kk = self.key(text)

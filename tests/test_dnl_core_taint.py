@@ -223,3 +223,141 @@ def test_model_binder_overrides_type_exclusions(app):
         return set(taint_solver.core_param_taint(model, SimpleNamespace(method=m, type=t, project=None)))
     assert taint([]) == set()
     assert taint([Attr("ModelBinder")]) == {0}
+
+
+# -- sinks and sanitizers -----------------------------------------------------------------------
+
+def _sink_handlers(findings, rule):
+    return {f.route.handler_name for f in findings if f.check_id == rule and f.route is not None}
+
+
+def _sink_hits(findings, rule, handler, path=None):
+    return _route_hits(findings, rule, handler, path)
+
+
+def _check_sinks(findings, skip=()):
+    """One assertion per action, shared by the helper and degraded runs. `skip` names entries a mode cannot
+    decide (with the reason at the call site)."""
+    def pos(rule, handler=None, path=None):
+        if (rule, handler or path) in skip:
+            return
+        assert _sink_hits(findings, rule, handler, path), (rule, handler or path)
+
+    def neg(rule, handler):
+        if (rule, handler) in skip:
+            return
+        assert not _sink_hits(findings, rule, f"SinkController.{handler}"), (rule, handler)
+
+    for h in ("RawConcat", "RawInterp", "Exec", "SqlCmd"):
+        pos("DNL-INJ-001", f"SinkController.{h}")
+    for h in ("Interp", "FromSqlSafe"):
+        neg("DNL-INJ-001", h)
+    pos("DNL-REDIR-001", "SinkController.Go")
+    pos("DNL-REDIR-001", path="/m/r")
+    for h in ("GoLocal", "GoGuarded"):
+        neg("DNL-REDIR-001", h)
+    pos("DNL-PATH-001", "SinkController.FileGet")
+    neg("DNL-PATH-001", "FileSafe")
+    for h in ("Hdr", "Cookie"):
+        pos("DNL-INJ-005", f"SinkController.{h}")
+    for h in ("LogInterp", "LogConcat"):
+        pos("DNL-LOG-001", f"SinkController.{h}")
+    neg("DNL-LOG-001", "LogTemplate")
+    pos("DNL-XSS-001", "SinkController.Html")
+    pos("DNL-XSS-001", path="/m/c")
+    pos("DNL-XSS-001", path="/m/w")
+    for h in ("JsonOk", "Encoded"):
+        neg("DNL-XSS-001", h)
+    pos("DNL-SSRF-001", "SinkController.Fetch")
+
+
+def test_ef_core_raw_sql(app):
+    for h in ("RawConcat", "RawInterp", "Exec", "SqlCmd"):
+        assert _sink_hits(app[1], "DNL-INJ-001", f"SinkController.{h}"), h
+    for h in ("Interp", "FromSqlSafe"):
+        assert not _sink_hits(app[1], "DNL-INJ-001", f"SinkController.{h}"), h
+
+
+def test_redirects(app):
+    assert _sink_hits(app[1], "DNL-REDIR-001", "SinkController.Go")
+    assert _route_hits(app[1], "DNL-REDIR-001", path="/m/r")
+    for h in ("GoLocal", "GoGuarded"):
+        assert not _sink_hits(app[1], "DNL-REDIR-001", f"SinkController.{h}"), h
+
+
+def test_paths(app):
+    assert _sink_hits(app[1], "DNL-PATH-001", "SinkController.FileGet")
+    assert not _sink_hits(app[1], "DNL-PATH-001", "SinkController.FileSafe")
+
+
+def test_headers_and_cookies(app):
+    for h in ("Hdr", "Cookie"):
+        assert _sink_hits(app[1], "DNL-INJ-005", f"SinkController.{h}"), h
+
+
+def test_logging_templates(app):
+    for h in ("LogInterp", "LogConcat"):
+        assert _sink_hits(app[1], "DNL-LOG-001", f"SinkController.{h}"), h
+    assert not _sink_hits(app[1], "DNL-LOG-001", "SinkController.LogTemplate")
+
+
+def test_html_results(app):
+    assert _sink_hits(app[1], "DNL-XSS-001", "SinkController.Html")
+    for p in ("/m/c", "/m/w"):
+        assert _route_hits(app[1], "DNL-XSS-001", path=p), p
+    for h in ("JsonOk", "Encoded"):
+        assert not _sink_hits(app[1], "DNL-XSS-001", f"SinkController.{h}"), h
+
+
+def test_ssrf_request_message(app):
+    assert _sink_hits(app[1], "DNL-SSRF-001", "SinkController.Fetch")
+
+
+def test_all_sinks_helper(app):
+    _check_sinks(app[1])
+
+
+def test_degraded_sinks(degraded_app):
+    _check_sinks(degraded_app[1])
+
+
+def test_content_type_condition():
+    from checks.dnl import taint_tables as T
+    assert T.html_content_type(None) is False
+    assert T.html_content_type({"k": "lit", "v": "text/html; charset=utf-8"}) is True
+    assert T.html_content_type({"k": "lit", "v": "application/json"}) is False
+    assert T.html_content_type({"k": "name", "id": "ct"}) is True
+
+
+def test_core_request_member_rows_resolve(app):
+    # Extra request-derived members must be sources, not merely unmatched syms (R2).
+    for sym in ("Microsoft.AspNetCore.Http.HttpRequest.Protocol", "Microsoft.AspNetCore.Http.HttpRequest.ContentLength",
+                "Microsoft.AspNetCore.Http.Extensions.UriHelper.GetDisplayUrl",
+                "Microsoft.AspNetCore.Http.Extensions.UriHelper.GetEncodedUrl",
+                "Microsoft.AspNetCore.Http.Extensions.UriHelper.GetEncodedPathAndQuery",
+                "Microsoft.AspNetCore.Http.HeaderDictionaryTypeExtensions.GetTypedHeaders",
+                "Microsoft.AspNetCore.Http.IFormFile.Length", "Microsoft.AspNetCore.Http.IFormFile.ContentDisposition"):
+        from checks.dnl import taint
+        assert any(sr.match(sym) for _s, sr, _t in taint._SOURCE_RES), sym
+
+
+def _check_sink_extras(findings):
+    def has(rule, handler):
+        return bool(_route_hits(findings, rule, f"SinkExtraController.{handler}"))
+    # The message template is the sink, whatever precedes it; placeholder arguments never are.
+    assert has("DNL-LOG-001", "LogEx") and not has("DNL-LOG-001", "LogExTemplate")
+    # Content: no content type is text/plain, a MediaTypeNames constant that is not HTML is known.
+    assert not has("DNL-XSS-001", "ContentPlain") and not has("DNL-XSS-001", "ContentMedia")
+    assert has("DNL-INJ-005", "HdrAppend") and not has("DNL-INJ-005", "DictAdd")
+    assert has("DNL-XSS-001", "HtmlStr") and not has("DNL-XSS-001", "UrlEnc")
+    assert has("DNL-REDIR-001", "RespRedirect") and has("DNL-REDIR-001", "NewRedirect")
+    for h in ("DisplayUrl", "Protocol"):
+        assert has("DNL-INJ-002", h), h
+
+
+def test_sink_extras(app):
+    _check_sink_extras(app[1])
+
+
+def test_sink_extras_degraded(degraded_app):
+    _check_sink_extras(degraded_app[1])
