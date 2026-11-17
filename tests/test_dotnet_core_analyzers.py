@@ -53,8 +53,8 @@ def _by_handler(results, check_id, handler):
 # -- detector ------------------------------------------------------------------
 
 def test_detector():
-    for root, fw in ((CONTROLLERS, ["controllers", "config"]), (RAZOR, ["razorpages", "config"]),
-                     (MINIMAL, ["minimalapi", "config"]), (MIXED, ["controllers", "config"])):
+    for root, fw in ((CONTROLLERS, ["controllers", "config", "deps"]), (RAZOR, ["razorpages", "config", "deps"]),
+                     (MINIMAL, ["minimalapi", "config", "deps"]), (MIXED, ["controllers", "config", "deps"])):
         assert core_detector.detect_language(root), root
         assert core_detector.detect_frameworks(root) == fw, root
     assert legacy_detector.detect_language(MIXED)
@@ -81,7 +81,7 @@ def test_detector_loose_core_source(tmp_path):
 def test_analyzers_split_routes(roslyn_helper):
     results = _dotnet(MINIMAL)
     by_fw = {r.framework: r for r in results}
-    assert set(by_fw) == {"minimalapi", "config"}
+    assert set(by_fw) == {"minimalapi", "config", "deps"}
     assert {"/api/orders/{id}", "/chat"} <= {r.path for r in by_fw["minimalapi"].routes}
     assert by_fw["config"].routes == []
     assert all(r.language == "dotnet" and not r.degraded for r in results)
@@ -192,8 +192,8 @@ def test_detector_enables_minimalapi_for_any_map_call(tmp_path):
         shutil.copytree(CONTROLLERS, root)
         prog = root / "Program.cs"
         prog.write_text(prog.read_text().replace("app.Run();", call + "\napp.Run();"))
-        assert core_detector.detect_frameworks(root) == ["controllers", "minimalapi", "config"], call
-    assert core_detector.detect_frameworks(CONTROLLERS) == ["controllers", "config"]
+        assert core_detector.detect_frameworks(root) == ["controllers", "minimalapi", "config", "deps"], call
+    assert core_detector.detect_frameworks(CONTROLLERS) == ["controllers", "config", "deps"]
 
 
 def test_route_of_unrunning_analyzer_is_not_dropped(roslyn_helper, tmp_path):

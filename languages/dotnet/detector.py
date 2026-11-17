@@ -9,10 +9,10 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from checks.dnl import project
+from checks.dnl import project, rules_sca_core
 from checks.dnl.files import iter_dnl_files, read_source
 
-_FRAMEWORK_ORDER = ["controllers", "razorpages", "minimalapi", "config"]
+_FRAMEWORK_ORDER = ["controllers", "razorpages", "minimalapi", "config", "deps"]
 # `[ApiController]`, `[ApiController, Route(..)]`, `[Route(..), ApiController]`; the base-list form allows a
 # primary constructor (`class T(ILogger<T> log) : ControllerBase`).
 _CONTROLLER = re.compile(r"[\[,]\s*(?:[\w.]+\.)?(?:ApiController|Controller)(?:Attribute)?\s*[\],(]"
@@ -49,6 +49,31 @@ def _owning(projects: list[project.Project], path: Path) -> project.Project | No
     return next((p for p in projects if p.path is None), None)
 
 
+_LIB_DIRS = {"lib", "libs", "scripts", "content"}
+
+
+def _has_deps(target: Path, all_projects: list[project.Project], core: list[project.Project]) -> bool:
+    """Something for the offline SCA to judge: package references, an end-of-support target framework,
+    a packages.lock.json beside a project file, or bundled JS below a project's lib/scripts folder."""
+    eol = rules_sca_core.eol_tfms()
+    if any(p.packages or any(rules_sca_core._norm_tfm(t) in eol for t in p.target_frameworks) for p in core):
+        return True
+    core_ids = {id(p) for p in core}
+    for f in iter_dnl_files(target, (".js", ".json")):
+        js = f.suffix.lower() == ".js"
+        if not js and f.name.lower() != "packages.lock.json":
+            continue
+        owner = _owning(all_projects, f)
+        if owner is None or id(owner) not in core_ids:
+            continue
+        if not js:
+            if f.parent.resolve() == owner.dir.resolve():
+                return True
+        elif any(part.lower() in _LIB_DIRS for part in f.resolve().relative_to(owner.dir.resolve()).parts[:-1]):
+            return True
+    return False
+
+
 def detect_frameworks(target_path: Path) -> list[str]:
     target = target_path.resolve()
     all_projects = project.load_projects(target)
@@ -72,4 +97,6 @@ def detect_frameworks(target_path: Path) -> list[str]:
         owner = _owning(all_projects, f)
         if owner is not None and id(owner) in core_dirs and _PAGE_DIRECTIVE.match(_read(f)):
             found.add("razorpages")
+    if _has_deps(target, all_projects, core):
+        found.add("deps")
     return [f for f in _FRAMEWORK_ORDER if f in found]

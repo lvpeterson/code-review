@@ -46,6 +46,7 @@ MIXED_LEGACY_FINDINGS = [
     ("DNL-AUTHZ-001", "Legacy/Controllers/HomeController.cs", 13),
     ("DNL-CSRF-001", "Legacy/Controllers/HomeController.cs", 13),
     ("DNL-LOG-002", "Legacy/Legacy.csproj", 1),
+    ("DNL-SCA-002", "Framework/Scripts/jquery.js", 1),
 ]
 MIXED_LEGACY_FRAMEWORKS = ["deps", "mvc"]
 

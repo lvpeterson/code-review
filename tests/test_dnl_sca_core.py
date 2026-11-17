@@ -286,3 +286,121 @@ def test_package_without_textual_reference_falls_back_to_line_1(tmp_path):
     # No textual reference: the id is only known lower-cased (Project.packages keys).
     hits = _by(findings, "DNL-SCA-001")
     assert len(hits) == 1 and "system.net.http 4.3.0" in hits[0].title and hits[0].file == "A.csproj" and hits[0].line == 1
+
+
+def test_lock_file_below_project_not_beside_csproj_is_a_note(tmp_path):
+    root = _copy(tmp_path)
+    stray = root / "samples" / "vendored"
+    stray.mkdir(parents=True)
+    (stray / "packages.lock.json").write_text(json.dumps({"version": 1, "dependencies": {}}), encoding="utf-8")
+    _, notes = _run(root)
+    want = "samples/vendored/packages.lock.json: packages.lock.json is not next to a project file; ignored"
+    assert notes.count(want) == 1
+
+
+# -- end to end: detector, analyzer, owner routing ---------------------------
+
+import enumerator  # noqa: E402
+from languages.dotnet import detector as core_detector  # noqa: E402
+
+FXROOT = Path(__file__).parent / "fixtures" / "aspnetcore"
+MIXED = FXROOT / "mixed_solution"
+CONTROLLERS_API = FXROOT / "controllers_api"
+
+
+def _core_project(tmp_path, body="", tfm="net10.0") -> Path:
+    (tmp_path / "A.csproj").write_text(
+        f'<Project Sdk="Microsoft.NET.Sdk.Web"><PropertyGroup><TargetFramework>{tfm}</TargetFramework>'
+        f"</PropertyGroup>{body}</Project>", encoding="utf-8")
+    return tmp_path
+
+
+def test_detector_registers_deps(tmp_path):
+    assert core_detector.detect_frameworks(FX)[-2:] == ["config", "deps"]
+    # Whether controllers_api gets it is decided by what its project file says.
+    csproj = "".join(p.read_text(encoding="utf-8") for p in CONTROLLERS_API.glob("*.csproj"))
+    expect = "PackageReference" in csproj or any(t in csproj for t in rules_sca_core.eol_tfms())
+    assert ("deps" in core_detector.detect_frameworks(CONTROLLERS_API)) == expect
+    # Nothing to judge: supported TFM, no packages, no lock file, no JS.
+    assert core_detector.detect_frameworks(_core_project(tmp_path)) == ["config"]
+
+
+@pytest.mark.parametrize("what", ["package", "lock", "js", "eol"])
+def test_detector_deps_triggers(tmp_path, what):
+    root = _core_project(tmp_path, tfm="net6.0" if what == "eol" else "net10.0",
+                         body='<ItemGroup><PackageReference Include="X" Version="1.0.0" /></ItemGroup>'
+                         if what == "package" else "")
+    if what == "lock":
+        (root / "packages.lock.json").write_text("{}", encoding="utf-8")
+    if what == "js":
+        (root / "wwwroot" / "lib").mkdir(parents=True)
+        (root / "wwwroot" / "lib" / "a.js").write_text("//", encoding="utf-8")
+    assert core_detector.detect_frameworks(root) == ["config", "deps"]
+
+
+def test_detector_deps_ignores_js_outside_lib_dirs_and_build_output(tmp_path):
+    root = _core_project(tmp_path)
+    (root / "wwwroot" / "js").mkdir(parents=True)
+    (root / "wwwroot" / "js" / "site.js").write_text("//", encoding="utf-8")
+    (root / "bin" / "lib").mkdir(parents=True)
+    (root / "bin" / "lib" / "a.js").write_text("//", encoding="utf-8")
+    assert core_detector.detect_frameworks(root) == ["config"]
+
+
+def test_deps_end_to_end():
+    results = [r for r in enumerator.enumerate_target(FX, allow_degraded=True) if r.language == "dotnet"]
+    deps = [r for r in results if r.framework == "deps"]
+    assert len(deps) == 1 and deps[0].routes == []
+    ids = {f.check_id for f in deps[0].findings}
+    assert {"DNL-SCA-001", "DNL-SCA-002", "DNL-SCA-003", "DNL-SCA-006"} <= ids
+    model = project.get_model(FX, "dotnet")
+    assert deps[0].degraded == model.degraded
+    assert any("end-of-support dates verified" in n for r in results for n in r.notes)
+
+
+def test_deps_crash_becomes_a_note(monkeypatch):
+    def boom(model):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(rules_sca_core, "check", boom)
+    results = [r for r in enumerator.enumerate_target(FX, allow_degraded=True) if r.language == "dotnet"]
+    deps = next(r for r in results if r.framework == "deps")
+    assert deps.findings == []
+    assert any("rules_sca_core failed (RuntimeError: boom)" in n for n in deps.notes)
+
+
+def test_route_less_findings_never_go_to_deps(monkeypatch):
+    """A route-less AUTHZ finding lands in config; without config, in the first route analyzer; never deps."""
+    from checks.dnl import rules_auth_core
+    from checks.dnl.findings import dnl_finding
+    from languages.dotnet import analyzers
+    real = rules_auth_core.check
+    monkeypatch.setattr(rules_auth_core, "check", lambda m, refs: real(m, refs) + [
+        dnl_finding("DNL-AUTHZ-001", "high", "route-less", "d", "x.cs", 1)])
+    model = project.get_model(CONTROLLERS_API, "dotnet")
+    for running, owner in ((["controllers", "config", "deps"], "config"),
+                           (["controllers", "deps"], "controllers"),
+                           (["deps", "controllers"], "controllers"),
+                           (["deps"], "config")):
+        model.cache.pop("code_results", None)
+        (model.parent or model).cache.setdefault("running", {})["dotnet"] = running
+        res = analyzers._code_results(model)
+        placed = [k for k, (_r, fs) in res.items() if any(f.title == "route-less" for f in fs)]
+        assert placed == [owner], running
+        assert "deps" not in res, running
+
+
+def test_mixed_solution_each_file_once(tmp_path):
+    root = tmp_path / "mixed"
+    shutil.copytree(MIXED, root)
+    for rel in ("Modern/bin/Debug/wwwroot/lib/jquery", "Modern/obj/lib/jquery", "Framework/bin/Scripts",
+                "Modern/node_modules/x/lib"):
+        d = root / rel
+        d.mkdir(parents=True)
+        shutil.copy(MIXED / "Modern/wwwroot/lib/jquery/jquery.js", d / "jquery.js")
+    results = enumerator.enumerate_target(root, allow_degraded=True)
+
+    def js(language):
+        return sorted(f.file for r in results if r.language == language and r.framework == "deps"
+                      for f in r.findings if f.check_id == "DNL-SCA-002")
+    assert js("dotnet_legacy") == ["Framework/Scripts/jquery.js"]
+    assert js("dotnet") == ["Modern/wwwroot/lib/jquery/jquery.js"]

@@ -21,6 +21,7 @@ config and dependency rules for Core come later.
 | `razorpages` | a `.cshtml` with `@page` under a `Pages` folder | one route per page handler |
 | `minimalapi` | a `MapGet/Post/Put/Patch/Delete/Methods/Group/Hub/GrpcService/HealthChecks/Fallback` call, or `.Map("...")` | minimal API endpoints, SignalR hubs, gRPC services, health checks, fallbacks, OpenAPI endpoints |
 | `config` | always, once the language is detected | no routes; route-less findings (never-denying handlers / policies / filters, middleware order) |
+| `deps` | a netcore project with package references, a `packages.lock.json` beside it, bundled JS under a `lib` / `libs` / `scripts` / `content` folder, or an end-of-support target framework | no routes; offline SCA (DNL-SCA-001/002/003/006, plus the shared packages.config / HintPath / nuget.config checks) |
 
 Route-less findings go to `config`; if `config` is not enumerated, the first
 enumerated analyzer reports them.

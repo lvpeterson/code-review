@@ -84,6 +84,9 @@ def _read_locks(model: ProjectModel, projects: list[Project], notes: list[str]) 
             continue
         here = path.parent.resolve()
         if here not in dirs:
+            # A lock file below a project (a sample or vendored tree) is not NuGet's own: say so.
+            if any(here.is_relative_to(d) for d in dirs):
+                notes.append(f"{model.rel(path)}: packages.lock.json is not next to a project file; ignored")
             continue
         owner = here
         rel = model.rel(path)

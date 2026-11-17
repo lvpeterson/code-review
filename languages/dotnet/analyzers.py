@@ -12,7 +12,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from checks.dnl import project, routes_core, rules_auth_core
+from checks.dnl import project, routes_core, rules_auth_core, rules_sca_core
 from checks.dnl.project import ProjectModel
 from core.base import BaseFrameworkAnalyzer
 from core.models import Finding, Route, ScanResult
@@ -20,6 +20,7 @@ from core.registry import register
 from languages.dotnet import detector
 
 _KINDS = ("controllers", "razorpages", "minimalapi", "config")
+_ROUTELESS = ("config", "deps")   # analyzers that never take routes or route-less code findings
 # route.meta["kind"] -> analyzer
 _KIND_OWNER = {"controller": "controllers", "razorpage": "razorpages", "minimalapi": "minimalapi",
                "hub": "minimalapi", "grpc": "minimalapi", "blazor": "minimalapi", "health": "minimalapi",
@@ -69,10 +70,11 @@ def _code_results(model: ProjectModel) -> dict[str, tuple[list[Route], list[Find
         want = _KIND_OWNER.get(kind, "minimalapi")
         if want in running or not running:
             return want
-        return next((k for k in running if k != "config"), "config")
+        return next((k for k in running if k not in _ROUTELESS), "config")
 
     # Route-less findings go to config; without it, the first analyzer that runs takes them.
-    fallback = "config" if "config" in running or not running else running[0]
+    fallback = "config" if "config" in running or not running else next(
+        (k for k in running if k not in _ROUTELESS), "config")
     for ref in refs:
         out[owner_of(ref.route.meta["kind"])][0].append(ref.route)
     for f in findings:
@@ -129,3 +131,30 @@ class MinimalApiAnalyzer(_CoreAnalyzer):
 class ConfigAnalyzer(_CoreAnalyzer):
     """Route-less findings; also takes routes when no route analyzer runs."""
     framework = "config"
+
+
+@register("dotnet", "deps")
+class DepsAnalyzer(_CoreAnalyzer):
+    """Offline SCA for SDK projects (PackageReference, lock file, end-of-support frameworks, wwwroot
+    libraries); needs no IR, so it also runs in degraded mode. Has no routes."""
+    framework = "deps"
+
+    def __init__(self, target_path: Path):
+        super().__init__(target_path)
+        self._notes: list[str] = []
+
+    def find_routes(self) -> list[Route]:
+        return []
+
+    def run_baseline_checks(self, routes_: list[Route]) -> list[Finding]:
+        try:
+            findings, self._notes = rules_sca_core.check(self.model)
+        except Exception as exc:  # noqa: BLE001
+            self._notes = [f"rules_sca_core failed ({type(exc).__name__}: {exc}); its findings are missing"]
+            return []
+        return findings
+
+    def analyze(self) -> ScanResult:
+        result = super().analyze()
+        result.notes += self._notes
+        return result
