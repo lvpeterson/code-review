@@ -22,6 +22,8 @@ app.MapPost("/m/ctx", (HttpContext c) => Process.Start("tool", c.Request.Form["f
 app.MapGet("/m/r", (string u) => Results.Redirect(u));
 app.MapGet("/m/c", (string s) => Results.Content(s, "text/html"));
 app.MapGet("/m/w", async (HttpContext c, string s) => await c.Response.WriteAsync(s));
+app.MapPost("/m/orders", (Order o, AppDb db) => { db.Orders.Add(o); db.SaveChanges(); return Results.Ok(); });
+app.MapGet("/m/users/{id}", (int id, AppDb db) => db.Users.Find(id));
 app.Run();
 
 static class Helpers
