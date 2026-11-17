@@ -11,7 +11,14 @@ non-literal expression is reported for review (low, `confidence="REVIEW"`).
 Literal-only and encoded outputs never fire, nor does a single allowlisted framework helper call
 with constant arguments (`Url.Content("~/x")`, `Html.Partial("_Nav")`, `Scripts.Render(..)`).
 
-XSS-004 flags the places request validation is switched off in code:
+ASP.NET Core: an MVC controller links to its views by convention (`Views/<Controller>/<Action>`,
+`[Area]`, `Views/Shared`), a Razor Page to its own .cshtml. A controller action is evaluated with
+the Core binding rules (DI services are not request input). For a page, `Model.X` is proven when
+the property `X` carries request input after the handler replay: a `[BindProperty]` source for
+that verb (`SupportsGet` for GET) or a value the handler writes into it.
+
+XSS-004 flags the places request validation is switched off in code (System.Web.Mvc only, so
+never on Core):
 `[AllowHtml]` on a property of a type bound as an action parameter,
 `[ValidateInput(false)]` on an action or controller, and any `Request.Unvalidated` read.
 """
@@ -23,6 +30,7 @@ from pathlib import Path
 from checks.dnl import taint, taint_solver, templates
 from checks.dnl.findings import dnl_finding
 from checks.dnl.ir import has_attr, receiver_text, walk
+from checks.dnl.taint import merge
 from core.models import Finding
 
 # `Request` read directly, optionally qualified by this / Me / Page / Context / HttpContext(.Current) /
@@ -33,6 +41,7 @@ _REQUEST_REF = re.compile(
 _VIEWBAG = re.compile(r"\bViewBag\s*\.\s*(\w+)", re.IGNORECASE)
 _VIEWDATA = re.compile(r"\bViewData\s*(?:\[\s*\"([^\"]+)\"\s*\]|\.\s*(\w+))", re.IGNORECASE)
 _MODEL = re.compile(r"(?<![\w.])Model\b", re.IGNORECASE)
+_MODEL_MEMBER = re.compile(r"(?<![\w.])Model\s*\.\s*(\w+)", re.IGNORECASE)
 _IDENT = re.compile(r"[A-Za-z_]\w*")
 _SEV = {"high": 2, "medium": 1, "low": 0}
 
@@ -61,12 +70,30 @@ class _Actions:
     def result(self, ref):
         key = id(ref.method)
         if key not in self.cache:
+            from checks.dnl.routes_core import CoreRouteRef
             decl = self.owner.get(key, ref.type)
             ft = taint_solver._type_field_taint(self.model, decl, self.state["ft"])
-            self.cache[key] = taint.analyze_method(
-                self.model, decl, ref.method, param_taint=taint_solver._entry_taint(self.model, decl, ref.method),
-                field_taint=ft, summaries=self.state["summaries"])
-        return self.cache[key]
+            if isinstance(ref, CoreRouteRef):
+                # Same entry replay as taint_solver.entry_hits: Core binding rules + [BindProperty] seeds.
+                ptaint = taint_solver.core_param_taint(self.model, ref)
+                bound = taint_solver._bound_origins(self.model, decl, ref.method, ref.project)
+                ft = {**ft, **{k: merge(ft.get(k), v) for k, v in bound.items()}}
+            else:
+                ptaint = taint_solver._entry_taint(self.model, decl, ref.method)
+            res = taint.analyze_method(self.model, decl, ref.method, param_taint=ptaint, field_taint=ft,
+                                       summaries=self.state["summaries"])
+            props: dict[str, object] = {}
+            for src in (ft, res.field_out):
+                for k, v in src.items():
+                    k = k.lower().removeprefix("this.")
+                    props[k] = merge(props.get(k), v)
+            self.cache[key] = (res, props)
+        return self.cache[key][0]
+
+    def page_props(self, ref) -> dict[str, object]:
+        """Razor Page: lowercased PageModel property -> taint after the handler replay."""
+        self.result(ref)
+        return self.cache[id(ref.method)][1]
 
 
 def _viewbag_taint(res, expr: str):
@@ -81,6 +108,15 @@ def _viewbag_taint(res, expr: str):
         v = env.get("viewdata")
         if _tainted(v):
             return v
+    return None
+
+
+def _page_taint(props: dict, expr: str):
+    """Taint of the PageModel properties the expression reads through `Model` (a bare `Model` reads any)."""
+    names = [m.lower() for m in _MODEL_MEMBER.findall(expr)]
+    for k in names or list(props):
+        if _tainted(props.get(k)):
+            return props[k]
     return None
 
 
@@ -114,12 +150,21 @@ def _template_findings(model, refs) -> list[Finding]:
                 proof = (linked[0] if linked else page, "request data read in the template")
             else:
                 for ref in linked:
+                    if ref.method is None:
+                        continue       # a page without handlers: nothing to replay
                     res = actions.result(ref)
                     v = _viewbag_taint(res, o.expr)
                     if v is not None:
                         proof = (ref, f"{_first_source(v)} via ViewBag/ViewData")
                         break
-                    if _MODEL.search(o.expr) and _tainted(res.view_model):
+                    if not _MODEL.search(o.expr):
+                        continue
+                    if ref.route.meta.get("kind") == "razorpage":
+                        v = _page_taint(actions.page_props(ref), o.expr)
+                        if v is not None:
+                            proof = (ref, f"{_first_source(v)} via the page model")
+                            break
+                    elif _tainted(res.view_model):
                         proof = (ref, f"{_first_source(res.view_model)} via the view model")
                         break
             if proof is not None:
@@ -228,4 +273,9 @@ def _validation_findings(model, refs) -> list[Finding]:
 
 
 def check(model, refs: list) -> list[Finding]:
-    return _template_findings(model, refs) + _validation_findings(model, refs)
+    from checks.dnl.routes_core import CoreRouteRef
+    out = _template_findings(model, refs)
+    # AllowHtml / ValidateInput / Request.Unvalidated are System.Web.Mvc concepts.
+    if not any(isinstance(r, CoreRouteRef) for r in refs):
+        out += _validation_findings(model, refs)
+    return out

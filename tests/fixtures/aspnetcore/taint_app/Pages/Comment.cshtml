@@ -1,3 +1,5 @@
 @page
 @model CommentModel
 <p>@Model.Text</p>
+<p>@Html.Raw(Model.Text)</p>
+<p>@(new Microsoft.AspNetCore.Html.HtmlString(Model.Q))</p>

@@ -659,7 +659,7 @@ def discover_pages(model: ProjectModel) -> list[CoreRouteRef]:
         if page.area:
             path = _join(page.area, path)
         path = strip_constraints(path)
-        meta: dict = {"kind": "razorpage", "api_surface": False, "page": name}
+        meta: dict = {"kind": "razorpage", "api_surface": False, "page": name, "page_file": page.rel}
         if page.area:
             meta["area"] = page.area
         if page.attributes:

@@ -760,7 +760,8 @@ class _Analysis:
             return False
         sym = call.get("sym")
         if sym:
-            return sym.lower().startswith("system.web.mvc.controller.")
+            low = sym.lower()
+            return low.startswith(("system.web.mvc.controller.", "microsoft.aspnetcore.mvc.controller."))
         if not self.model.derives_from(self.t, {"Controller"}):
             return False
         chain = [self.t] + [bt for b in self.model.base_chain(self.t) for bt in self.model.find_types(b)]
