@@ -204,6 +204,10 @@ public class ADocController : ControllerBase
     { var o = db.Docs.Find(id); var r = await authz.AuthorizeAsync(User, o, "p"); if (r.Succeeded) return Ok(o); if (flag) return Forbid(); return Ok(o); }
     [HttpGet("u3/{id}")] public async Task<IActionResult> CondElse(int id, bool flag)
     { var o = db.Docs.Find(id); var r = await authz.AuthorizeAsync(User, o, "p"); if (r.Succeeded) { Audit(); } else { if (flag) return Forbid(); } return Ok(o); }
+    [HttpGet("u4/{id}")] public async Task<IActionResult> BareBlock(int id)
+    { var o = db.Docs.Find(id); var r = await authz.AuthorizeAsync(User, o, "p"); if (!r.Succeeded) { Forbid(); } return Ok(o); }
+    [HttpGet("u5/{id}")] public async Task<IActionResult> BareStmt(int id)
+    { var o = db.Docs.Find(id); var r = await authz.AuthorizeAsync(User, o, "p"); if (!r.Succeeded) Forbid(); return Ok(o); }
     private void Audit() { }
 }
 public class FormBodyController : Controller
@@ -269,7 +273,7 @@ def test_authz_result_must_gate_a_rejection(tmp_path, monkeypatch):
     idor = on(rules_object.check(model, refs), "DNL-AUTHZ-005")
     # A null-check NotFound next to an AuthorizeAsync whose failure rejects nothing is no guard.
     assert {"ADocController.NullOnly", "ADocController.Unknown", "ADocController.CondFollow",
-            "ADocController.CondElse"} <= idor
+            "ADocController.CondElse", "ADocController.BareBlock", "ADocController.BareStmt"} <= idor
     for ok in ("Pos", "Neg", "Else", "Inline", "Um"):
         assert f"ADocController.{ok}" not in idor, ok
     project._CACHE.clear()
@@ -383,3 +387,12 @@ def test_identity_multiline_bases_and_member_variants(tmp_path, monkeypatch):
     assert {"RolesController.R", "RolesController.S", "RolesController.T", "RolesController.K"} <= exposed
     assert "RolesController.P" not in exposed
     project._CACHE.clear()
+
+
+def test_unknown_authz_condition_is_no_guard(app):
+    # `if (r == null) return NotFound();` after AuthorizeAsync: the result's failure rejects nothing.
+    assert "OrdersController.Probe" in on(app[2], "DNL-AUTHZ-005")
+
+
+def test_unknown_authz_condition_is_no_guard_degraded(degraded_app):
+    assert "OrdersController.Probe" in on(degraded_app[2], "DNL-AUTHZ-005")

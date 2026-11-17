@@ -340,12 +340,11 @@ def _stmts(x) -> list:
 
 
 def _rejection_stmt(st: dict) -> bool:
-    """A statement that denies by itself: a throw, or a return of a rejecting call / new (not a ternary)."""
+    """A statement that denies by itself: a throw, or a return of a rejecting call / new (not a ternary).
+    A bare `Forbid();` statement only builds a result that is thrown away, so it denies nothing."""
     if st.get("k") == "throw":
         return True
-    v = st.get("value") if st.get("k") == "return" else st
-    if st.get("k") == "expr":
-        v = st.get("expr")
+    v = st.get("value") if st.get("k") == "return" else None
     return isinstance(v, dict) and v.get("k") in ("call", "new") and _rejects(v)
 
 
