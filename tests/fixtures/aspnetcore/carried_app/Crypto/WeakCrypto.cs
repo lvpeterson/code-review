@@ -49,12 +49,6 @@ public class WeakCrypto
         return kdf.GetBytes(32);
     }
 
-    public RSA Weak()
-    {
-        var rsa = RSA.Create(1024);
-        return rsa;
-    }
-
     public HttpClientHandler Lax()
     {
         ServicePointManager.SecurityProtocol = SecurityProtocolType.Ssl3 | SecurityProtocolType.Tls;

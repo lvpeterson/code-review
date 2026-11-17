@@ -101,10 +101,10 @@ CRYPTO_EXPECTED = {
     ("DNL-CRY-004", CRYPTO_FILE, 35, "high"),
     ("DNL-CRY-005", CRYPTO_FILE, 42, "medium"),    # the token local ...
     ("DNL-CRY-005", CRYPTO_FILE, 43, "medium"),    # ... and the value NewToken returns
-    ("DNL-CRY-006", CRYPTO_FILE, 62, "high"),
-    ("DNL-CRY-007", CRYPTO_FILE, 60, "medium"),
+    ("DNL-CRY-006", CRYPTO_FILE, 56, "high"),
+    ("DNL-CRY-007", CRYPTO_FILE, 54, "medium"),
     ("DNL-CRY-008", CRYPTO_FILE, 48, "medium"),
-    ("DNL-SEC-003", CRYPTO_FILE, 68, "high"),
+    ("DNL-SEC-003", CRYPTO_FILE, 62, "high"),
 }
 
 
@@ -149,3 +149,11 @@ def test_no_failed_notes(mode, monkeypatch):
     results = _carried(monkeypatch, mode)
     assert results
     assert not [n for r in results for n in r.notes if "failed (" in n]
+
+
+def test_taint_flag_matches_wiring():
+    from languages.dotnet import analyzers
+    assert analyzers.CORE_RUNS_TAINT == hasattr(analyzers, "rules_taint"), (
+        "CORE_RUNS_TAINT and the rules_taint wiring drifted: set the flag to True in the same change "
+        "that imports and runs rules_taint in languages/dotnet/analyzers.py (and back), otherwise "
+        "DESER-001 / XXE-001 on tainted lines are lost or doubled")

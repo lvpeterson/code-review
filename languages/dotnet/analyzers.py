@@ -20,6 +20,9 @@ from core.registry import register
 from languages.dotnet import detector
 
 _KINDS = ("controllers", "razorpages", "minimalapi", "config")
+# Flip to True in the same change that wires rules_taint into _code_results, otherwise DESER-001 /
+# XXE-001 on tainted lines are lost or doubled (rules_deser_xml leaves those lines to rules_taint).
+CORE_RUNS_TAINT = False
 _ROUTELESS = ("config", "deps")   # analyzers that never take routes or route-less code findings
 # route.meta["kind"] -> analyzer
 _KIND_OWNER = {"controller": "controllers", "razorpage": "razorpages", "minimalapi": "minimalapi",
@@ -63,7 +66,7 @@ def _code_results(model: ProjectModel) -> dict[str, tuple[list[Route], list[Find
 
     findings += guarded("rules_auth_core", lambda: rules_auth_core.check(model, refs))
     findings += guarded("rules_crypto", lambda: rules_crypto.check(model, refs))
-    findings += guarded("rules_deser_xml", lambda: rules_deser_xml.check(model, refs, taint_reports=False))
+    findings += guarded("rules_deser_xml", lambda: rules_deser_xml.check(model, refs, taint_reports=CORE_RUNS_TAINT))
     findings += guarded("rules_integrity", lambda: rules_integrity.check(model, refs))
     running = _running(model)
 

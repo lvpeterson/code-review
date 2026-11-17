@@ -10,4 +10,8 @@ Rule modules shared with `dotnet_legacy` that also run on SDK projects. The Core
 | XML parser defaults | DNL-XXE-002 | no effect | only fires below .NET Framework 4.5.2, which SDK projects never target |
 | integrity (SRI) | DNL-INT-003 | yes | text scan of `.cshtml` layouts and views |
 | ViewState | DNL-INT-004 | no | WebForms directives (`.aspx`, `.ascx`, `.master`) do not exist in SDK projects |
-| System.Web-only constructs | `FormsAuthentication`, `MachineKey`, `HttpContext.Current` | no | the types do not exist in ASP.NET Core; not part of the Core fixture |
+| System.Web-only constructs | DNL-CRY-001 (`FormsAuthentication.HashPasswordForStoringInConfigFile`), `MachineKey`, `HttpContext.Current` | no | the types do not exist in ASP.NET Core; not part of the Core fixture |
+
+Caveat: DNL-DESER-003 matches `JavaScriptSerializer` / `SimpleTypeResolver` by name. The types are System.Web
+only and exist on Core solely through a compatibility package or ported Framework code, so the finding is
+rare there but kept.
