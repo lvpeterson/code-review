@@ -128,17 +128,41 @@ def _project_findings(model: ProjectModel) -> list[Finding]:
     return out
 
 
+def _failed(ref: CoreRouteRef, exc: Exception) -> list[Finding]:
+    """A route whose resolution or finding building crashed: never silent, never protected."""
+    r = ref.route
+    r.auth_decorators = []
+    r.explicit_access = None
+    r.meta["auth"] = {"state": UNKNOWN, "source": "none", "reasons": [f"{type(exc).__name__}: {exc}"], "notes": []}
+    if r.meta.get("env") == "Development":
+        return []
+    return [dnl_finding(
+        "DNL-AUTHZ-001", "medium", f"Authentication of {r.handler_name} could not be determined",
+        f"{r.handler_name} ({', '.join(r.methods)} {r.path}): authorization analysis failed "
+        f"({type(exc).__name__}: {exc}), so this route may be unprotected. Review it by hand.",
+        r.file, r.line, confidence="REVIEW", route=r, api_surface=bool(r.meta.get("api_surface", False)))]
+
+
 def check(model: ProjectModel, refs: list[CoreRouteRef]) -> list[Finding]:
     out: list[Finding] = []
     for ref in refs:
         r = ref.route
-        info = auth_core.resolve(model, ref, pipeline_for(model, ref.project))
+        try:
+            info = auth_core.resolve(model, ref, pipeline_for(model, ref.project))
+            found = [] if r.meta.get("env") == "Development" else _route_findings(ref, info)
+        except Exception as exc:  # noqa: BLE001
+            out += _failed(ref, exc)
+            continue
         r.auth_decorators = [info.source] if info.state == PROTECTED else []
         if info.state == ANONYMOUS:
             r.explicit_access = "PermitAll"
         r.meta["auth"] = {"state": info.state, "source": info.source, "reasons": list(info.reasons),
                           "notes": list(info.notes)}
-        if r.meta.get("env") == "Development":
-            continue
-        out += _route_findings(ref, info)
-    return out + _project_findings(model)
+        out += found
+    try:
+        out += _project_findings(model)
+    except Exception as exc:  # noqa: BLE001
+        note = f"route-less authorization rules failed ({type(exc).__name__}: {exc}); their findings are missing"
+        if note not in model.notes:
+            model.notes.append(note)
+    return out

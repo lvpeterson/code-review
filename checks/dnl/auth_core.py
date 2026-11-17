@@ -881,7 +881,8 @@ def never_denying_filters(model: ProjectModel) -> list[TypeIR]:
     context.Result, whether or not an attribute uses them."""
     out = []
     for t in model.types():
-        if t.kind == "class" and _implements(model, t, "iauthorizationfilter", "iasyncauthorizationfilter"):
+        if (t.kind == "class" and "abstract" not in {m.lower() for m in t.modifiers}
+                and _implements(model, t, "iauthorizationfilter", "iasyncauthorizationfilter")):
             if _filter_verdict(model, t)[0] == NEVER:
                 out.append(t)
     return out

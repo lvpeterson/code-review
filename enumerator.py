@@ -79,6 +79,9 @@ def _run_frameworks(target_path: Path, language_name: str, frameworks: list[str]
         # Fail fast (PreflightError -> CLI exit 2) before any analyzer runs.
         project.prepare(target_path, allow_degraded)
         prepared = True
+    if language_name in _DOTNET_PACKAGES:
+        # The analyzers route work to a framework that actually runs (see languages/dotnet/analyzers).
+        project.get_model(target_path).cache.setdefault("running", {})[language_name] = list(frameworks)
 
     for framework in frameworks:
         analyzer_cls = get_analyzer(language_name, framework)

@@ -26,8 +26,13 @@ _KIND_OWNER = {"controller": "controllers", "razorpage": "razorpages", "minimala
                "fallback": "minimalapi", "openapi": "minimalapi"}
 
 
-def _enumerated(model: ProjectModel) -> list[str]:
-    """Frameworks the enumerator runs for this scan (detector order), cached on the model."""
+def _running(model: ProjectModel) -> list[str]:
+    """Frameworks of this package that actually run in this scan: what the enumerator recorded (a forced
+    --framework included), else what the detector finds."""
+    shared = model.parent or model
+    rec = shared.cache.get("running", {}).get("dotnet")
+    if rec is not None:
+        return list(rec)
     cached = model.cache.get("enumerated")
     if cached is None:
         cached = model.cache["enumerated"] = detector.detect_frameworks(model.root)
@@ -56,13 +61,22 @@ def _code_results(model: ProjectModel) -> dict[str, tuple[list[Route], list[Find
             return []
 
     findings += guarded("rules_auth_core", lambda: rules_auth_core.check(model, refs))
-    for ref in refs:
-        out[_KIND_OWNER.get(ref.route.meta["kind"], "minimalapi")][0].append(ref.route)
-    running = _enumerated(model)
+    running = _running(model)
+
+    def owner_of(kind: str) -> str:
+        # A route whose analyzer does not run (not detected, or not forced) goes to the first route
+        # analyzer that does, else to config: routes and their findings are never dropped.
+        want = _KIND_OWNER.get(kind, "minimalapi")
+        if want in running or not running:
+            return want
+        return next((k for k in running if k != "config"), "config")
+
     # Route-less findings go to config; without it, the first analyzer that runs takes them.
     fallback = "config" if "config" in running or not running else running[0]
+    for ref in refs:
+        out[owner_of(ref.route.meta["kind"])][0].append(ref.route)
     for f in findings:
-        owner = _KIND_OWNER.get(f.route.meta["kind"], "minimalapi") if f.route is not None else fallback
+        owner = owner_of(f.route.meta["kind"]) if f.route is not None else fallback
         out[owner][1].append(f)
     model.cache["code_results"] = out
     return out
@@ -90,13 +104,9 @@ class _CoreAnalyzer(BaseFrameworkAnalyzer):
     def analyze(self) -> ScanResult:
         result = super().analyze()
         result.degraded = self.model.degraded
-        # Model notes describe the whole scan: the first analyzer to report takes them.
-        # The flag lives on the full model: it is shared by every view of the scan.
-        shared = self.model.parent or self.model
-        # The flag is shared with dotnet_legacy: the notes list is one object for both packages.
-        notes = [] if shared.cache.get("notes_taken") else list(self.model.notes)
-        shared.cache["notes_taken"] = True
-        result.notes = notes
+        # Model notes describe the whole scan: each analyzer reports those added since the last report
+        # (one pointer shared with dotnet_legacy).
+        result.notes = self.model.take_notes()
         return result
 
 
@@ -117,8 +127,5 @@ class MinimalApiAnalyzer(_CoreAnalyzer):
 
 @register("dotnet", "config")
 class ConfigAnalyzer(_CoreAnalyzer):
-    """Route-less findings; reports even when no route-bearing framework was detected."""
+    """Route-less findings; also takes routes when no route analyzer runs."""
     framework = "config"
-
-    def find_routes(self) -> list[Route]:
-        return []

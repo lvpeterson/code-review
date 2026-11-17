@@ -170,3 +170,77 @@ def test_degraded_end_to_end(roslyn_helper, monkeypatch):
     degraded = _dotnet(MINIMAL, allow_degraded=True)
     assert degraded and all(r.degraded for r in degraded)
     assert _keys(degraded) == _keys(full)
+
+
+# -- fix round 1 ---------------------------------------------------------------
+
+def _with_program(tmp_path, extra):
+    root = tmp_path / "app"
+    shutil.copytree(CONTROLLERS, root)
+    prog = root / "Program.cs"
+    text = prog.read_text()
+    assert "app.Run();" in text
+    prog.write_text(text.replace("app.Run();", extra + "\napp.Run();"))
+    return root
+
+
+def test_detector_enables_minimalapi_for_any_map_call(tmp_path):
+    calls = ('app.MapBlazorHub();', 'app.MapRazorComponents<App>();', 'app.MapOpenApi();',
+             'app.MapFallbackToFile("index.html");', 'app.MapHealthChecks("/h");')
+    for n, call in enumerate(calls):
+        root = tmp_path / f"app{n}"
+        shutil.copytree(CONTROLLERS, root)
+        prog = root / "Program.cs"
+        prog.write_text(prog.read_text().replace("app.Run();", call + "\napp.Run();"))
+        assert core_detector.detect_frameworks(root) == ["controllers", "minimalapi", "config"], call
+    assert core_detector.detect_frameworks(CONTROLLERS) == ["controllers", "config"]
+
+
+def test_route_of_unrunning_analyzer_is_not_dropped(roslyn_helper, tmp_path):
+    root = _with_program(tmp_path, 'app.MapHealthChecks("/h");')
+    results = enumerator.enumerate_target(root, force_language="dotnet", force_framework="controllers")
+    assert [r.framework for r in results] == ["controllers"]
+    assert _by_path(results, "DNL-AUTHZ-001", "/h")
+    assert any(r.path == "/h" for r in results[0].routes)
+
+
+def test_forced_framework_still_reports_route_less_findings(roslyn_helper):
+    results = enumerator.enumerate_target(FX / "pipelines" / "startup", force_language="dotnet",
+                                          force_framework="controllers")
+    assert [r.framework for r in results] == ["controllers"]
+    assert [f for f in results[0].findings if f.check_id == "DNL-AUTHZ-008"]
+
+
+def test_legacy_crash_note_survives_mixed_solution(roslyn_helper, monkeypatch):
+    from checks.dnl import rules_auth
+
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(rules_auth, "check_routes", boom)
+    results = enumerator.enumerate_target(MIXED)
+    legacy = [r for r in results if r.language == "dotnet_legacy"]
+    assert any("rules_auth failed" in n for r in legacy for n in r.notes)
+
+
+def test_one_route_crash_is_isolated(roslyn_helper, monkeypatch):
+    from checks.dnl import auth_core, rules_auth_core
+    real = auth_core.resolve
+
+    def flaky(model, ref, pipe):
+        if ref.route.handler_name == "HealthController.Get":
+            raise RuntimeError("kaput")
+        return real(model, ref, pipe)
+    monkeypatch.setattr(rules_auth_core.auth_core, "resolve", flaky)
+    results = _dotnet(CONTROLLERS)
+    (bad,) = _by_handler(results, "DNL-AUTHZ-001", "HealthController.Get")
+    assert bad.severity == "medium" and bad.confidence == "REVIEW" and "kaput" in bad.description
+    route = next(r for x in results for r in x.routes if r.handler_name == "HealthController.Get")
+    assert route.meta["auth"]["state"] == "unknown" and route.auth_decorators == []
+    assert _by_handler(results, "DNL-AUTHZ-001", "ReportsController.List")   # the rest continue
+
+
+def test_dotnet_only_target_without_helper_fails_preflight(monkeypatch):
+    from checks.dnl import helper
+    _degraded(monkeypatch)
+    with pytest.raises(helper.PreflightError):
+        enumerator.enumerate_target(MINIMAL)

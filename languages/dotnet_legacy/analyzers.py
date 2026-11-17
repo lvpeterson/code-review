@@ -150,12 +150,9 @@ class _DnlAnalyzer(BaseFrameworkAnalyzer):
     def analyze(self) -> ScanResult:
         result = super().analyze()
         result.degraded = self.model.degraded
-        # Model notes describe the whole scan: the first analyzer to report takes them.
-        # The flag lives on the full model: it is shared by every view of the scan.
-        shared = self.model.parent or self.model
-        notes = [] if shared.cache.get("notes_taken") else list(self.model.notes)
-        shared.cache["notes_taken"] = True
-        result.notes = notes + self._notes
+        # Model notes describe the whole scan: each analyzer reports the ones added since the last
+        # report (pointer shared with the dotnet package), so a late crash note is never lost.
+        result.notes = self.model.take_notes() + self._notes
         return result
 
 

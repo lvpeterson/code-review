@@ -108,6 +108,14 @@ class ProjectModel:
         self._views[owner] = v
         return v
 
+    def take_notes(self) -> list[str]:
+        """Notes added since the last analyzer of this scan reported (one pointer for every package,
+        kept on the full model), so a note appended after another analyzer reported is not lost."""
+        shared = self.parent or self
+        start = shared.cache.get("notes_reported", 0)
+        shared.cache["notes_reported"] = len(self.notes)
+        return list(self.notes[start:])
+
     def owns(self, path: Path) -> bool:
         """True when path belongs to this model's package: always on a full model; on a
         view, the project listing the file (else the deepest project dir holding it)

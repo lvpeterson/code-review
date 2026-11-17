@@ -341,14 +341,13 @@ relative to the route decorator.
   `tree-sitter-typescript` grammars -- prebuilt wheels, no Node.js or
   compiler required either.
 - **go**: `tree-sitter-go`.
-- **dotnet**: `tree-sitter-c-sharp`. tree-sitter gives real start/end
-  positions natively here, unlike javalang for Spring, which needed manual
-  brace-counting (`_method_end_line()`).
+- **dotnet** / **dotnet_legacy**: the Roslyn helper (`tools/roslyn-ir`); `tree-sitter-c-sharp`
+  only for the `--allow-degraded` fallback.
 - **ruby**: `tree-sitter-ruby`.
 
-All five tree-sitter grammars are prebuilt wheels (no JDK/Node/Go/.NET/Ruby
+The tree-sitter grammars are prebuilt wheels (no JDK/Node/Go/Ruby
 toolchain needed on the machine actually running this tool) -- every
-`languages/<lang>/_ts_utils.py` is the same trivial node-text/walk-helper
+`languages/<lang>/_ts_utils.py` (go, ruby) is the same trivial node-text/walk-helper
 pattern duplicated per language rather than shared, matching this repo's
 existing convention (`_ast_utils.py` is the one deliberately shared module,
 for Python specifically).

@@ -15,8 +15,11 @@ from checks.dnl.files import iter_dnl_files, read_source
 _FRAMEWORK_ORDER = ["controllers", "razorpages", "minimalapi", "config"]
 _CONTROLLER = re.compile(r"\[\s*(?:[\w.]+\.)?(?:ApiController|Controller)(?:Attribute)?\s*[\](]"
                          r"|\bclass\s+\w+(?:<[^>]*>)?\s*:[^{;]*?\b(?:Controller|ControllerBase)\b")
-_MINIMAL = re.compile(r"\.Map(?:Get|Post|Put|Patch|Delete|Methods|Group|Hub|GrpcService|HealthChecks|Fallback)\w*\s*[(<]"
-                      r"|\.Map\(\s*[$@]*\"")
+# Any endpoint-builder Map call (MapGet, MapGroup, MapHub, MapBlazorHub, MapRazorComponents, MapOpenApi,
+# MapFallbackToFile, MapHealthChecks, ...) or `.Map("...")`. MapControllers / MapRazorPages and the
+# conventional controller routes only enable the styles detected separately.
+_MINIMAL = re.compile(r"\.Map(?!Controllers|ControllerRoute|DefaultControllerRoute|AreaControllerRoute"
+                      r"|RazorPages|When)[A-Z]\w*\s*[(<]|\.Map\(\s*[$@]*\"")
 _PAGE_DIRECTIVE = re.compile(r"\A\s*(?:@\*.*?\*@\s*)*@page\b", re.S)
 
 
