@@ -213,7 +213,9 @@ def test_opaque_option_sources_are_review(tmp_path, mode):
     for name, svc in shapes.items():
         body = "app.UseCookiePolicy(policyVar);" if name == "middleware" else ""
         f = scan(tmp_path / name, prog(svc, body), mode)
-        assert review_ids(f) == FOUR, name
+        # antiforgery and cookie-policy options carry no lifetime
+        want = FOUR - {"DNL-SESS-003"} if name in ("section", "antiforgery", "middleware") else FOUR
+        assert review_ids(f) == want, name
         assert all(x.line > 0 for x in f if x.check_id in FOUR)
 
 
@@ -247,3 +249,32 @@ def test_configure_filter_matches_type_names_exactly(tmp_path, mode):
     f = scan(tmp_path / "b", prog("builder.Services.Configure<Microsoft.AspNetCore.Builder.CookiePolicyOptions>("
                                   "o => { o.Secure = CookieSecurePolicy.None; });"), mode)
     assert ("DNL-SESS-001", "medium", None) in ids(f)
+
+
+def test_method_group_on_defaults_class_is_review(tmp_path, mode):
+    f = scan(tmp_path, prog("builder.Services.AddAuthentication().AddCookie(AuthDefaults.ConfigureCookie);"), mode)
+    assert review_ids(f) == FOUR
+
+
+def test_scheme_constants_and_bare_names(tmp_path, mode):
+    f = scan(tmp_path / "a", prog("builder.Services.AddAuthentication().AddCookie("
+                                  "CookieAuthenticationDefaults.AuthenticationScheme);"), mode)
+    assert not review_ids(f)
+    f = scan(tmp_path / "b", prog('builder.Services.AddAuthentication().AddCookie("Cookies");'), mode)
+    assert not review_ids(f)
+    f = scan(tmp_path / "c", prog("builder.Services.AddAuthentication().AddCookie(schemeName);"), mode)
+    assert review_ids(f) == FOUR
+
+
+def test_review_ids_follow_the_call_type(tmp_path, mode):
+    no_life = {"DNL-SESS-001", "DNL-SESS-002", "DNL-SESS-009"}
+    f = scan(tmp_path / "a", prog("", "app.UseCookiePolicy(policyVar);"), mode)
+    assert review_ids(f) == no_life
+    f = scan(tmp_path / "b", prog("builder.Services.AddAntiforgery(setup);"), mode)
+    assert review_ids(f) == no_life
+    f = scan(tmp_path / "c", prog("builder.Services.Configure<CookiePolicyOptions>(cfg.GetSection(\"C\"));"), mode)
+    assert review_ids(f) == no_life
+    f = scan(tmp_path / "d", prog("builder.Services.Configure<SessionOptions>(cfg.GetSection(\"S\"));"), mode)
+    assert review_ids(f) == FOUR
+    f = scan(tmp_path / "e", prog("builder.Services.ConfigureApplicationCookie(setup);"), mode)
+    assert review_ids(f) == FOUR

@@ -109,13 +109,26 @@ _OPAQUE_IDS = (("DNL-SESS-001", "medium", "Cookie not restricted to HTTPS", "Sec
                ("DNL-SESS-009", "low", "Cookie SameSite is None", "SameSite mode"))
 
 
+def _kind_of_call(c: PipeCall) -> str:
+    """"cookie" | "session" | "antiforgery" | "policy": which cookie a call configures."""
+    if c.name == "Configure":
+        targs = [str(x).strip().split(".")[-1] for x in (c.node.get("fn") or {}).get("targs") or []]
+        return ("session" if "SessionOptions" in targs else "antiforgery" if "AntiforgeryOptions" in targs
+                else "policy" if "CookiePolicyOptions" in targs else "cookie")
+    return {"AddSession": "session", "AddAntiforgery": "antiforgery", "UseCookiePolicy": "policy"}.get(c.name, "cookie")
+
+
 def _opaque(c: PipeCall, conf, add) -> None:
     """A cookie call whose options are not all readable (a method group, a variable, a configuration
     section, an options parameter handed to a helper): REVIEW for every id the settings could affect."""
     reason = opaque_reason(c.node)
     if reason is None:
         return
+    # Antiforgery and cookie-policy options carry no lifetime, so SESS-003 cannot apply to them.
+    skip_life = _kind_of_call(c) in ("antiforgery", "policy")
     for cid, sev, title, what in _OPAQUE_IDS:
+        if cid == "DNL-SESS-003" and skip_life:
+            continue
         add(cid, sev, title, f"The {what} of the cookie set up by {c.name} could not be read: {reason}. "
                              "Confirm the cookie is Secure, HttpOnly, not SameSite=None and short-lived.",
             c, c.line, "REVIEW")

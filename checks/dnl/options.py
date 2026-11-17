@@ -319,15 +319,26 @@ def _hands_off(n, param: str) -> bool:
     return any(_hands_off(v, param) for v in n.values() if isinstance(v, (dict, list)))
 
 
-_SCHEME_NAME = re.compile(r"Defaults\.|Scheme$")
+# Constants that name an authentication scheme: any `X.AuthenticationScheme` (CookieAuthenticationDefaults,
+# JwtBearerDefaults, OpenIdConnectDefaults, ...) and the IdentityConstants scheme names.
+_IDENTITY_SCHEMES = frozenset({"IdentityConstants.ApplicationScheme", "IdentityConstants.ExternalScheme",
+                               "IdentityConstants.TwoFactorRememberMeScheme",
+                               "IdentityConstants.TwoFactorUserIdScheme"})
 
 
 def _scheme_like(e: dict) -> bool:
-    """A literal, or a constant such as `CookieAuthenticationDefaults.AuthenticationScheme`: a scheme or
-    option name, never an options source."""
-    if e.get("k") == "lit":
+    """A literal, `nameof(...)`, or a known scheme constant: a scheme or option name, never an options
+    source. Any other member (a method group on a `*Defaults` class) and any bare name (a variable or a
+    constant this code cannot resolve) is not."""
+    k = e.get("k")
+    if k == "lit":
         return True
-    return e.get("k") == "member" and bool(_SCHEME_NAME.search(receiver_text(e) or ""))
+    if k == "call":
+        return call_name(e) == "nameof"
+    if k == "member":
+        text = receiver_text(e) or ""
+        return e.get("name") == "AuthenticationScheme" or ".".join(text.split(".")[-2:]) in _IDENTITY_SCHEMES
+    return False
 
 
 def opaque_reason(call: dict, opts_param_names=None) -> str | None:
@@ -335,7 +346,11 @@ def opaque_reason(call: dict, opts_param_names=None) -> str | None:
     arguments, or only scheme names) is not opaque: it takes the defaults. Opaque are: an argument that is
     not a literal, a lambda or a `new` (a method group, a variable, a configuration section), and a lambda
     whose options parameter is passed to another call, stored or returned. `opts_param_names` limits which
-    lambda parameters count (default: the first one)."""
+    lambda parameters count (default: the first one).
+
+    Known limits: a bare name is never resolved to a constant (it is opaque, so `AddCookie(schemeName)` is
+    REVIEW even when it is a const string), and the options parameter wrapped in a larger expression handed
+    on (`Harden(o.Cookie ?? fallback)`) is not detected."""
     args = list(call.get("args") or []) + list((call.get("named") or {}).values())
     for a in args:
         if not isinstance(a, dict):

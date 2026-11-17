@@ -285,3 +285,30 @@ def test_opaque_lambda_that_only_sets_members_is_fine():
     assert _opaque(lam(["o"], [assign("o", "Cookie.Name", name("cfgName"))])) is None
     shadow = lam(["o"], [{"k": "expr", "e": call(None, "Each", [lam(["o"], call(None, "F", [name("o")]))]), "line": 1}])
     assert _opaque(shadow) is None
+
+
+def test_opaque_method_group_on_a_defaults_class_is_opaque():
+    assert _opaque(member(name("AuthDefaults"), "ConfigureCookie"))
+    assert _opaque(member(name("CookieDefaults"), "Configure"))
+    assert _opaque(member(name("CookieAuthenticationDefaults"), "ConfigureCookie"))
+
+
+def test_opaque_known_scheme_constants_are_not_opaque():
+    for obj, n in (("CookieAuthenticationDefaults", "AuthenticationScheme"), ("JwtBearerDefaults", "AuthenticationScheme"),
+                   ("Custom", "AuthenticationScheme"), ("IdentityConstants", "ApplicationScheme"),
+                   ("IdentityConstants", "ExternalScheme"), ("IdentityConstants", "TwoFactorRememberMeScheme"),
+                   ("IdentityConstants", "TwoFactorUserIdScheme")):
+        assert _opaque(member(name(obj), n)) is None, (obj, n)
+    assert _opaque(call(None, "nameof", [name("X")])) is None
+
+
+def test_opaque_bare_name_is_opaque():
+    assert _opaque(name("SchemeName"))
+    assert _opaque(lit("Cookies"), name("SchemeName"))
+
+
+def test_opaque_known_limit_wrapped_expression_is_not_detected():
+    # Known limit: the options parameter inside a wrapping expression (`Harden(o.Cookie ?? fallback)`) is
+    # not seen as handed off. Pinned so a change is deliberate.
+    wrapped = {"k": "bin", "op": "??", "l": member(name("o"), "Cookie"), "r": name("fallback"), "line": 1}
+    assert _opaque(lam(["o"], call(None, "Harden", [wrapped]))) is None
