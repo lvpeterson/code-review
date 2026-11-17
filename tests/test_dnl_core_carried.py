@@ -163,3 +163,136 @@ def test_taint_flag_matches_wiring(monkeypatch):
         "CORE_RUNS_TAINT and the rules_taint wiring drifted: set the flag to True in the same change "
         "that runs rules_taint.check in languages/dotnet/analyzers.py (and back), otherwise "
         "DESER-001 / XXE-001 on tainted lines are lost or doubled")
+
+
+# -- carried families on SDK projects, part 2: errors, logging, flows, resources, inventory, session --
+
+ERR_FILE = "Controllers/ErrorsController.cs"
+ERRORS_EXPECTED = {
+    ("DNL-ERR-001", ERR_FILE, 81, "medium"),     # IAuthorizationFilter whose empty catch lets the request through
+    ("DNL-ERR-002", ERR_FILE, 25, "medium"),     # Ok(ex.ToString())
+    ("DNL-ERR-002", ERR_FILE, 35, "medium"),     # Content(detail) with detail = ex.StackTrace
+    ("DNL-ERR-003", ERR_FILE, 17, "low"),        # catch { }
+}
+
+
+@pytest.mark.parametrize("mode", ["helper", "degraded"])
+def test_errors_findings_on_core(mode, monkeypatch):
+    results = _carried(monkeypatch, mode)
+    got = _family(results, ("DNL-ERR-",))
+    # logged + Problem(), type name only, a narrow empty catch and the fail-closed filter stay silent
+    assert got == ERRORS_EXPECTED
+
+
+LOG_FILE = "Services/Logging.cs"
+LOGGING_EXPECTED = {
+    ("DNL-LOG-003", LOG_FILE, 14, "medium"),     # $"... {password}"
+    ("DNL-LOG-003", LOG_FILE, 15, "medium"),     # "token issued: " + token
+    ("DNL-LOG-004", LOG_FILE, 38, "low"),        # Login: rejected sign-in never logged
+}
+
+
+@pytest.mark.parametrize("mode", ["helper", "degraded"])
+def test_logging_findings_on_core(mode, monkeypatch):
+    results = _carried(monkeypatch, mode)
+    # templates, password.Length and the audited login stay silent (Serilog / ILogger are matched by name)
+    assert _family(results, ("DNL-LOG-",)) == LOGGING_EXPECTED
+
+
+FLOWS_EXPECTED = {
+    ("DNL-DES-001", "Controllers/FlowsController.cs", 22, "low"),     # Login: no lockout / limiter
+    ("DNL-CONSUME-001", "Services/Outbound.cs", 10, "low"),           # http:// partner endpoint
+    ("DNL-CONSUME-002", "Controllers/FlowsController.cs", 60, "low"),  # upstream body run as a command
+}
+
+
+@pytest.mark.parametrize("mode", ["helper", "degraded"])
+def test_flows_consume_on_core(mode, monkeypatch):
+    results = _carried(monkeypatch, mode)
+    # SignInLocked (lockoutOnFailure: true), Register ([EnableRateLimiting]), the https call and the
+    # response that never reaches a sink stay silent
+    assert _family(results, ("DNL-DES-", "DNL-CONSUME-")) == FLOWS_EXPECTED
+    des = next(f for r in results for f in r.findings if f.check_id == "DNL-DES-001")
+    assert des.route is not None and des.route.meta["kind"] == "controller"
+
+
+RESOURCES_EXPECTED = {
+    ("DNL-RES-002", "Controllers/UploadController.cs", 36, "low"),    # every row of a DbSet
+    ("DNL-RES-003", "Controllers/UploadController.cs", 17, "medium"),  # IFormFile.CopyToAsync, no Length check
+    ("DNL-INV-002", "Controllers/UploadController.cs", 47, "low"),    # DiagnosticsController shipped
+    ("DNL-INV-002", "Program.cs", 11, "low"),                         # UseSwagger() in every environment
+}
+
+
+@pytest.mark.parametrize("mode", ["helper", "degraded"])
+def test_resources_inventory_on_core(mode, monkeypatch):
+    results = _carried(monkeypatch, mode)
+    # SaveChecked (file.Length guard), the capped Take(Math.Min(..)) page and the swagger UI under
+    # IsDevelopment() stay silent
+    assert _family(results, ("DNL-RES-", "DNL-INV-")) == RESOURCES_EXPECTED
+
+
+@pytest.mark.parametrize("mode", ["helper", "degraded"])
+def test_session_on_core(mode, monkeypatch):
+    results = _carried(monkeypatch, mode)
+    # the hashed comparison through IPasswordHasher stays silent
+    assert _family(results, ("DNL-SESS-",)) == {("DNL-SESS-008", "Controllers/SessionController.cs", 16, "medium")}
+
+
+# Ids the carried modules can emit that cannot fire on SDK projects (or are not asserted by a fixture
+# positive); mirrored in languages/dotnet/CARRIED_RULES.md.
+EXCLUDED = {
+    "DNL-LOG-002": "legacy projects only: the finding is anchored on a .NET Framework project file and an "
+                   "SDK-only model has none, so logging absence is never reported for Core",
+    "DNL-SESS-006": "System.Web / OWIN only: matches FormsAuthentication.SignOut and "
+                    "AuthenticationManager.SignOut; Core's HttpContext.SignOutAsync is not matched",
+    "DNL-SESS-007": "System.Web / OWIN only: matches FormsAuthentication.SetAuthCookie / "
+                    "RedirectFromLoginPage and AuthenticationManager.SignIn; Core's SignInAsync is not matched",
+}
+_MODULES = ("rules_errors", "rules_logging", "rules_flows", "rules_resources", "rules_session")
+
+
+def test_every_emittable_id_has_a_core_positive_or_an_exclusion():
+    import re
+    emittable = set()
+    for mod in _MODULES:
+        text = (Path(__file__).parent.parent / "checks" / "dnl" / f"{mod}.py").read_text(encoding="utf-8")
+        emittable |= set(re.findall(r"DNL-[A-Z]+-\d{3}", text))
+    positives = {i for exp in (ERRORS_EXPECTED, LOGGING_EXPECTED, FLOWS_EXPECTED, RESOURCES_EXPECTED,
+                               {("DNL-SESS-008", "", 0, "")}) for i, *_ in exp}
+    assert all(reason.strip() for reason in EXCLUDED.values())
+    assert not positives & set(EXCLUDED)
+    assert emittable == positives | set(EXCLUDED), emittable ^ (positives | set(EXCLUDED))
+
+
+def test_rules_misc_runs_without_web_config_on_core(monkeypatch):
+    from checks.dnl import rules_misc, webconfig
+    seen = []
+    real = rules_misc.check
+    monkeypatch.setattr(rules_misc, "check", lambda model, refs=(), configs=(): seen.append(tuple(configs)) or real(model, refs, configs))
+    monkeypatch.setattr(webconfig, "load_configs", lambda *a, **k: (_ for _ in ()).throw(AssertionError("Web.config read on Core")))
+    results = _dotnet(CARRIED_APP, allow_degraded=False)
+    assert seen == [()]
+    assert not [n for r in results for n in r.notes if "failed (" in n]
+
+
+def test_no_logging_absence_finding_for_sdk_side_of_mixed_solution():
+    results = _dotnet(FX / "mixed_solution", allow_degraded=False)
+    assert not [f for r in results for f in r.findings if f.check_id == "DNL-LOG-002"]
+
+
+def test_one_crashing_module_does_not_hide_others(monkeypatch):
+    from checks.dnl import rules_errors
+
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(rules_errors, "check", boom)
+    project._CACHE.clear()
+    results = _dotnet(CARRIED_APP, allow_degraded=False)
+    notes = [n for r in results for n in r.notes]
+    assert any("rules_errors failed (RuntimeError: boom)" in n for n in notes)
+    got = _family(results, ("DNL-CRY-", "DNL-SEC-"))
+    assert got == CRYPTO_EXPECTED
+    assert not _family(results, ("DNL-ERR-",))
+    # the modules wired after the crashing one still ran
+    assert _family(results, ("DNL-LOG-", "DNL-SESS-")) >= LOGGING_EXPECTED

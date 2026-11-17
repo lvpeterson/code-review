@@ -12,7 +12,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from checks.dnl import project, routes_core, rules_auth_core, rules_crypto, rules_deser_xml, rules_integrity, rules_sca_core
+from checks.dnl import project, routes_core, rules_auth_core, rules_crypto, rules_deser_xml, rules_errors, rules_integrity, rules_misc, rules_sca_core, rules_session
 from checks.dnl.project import ProjectModel
 from core.base import BaseFrameworkAnalyzer
 from core.models import Finding, Route, ScanResult
@@ -68,6 +68,15 @@ def _code_results(model: ProjectModel) -> dict[str, tuple[list[Route], list[Find
     findings += guarded("rules_crypto", lambda: rules_crypto.check(model, refs))
     findings += guarded("rules_deser_xml", lambda: rules_deser_xml.check(model, refs, taint_reports=CORE_RUNS_TAINT))
     findings += guarded("rules_integrity", lambda: rules_integrity.check(model, refs))
+    findings += guarded("rules_session", lambda: rules_session.check(model, refs))
+    findings += guarded("rules_errors", lambda: rules_errors.check(model, refs))
+
+    def run_misc():
+        # Web.config checks stay legacy-only: no configs are loaded for SDK projects.
+        found, notes = rules_misc.check(model, refs, ())
+        model.notes.extend(n for n in notes if n not in model.notes)
+        return found
+    findings += guarded("rules_misc", run_misc)
     running = _running(model)
 
     def owner_of(kind: str) -> str:

@@ -49,8 +49,9 @@ NOT_RULE_IDS: frozenset[str] = frozenset()
 # Imports that correlate data rather than emit the importee's rules: the
 # Lambda scanner asks tf_graph which role a handler runs as (LMB-019) but
 # never emits POL-* itself. rules_crypto borrows rules_config's regexes for
-# hardcoded credentials but never emits the Web.config rules (DNL-CFG-*).
-EXCLUDED_EDGES = {("aws_lambda", "tf_graph"), ("rules_crypto", "rules_config")}
+# hardcoded credentials but never emits the Web.config rules (DNL-CFG-*);
+# rules_logging borrows its package / config-file regexes the same way.
+EXCLUDED_EDGES = {("aws_lambda", "tf_graph"), ("rules_crypto", "rules_config"), ("rules_logging", "rules_config")}
 
 # Families whose analyzers can mark a finding as sitting on an API surface
 # (see core.owasp_web.api_surface_for); the rest only get API tags from
