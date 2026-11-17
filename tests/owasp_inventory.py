@@ -52,14 +52,16 @@ NOT_RULE_IDS: frozenset[str] = frozenset()
 # hardcoded credentials but never emits the Web.config rules (DNL-CFG-*);
 # rules_logging borrows its package / config-file regexes the same way.
 # ASP.NET Core runs no taint or object rules yet (CORE_RUNS_TAINT = False): rules_deser_xml imports
-# rules_taint lazily and rules_resources imports rules_object, neither of which Core emits. Delete
-# both edges when Plan 2 wires taint / object into Core. flowutil only borrows a helper from rules_object.
+# rules_taint lazily and rules_resources imports rules_object, neither of which Core emits. flowutil
+# only borrows a helper from rules_object. Delete all three of these edges (flowutil's included) when
+# Plan 2 wires taint / object into Core.
 EXCLUDED_EDGES = {("aws_lambda", "tf_graph"), ("rules_crypto", "rules_config"), ("rules_logging", "rules_config"),
                   ("rules_deser_xml", "rules_taint"), ("rules_resources", "rules_object"),
                   ("flowutil", "rules_object")}
 
-# Ids inside modules Core does run that can never fire on an SDK project (see
-# languages/dotnet/CARRIED_RULES.md): they must not count towards the dotnet row.
+# Ids inside modules Core does run that do not fire on conventional SDK projects (see
+# languages/dotnet/CARRIED_RULES.md for the edge layouts, e.g. a stray .aspx inside an SDK project
+# directory, or a user type named like OWIN's AuthenticationManager): they do not count towards the dotnet row.
 CORE_NEVER_EMITTED = {"DNL-INT-004", "DNL-XXE-002", "DNL-SESS-006", "DNL-SESS-007", "DNL-LOG-002"}
 
 # Families whose analyzers can mark a finding as sitting on an API surface
