@@ -42,4 +42,5 @@ public class FetchController : ControllerBase
     [HttpGet("full")] public async Task<IActionResult> Full(string url) => Ok(await _http.GetStringAsync(url));
     [HttpGet("hostfirst")] public async Task<IActionResult> HostFirst(string host) => Ok(await _http.GetStringAsync($"{host}/x"));
     [HttpGet("schemeonly")] public async Task<IActionResult> SchemeOnly(string host) => Ok(await _http.GetStringAsync("https://" + host));
+    [HttpGet("hostnoslash")] public async Task<IActionResult> HostNoSlash(string p) => Ok(await _http.GetStringAsync("https://api.example.test" + p));
 }

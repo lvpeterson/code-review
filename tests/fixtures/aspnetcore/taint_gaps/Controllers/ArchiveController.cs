@@ -50,4 +50,26 @@ public class ArchiveController : ControllerBase
         using var archive = ZipFile.OpenRead("/data/upload.zip");
         return Ok(archive.Entries.Count);
     }
+
+    [HttpPost("slip-item")]
+    public IActionResult SlipItem()
+    {
+        using var archive = ZipFile.OpenRead("/data/upload.zip");
+        foreach (var item in archive.Entries)
+        {
+            System.IO.File.WriteAllText(Path.Combine("/data", item.FullName), "x");
+        }
+        return Ok();
+    }
+
+    [HttpPost("slip-typed")]
+    public IActionResult SlipTyped()
+    {
+        using var archive = ZipFile.OpenRead("/data/upload.zip");
+        foreach (ZipArchiveEntry z in archive.Entries)
+        {
+            System.IO.File.WriteAllText(Path.Combine("/data", z.FullName), "x");
+        }
+        return Ok();
+    }
 }

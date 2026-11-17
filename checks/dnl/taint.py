@@ -151,10 +151,13 @@ _STATIC_SEQ_TYPES = {"enumerable", "queryable", "parallel", "parallelenumerable"
 
 
 # A literal that is only a scheme and / or slashes (`"https://"`, `"//"`, `"/"`, ""): the host is still the request's.
+_ZIP_ENTRY_DECL_RE = re.compile(r"^\s*(?:var\s+)?(?:[\w.]*\.)?ZipArchiveEntry\s+(\w+)\s*$")
 _SCHEME_ONLY_RE = re.compile(r"(?i)\s*([a-z][a-z0-9+.\-]*:)?/{0,2}\s*")
 # Marker in `Taint.cleansed`: the value starts with an untainted prefix (SSRF: only the path is controlled).
 # It survives a merge only when every merged value has it, so a fully tainted contribution removes it.
 PREFIX_MARK = "~prefix"
+# `scheme://host` with nothing after the host: the appended value still extends the host (`"https://h" + p`).
+_HOST_ONLY_RE = re.compile(r"(?i)\s*[a-z][a-z0-9+.\-]*://[^/]*$")
 
 
 def _with_prefix(t: Taint) -> Taint:
@@ -400,6 +403,8 @@ class _Analysis:
         if not isinstance(recv, dict):
             return None
         rt = _simple(self.type_of(recv) or "").lower()
+        if rt == "ziparchiveentry" and name in ("fullname", "name"):
+            return self._origin("archive entry name", e.get("line", 0))
         if rt == "httpcontext":
             if name == "request":
                 return self._origin("Request", e.get("line", 0))
@@ -534,7 +539,7 @@ class _Analysis:
             return True
         tn = self.type_of(arg)
         if tn:
-            return _simple(tn) in ("string", "object")
+            return _simple(tn) in ("string", "object", "stringvalues")
         return not self._stream_like(arg)
 
     def _stream_like(self, e: Any) -> bool:
@@ -554,7 +559,13 @@ class _Analysis:
         if k == "call":
             fn = e.get("fn") or {}
             name = (fn.get("name") if fn.get("k") == "member" else fn.get("id")) or ""
-            return name.lower() in _STREAM_CALLS
+            if name.lower() not in _STREAM_CALLS:
+                return False
+            sym = e.get("sym")
+            if sym:
+                return sym.startswith(("System.", "Microsoft."))     # a project method of that name is no stream factory
+            recv = self._recv(fn) if fn.get("k") == "member" else None
+            return not self._targets(e, fn, recv)
         return False
 
     def _check_call_sinks(self, call: dict, name: str, recv: Any, args: list, vals: list, nvals: list) -> None:
@@ -782,7 +793,10 @@ class _Analysis:
             return False
         if lead.get("k") == "lit":
             v = literal_str(lead)
-            return v is not None and not _SCHEME_ONLY_RE.fullmatch(v)
+            if v is None or _SCHEME_ONLY_RE.fullmatch(v):
+                return False
+            # an absolute URL fixes the host only when the literal goes on past it (`https://h/`, `https://h/api`)
+            return not _HOST_ONLY_RE.match(v)
         return self.ev(lead) is None
 
     def _ev_unary(self, e: dict) -> Taint | None:
@@ -1467,6 +1481,7 @@ class _Analysis:
     def _st_local(self, s: dict) -> bool:
         kk = self.key(s.get("name") or "")
         init = s.get("init")
+        self._drop_paths(kk)
         self.env[kk] = self.ev(init)
         self.locals.add(kk)
         tn = s.get("type_full") or s.get("type")
@@ -1560,6 +1575,7 @@ class _Analysis:
             value = None
         if k == "name":
             kk = self.key(target.get("id") or "")
+            self._drop_paths(kk)
             self.env[kk] = value
             self._note_write(target.get("id") or "", value)
             if kk not in self.locals:
@@ -1573,6 +1589,7 @@ class _Analysis:
             self._call_setter(recv, target.get("name") or "", value)
             text = self._text(target)
             if text:
+                self._drop_paths(self.key(text))
                 self.env[self.key(text)] = value
                 self._note_write(text, value)
         elif k == "index":
@@ -1622,12 +1639,32 @@ class _Analysis:
             self.env = self._merge_envs(env_t, env_e)
         return False
 
-    @staticmethod
-    def _merge_envs(a: dict, b: dict) -> dict:
+    def _root_value(self, env: dict, key: str) -> Taint | None:
+        """Value of a dotted member path that `env` has no entry for: the nearest tracked root's taint
+        (`model.ReturnUrl` is as tainted as `model`)."""
+        parts = key.split(".")
+        for n in range(len(parts) - 1, 0, -1):
+            pre = ".".join(parts[:n])
+            if pre in env:
+                return env[pre]
+            if pre in self.field_taint:
+                return self.field_taint[pre]
+        return None
+
+    def _merge_envs(self, a: dict, b: dict) -> dict:
         out = {}
         for k in a.keys() | b.keys():
-            out[k] = merge(a.get(k), b.get(k))
+            va = a[k] if k in a else (self._root_value(a, k) if "." in k else None)
+            vb = b[k] if k in b else (self._root_value(b, k) if "." in k else None)
+            out[k] = merge(va, vb)
         return out
+
+    def _drop_paths(self, kk: str) -> None:
+        """A name was (re)assigned: member paths recorded under it (`kk.x`, e.g. a guarded `model.ReturnUrl`)
+        describe the old object."""
+        pre = kk + "."
+        for k in [k for k in self.env if k.startswith(pre)]:
+            del self.env[k]
 
     def _st_loop(self, s: dict) -> bool:
         header = s.get("header") or []
@@ -1636,8 +1673,18 @@ class _Analysis:
             and header[0].get("k") == "unknown" else None
         if len(header) == 2 and isinstance(header[0], dict) and header[0].get("k") == "name" \
                 and (header[1] or {}).get("k") != "unary":
-            self.env[self.key(header[0].get("id") or "")] = self.ev(header[1])
-            self.locals.add(self.key(header[0].get("id") or ""))
+            lv = self.key(header[0].get("id") or "")
+            self.env[lv] = self.ev(header[1])
+            self.locals.add(lv)
+            if (header[1].get("name") if header[1].get("k") == "member" else "") == "Entries":
+                self.types[lv] = "ZipArchiveEntry"      # `foreach (var e in archive.Entries)`
+            else:
+                self.types.pop(lv, None)
+        elif len(header) == 2 and isinstance(header[0], dict) and header[0].get("k") == "unknown"                 and _ZIP_ENTRY_DECL_RE.match(header[0].get("text") or ""):
+            lv = self.key(_ZIP_ENTRY_DECL_RE.match(header[0]["text"]).group(1))
+            self.env[lv] = self.ev(header[1])
+            self.locals.add(lv)
+            self.types[lv] = "ZipArchiveEntry"
         elif tup is not None and isinstance(header[1], dict):
             # `foreach (var (a, b) in xs)`: every deconstructed name carries the collection's taint.
             v = self.ev(header[1])

@@ -17,4 +17,9 @@ public class StreamsController : ControllerBase
     [HttpPost("stringpath")] public IActionResult StringPath(string p) { using var r = new StreamReader(p); return Ok(); }
     [HttpPost("writerpath")] public IActionResult WriterPath(string p) { using var w = new StreamWriter(p); return Ok(); }
     [HttpPost("filestream")] public IActionResult FileStreamPath(string p) { using var f = new FileStream(p, FileMode.Open); return Ok(); }
+
+    // A project method named like a stream factory that returns a path is still a path.
+    private static string OpenRead(string name) => name;
+    [HttpPost("useropen")] public IActionResult UserOpen(string p) { using var r = new StreamReader(OpenRead(p)); return Ok(); }
+    [HttpPost("formpath")] public IActionResult FormPath() { var v = Request.Form["a"]; using var r = new StreamReader(v); return Ok(); }
 }

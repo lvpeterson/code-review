@@ -52,7 +52,7 @@ def test_constant_paths_are_clean(findings):
 
 
 def test_zip_slip_sources(findings):
-    for action in ("SlipBody", "SlipDisk", "SlipName"):
+    for action in ("SlipBody", "SlipDisk", "SlipName", "SlipItem", "SlipTyped"):
         got = hits(findings, f"ArchiveController.{action}", "DNL-PATH-001")
         assert len(got) == 1, action
     for action in ("SlipDisk", "SlipName"):
@@ -87,7 +87,7 @@ def test_stream_arguments_are_not_paths(findings, action):
     assert not hits(findings, f"StreamsController.{action}", "DNL-PATH-001"), action
 
 
-@pytest.mark.parametrize("action", ["StringPath", "WriterPath", "FileStreamPath"])
+@pytest.mark.parametrize("action", ["StringPath", "WriterPath", "FileStreamPath", "UserOpen", "FormPath"])
 def test_string_paths_still_flag(findings, action):
     assert len(hits(findings, f"StreamsController.{action}", "DNL-PATH-001")) == 1, action
 
@@ -102,7 +102,8 @@ def test_is_local_url_cleanses_member_paths(findings, handler):
 
 
 @pytest.mark.parametrize("handler", ["RedirectController.Unguarded", "RedirectController.OtherMember",
-                                     "LoginModel.OnPostOther"])
+                                     "LoginModel.OnPostOther", "RedirectController.NoExit",
+                                     "RedirectController.Reassign"])
 def test_unguarded_redirects_still_flag(findings, handler):
     assert len(hits(findings, handler, "DNL-REDIR-001")) == 1, handler
 
@@ -117,7 +118,7 @@ def test_ssrf_path_only_is_low_review(findings, action):
     assert "only the path" in got[0].description
 
 
-@pytest.mark.parametrize("action", ["Full", "HostFirst", "SchemeOnly"])
+@pytest.mark.parametrize("action", ["Full", "HostFirst", "SchemeOnly", "HostNoSlash"])
 def test_ssrf_full_url_stays_high(findings, action):
     got = hits(findings, f"FetchController.{action}", "DNL-SSRF-001")
     assert len(got) == 1 and got[0].severity == "high" and got[0].confidence != "REVIEW", action

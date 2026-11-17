@@ -44,4 +44,20 @@ public class RedirectController : ControllerBase
         if (Url.IsLocalUrl(model.ReturnUrl)) { return Redirect(model.Other); }
         return BadRequest();
     }
+
+    // Controls: a guard that does not exit must not cleanse the other path, nor survive reassigning its root.
+    [HttpPost("noexit")]
+    public IActionResult NoExit([FromBody] ReturnModel model)
+    {
+        if (Url.IsLocalUrl(model.ReturnUrl)) { var x = 1; }
+        return Redirect(model.ReturnUrl);
+    }
+
+    [HttpPost("reassign")]
+    public IActionResult Reassign([FromBody] ReturnModel model, [FromQuery] ReturnModel m2)
+    {
+        if (!Url.IsLocalUrl(model.ReturnUrl)) { return BadRequest(); }
+        model = m2;
+        return Redirect(model.ReturnUrl);
+    }
 }
