@@ -2,7 +2,7 @@
 
 Groups: cookies and session (DNL-SESS-001/002/003 reused, DNL-SESS-009), antiforgery (DNL-CSRF-001
 reused, DNL-CSRF-002) and JWT / OIDC token validation (DNL-SESS-010, DNL-SESS-011, DNL-CFG-012,
-DNL-SEC-004). Later tasks add the Identity group to this module.
+DNL-SEC-004) and the Identity options (DNL-SEC-005, DNL-SEC-006, DNL-SEC-007).
 
 Like the other rules_pipeline* modules it must not import rules_auth_core (static inventory test);
 shared helpers live in auth_core.py.
@@ -1174,3 +1174,205 @@ def check_tokens(ctx: Ctx) -> None:
                         confidence=conf)
         _settings_https(ctx, pipe, add_cfg)
     _signing_keys(ctx)
+
+
+# -- Identity options (DNL-SEC-005, DNL-SEC-006, DNL-SEC-007) -------------------------------------------
+
+# Calls whose options lambda carries IdentityOptions; `Configure<T>` / `PostConfigure<T>` count only for it.
+_IDENTITY_CALLS = ("AddIdentity", "AddDefaultIdentity", "AddIdentityCore", "Configure", "PostConfigure")
+_MIN_PASSWORD_LENGTH = 8       # the framework default is 6: an unset RequiredLength is not reported
+_MAX_LOCKOUT_ATTEMPTS = 20
+_COMPLEXITY = {"password.requiredigit": "a digit", "password.requirelowercase": "a lower-case letter",
+               "password.requireuppercase": "an upper-case letter",
+               "password.requirenonalphanumeric": "a non-alphanumeric character"}
+_CONFIRMED = {"signin.requireconfirmedaccount": "RequireConfirmedAccount",
+              "signin.requireconfirmedemail": "RequireConfirmedEmail"}
+# The sub-objects of IdentityOptions the rules read, and the id each one feeds.
+_IDENTITY_PARTS = {"password": "DNL-SEC-005", "lockout": "DNL-SEC-006", "signin": "DNL-SEC-007"}
+_IDENTITY_META = {"DNL-SEC-005": ("medium", "Weak Identity password policy", "password options"),
+                  "DNL-SEC-006": ("medium", "Account lockout disabled or too lenient", "lockout options"),
+                  "DNL-SEC-007": ("low", "Identity does not require a confirmed account", "sign-in options")}
+# Parameter position of `lockoutOnFailure` in SignInManager.PasswordSignInAsync(user|userName, password,
+# isPersistent, lockoutOnFailure) and CheckPasswordSignInAsync(user, password, lockoutOnFailure).
+_SIGNIN_LOCKOUT_INDEX = {"PasswordSignInAsync": 3, "CheckPasswordSignInAsync": 2}
+
+
+def _identity_calls(ctx: Ctx, pipe: Pipeline) -> list[tuple[PipeCall, str | None]]:
+    def wanted(c: PipeCall) -> bool:
+        if c.name not in ("Configure", "PostConfigure"):
+            return True
+        targs = (c.node.get("fn") or {}).get("targs") or []
+        return any(str(x).strip().split(".")[-1] == "IdentityOptions" for x in targs)
+    return [(c, conf) for c, conf in _calls(ctx, pipe, *_IDENTITY_CALLS) if wanted(c)]
+
+
+def _int_kind(o: Opt, limit: int, bad_above: bool) -> str:
+    """"bad" | "good" | "unknown" for an integer setting against a limit: below `limit` is bad (a minimum),
+    or above it when `bad_above` (a maximum)."""
+    v = const(o.value)
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return "unknown"
+    return "bad" if (v > limit if bad_above else v < limit) else "good"
+
+
+def _identity_options(c: PipeCall, conf, add) -> None:
+    node = _prune(c.node)
+    reason = opaque_reason(node)
+    if reason is not None:
+        for cid, (sev, title, what) in _IDENTITY_META.items():
+            add(cid, sev, title, f"The {what} of {c.name} could not be read: {reason}. Confirm the password "
+                                 "length and complexity, lockout and account confirmation are enforced.",
+                c, c.line, "REVIEW")
+    opts = options_of(node)
+    for o in opts:        # o.Password = Build(); the whole sub-object comes from elsewhere
+        cid = _IDENTITY_PARTS.get(o.path.lower())
+        if cid is not None and not (isinstance(o.value, dict) and o.value.get("k") == "new"):
+            sev, title, what = _IDENTITY_META[cid]
+            add(cid, sev, title, f"o.{o.path} is assigned {_text(o.value)}, so its settings cannot be read; "
+                                 f"confirm the {what} are safe.", c, o.line, "REVIEW")
+    _password(opts, c, conf, add)
+    _lockout(opts, c, conf, add)
+    _confirmed(opts, c, conf, add)
+
+
+def _password(opts: list[Opt], c: PipeCall, conf, add) -> None:
+    sev, title, _ = _IDENTITY_META["DNL-SEC-005"]
+    o, uncertain = verdict(opts, "password.requiredlength",
+                           bad=lambda x: _int_kind(x, _MIN_PASSWORD_LENGTH, False) != "good")
+    if o is not None and _int_kind(o, _MIN_PASSWORD_LENGTH, False) != "good":
+        if _int_kind(o, _MIN_PASSWORD_LENGTH, False) == "bad" and not uncertain:
+            add("DNL-SEC-005", sev, title,
+                f"Password.RequiredLength is {const(o.value)}, below {_MIN_PASSWORD_LENGTH}, so short passwords "
+                f"are accepted and fall quickly to guessing. Require at least {_MIN_PASSWORD_LENGTH}.",
+                c, o.line, conf)
+        else:
+            why = ("is set under a condition" if _int_kind(o, _MIN_PASSWORD_LENGTH, False) == "bad"
+                   else f"is set from {_text(o.value)}, which is not a compile-time value")
+            add("DNL-SEC-005", sev, title,
+                f"Password.RequiredLength {why}, so it may be below {_MIN_PASSWORD_LENGTH} in Production; "
+                "confirm it is not.", c, o.line, "REVIEW")
+    for path, what in _COMPLEXITY.items():
+        same = [x for x in opts if x.path.lower() == path]
+        for i, x in enumerate(same):
+            if _flag_kind(x) != "bad":
+                continue        # a non-literal flag is not reported (the framework default requires it)
+            later = same[i + 1:]
+            if any(_flag_kind(y) == "good" and not y.conditional for y in later):
+                continue        # switched on again unconditionally
+            firm = not x.conditional and not any(_flag_kind(y) == "good" for y in later)
+            desc = f"{x.path} is false, so passwords need not contain {what}."
+            if not firm:
+                desc += " Some assignment to it sits under a condition, so it may not apply; confirm."
+            add("DNL-SEC-005", "low", title, desc, c, x.line, conf if firm else "REVIEW")
+
+
+def _lockout(opts: list[Opt], c: PipeCall, conf, add) -> None:
+    sev, title, _ = _IDENTITY_META["DNL-SEC-006"]
+    o, uncertain = verdict(opts, "lockout.allowedfornewusers", bad=lambda x: _flag_kind(x) != "good")
+    if o is not None and _flag_kind(o) != "good":
+        if _flag_kind(o) == "bad" and not uncertain:
+            add("DNL-SEC-006", sev, title,
+                "Lockout.AllowedForNewUsers is false, so new accounts are never locked out and a password can be "
+                "guessed without limit. Leave it true.", c, o.line, conf)
+        else:
+            why = ("is false under a condition" if _flag_kind(o) == "bad"
+                   else f"is set from {_text(o.value)}, which is not a compile-time value")
+            add("DNL-SEC-006", sev, title,
+                f"Lockout.AllowedForNewUsers {why}, so lockout may be off in Production; confirm it is true.",
+                c, o.line, "REVIEW")
+    o, uncertain = verdict(opts, "lockout.maxfailedaccessattempts",
+                           bad=lambda x: _int_kind(x, _MAX_LOCKOUT_ATTEMPTS, True) != "good")
+    if o is not None and _int_kind(o, _MAX_LOCKOUT_ATTEMPTS, True) != "good":
+        if _int_kind(o, _MAX_LOCKOUT_ATTEMPTS, True) == "bad" and not uncertain:
+            add("DNL-SEC-006", sev, title,
+                f"Lockout.MaxFailedAccessAttempts is {const(o.value)}, so an attacker gets that many guesses per "
+                f"account before the lockout (over {_MAX_LOCKOUT_ATTEMPTS}). Keep it at {_MAX_LOCKOUT_ATTEMPTS} or "
+                "fewer.", c, o.line, conf)
+        else:
+            why = ("is set under a condition" if _int_kind(o, _MAX_LOCKOUT_ATTEMPTS, True) == "bad"
+                   else f"is set from {_text(o.value)}, which is not a compile-time value")
+            add("DNL-SEC-006", sev, title,
+                f"Lockout.MaxFailedAccessAttempts {why}, so it may be over {_MAX_LOCKOUT_ATTEMPTS} in Production; "
+                "confirm it is not.", c, o.line, "REVIEW")
+
+
+def _confirmed(opts: list[Opt], c: PipeCall, conf, add) -> None:
+    sev, title, _ = _IDENTITY_META["DNL-SEC-007"]
+    for path, name in _CONFIRMED.items():
+        o, uncertain = verdict(opts, path, bad=lambda x: _flag_kind(x) == "bad")
+        if o is None or _flag_kind(o) != "bad":
+            continue            # absent, true or not a literal: explicit false only
+        desc = (f"SignIn.{name} is false, so an account can sign in before its owner proves control of the "
+                "address. Set it true.")
+        if uncertain:
+            desc += " Some assignment to it sits under a condition, so it may not apply; confirm."
+        add("DNL-SEC-007", sev, title, desc, c, o.line, "REVIEW" if uncertain else conf)
+
+
+def _signin_calls(ctx: Ctx, add_code) -> None:
+    """PasswordSignInAsync / CheckPasswordSignInAsync calls (any receiver) anywhere in the solution's code."""
+    for f in ctx.model.files.values():
+        for t in f.types:
+            roots = [m.body for m in t.methods]
+            for p in t.properties:
+                roots += [b for b in (p.get, p.set) if b]
+                if p.init is not None:
+                    roots.append(p.init)
+            roots += [fl.init for fl in t.fields if fl.init is not None]
+            for root in roots:
+                for n, state in _env_walk(root):
+                    idx = _SIGNIN_LOCKOUT_INDEX.get(call_name(n) or "") if n.get("k") == "call" else None
+                    if idx is None or state == "skip":
+                        continue
+                    args, named = n.get("args") or [], n.get("named") or {}
+                    arg = named["lockoutOnFailure"] if "lockoutOnFailure" in named else (
+                        args[idx] if len(args) > idx else None)
+                    name = call_name(n)
+                    if arg is None:
+                        if len(args) + len(named) < 2:
+                            continue        # not the Identity shape (user, password, ...)
+                        # The framework overloads take lockoutOnFailure with no default, so a call without it
+                        # is a wrapper or extension whose default (often false) this rule cannot see.
+                        add_code(t, n, state, "REVIEW", f"{name} is called without a lockoutOnFailure argument; "
+                                 "the Identity methods require one, so this is a wrapper whose default is not "
+                                 "visible here. Confirm it passes lockoutOnFailure: true.")
+                        continue
+                    v = const(arg)
+                    if v is True:
+                        continue
+                    if v is False:
+                        add_code(t, n, state, None, f"{name} passes lockoutOnFailure: false, so failed password "
+                                 "attempts are never counted and the account is never locked out, which allows "
+                                 "unlimited password guessing. Pass true.")
+                    else:
+                        add_code(t, n, state, "REVIEW", f"{name} passes lockoutOnFailure from {_text(arg)}, which "
+                                 "is not a compile-time value, so lockout may be off; confirm it is true.")
+
+
+def check_identity(ctx: Ctx) -> None:
+    seen: set = set()
+
+    def add(cid: str, sev: str, title: str, desc: str, c: PipeCall, line: int, conf: str | None) -> None:
+        if c.runs_in("Production") is None:
+            conf = "REVIEW"
+            desc += " The call sits under an environment condition that could not be parsed."
+        key = (cid, c.file, line, conf, desc)
+        if key not in seen:
+            seen.add(key)
+            ctx.add(cid, sev, title, desc, c.file, line, confidence=conf)
+
+    for pipe in ctx.pipes:
+        for c, conf in _identity_calls(ctx, pipe):
+            _identity_options(c, conf, add)
+
+    def add_code(t, n: dict, state: str, conf: str | None, desc: str) -> None:
+        if state == "review":
+            conf = "REVIEW"
+            desc += " The call sits under an environment condition that could not be parsed."
+        line = n.get("line") or t.line
+        key = ("DNL-SEC-006", t.file, line, desc)
+        if key not in seen:
+            seen.add(key)
+            sev, title, _ = _IDENTITY_META["DNL-SEC-006"]
+            ctx.add("DNL-SEC-006", sev, title, desc, t.file, line, confidence=conf)
+    _signin_calls(ctx, add_code)

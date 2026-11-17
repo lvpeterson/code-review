@@ -883,7 +883,8 @@ def _cors(ctx: Ctx) -> None:
 _GROUPS: list = [("errors", _errors), ("transport", _transport), ("cors", _cors),
                  ("cookies", rules_pipeline_auth.check_cookies),
                  ("antiforgery", rules_pipeline_auth.check_antiforgery),
-                 ("tokens", rules_pipeline_auth.check_tokens)]
+                 ("tokens", rules_pipeline_auth.check_tokens),
+                 ("identity", rules_pipeline_auth.check_identity)]
 
 
 def check(model: ProjectModel, refs: list[CoreRouteRef]) -> list[Finding]:

@@ -814,3 +814,211 @@ def test_ms_identity_method_group_named_like_config_is_opaque(tmp_path, mode):
         files = prog(f"builder.Services.AddAuthentication().AddMicrosoftIdentityWebApi({arg});")
         f = scan(tmp_path / str(i), files, mode)
         assert ("DNL-SESS-010", "medium", "REVIEW") in tok(f, "DNL-SESS-010"), arg
+
+
+# -- Identity options (DNL-SEC-005, DNL-SEC-006, DNL-SEC-007) -------------------------------------------
+
+def ident(lines: str, call: str = "AddIdentity<IdentityUser, IdentityRole>") -> dict:
+    return prog(f"builder.Services.{call}(o => {{ {lines} }});")
+
+
+def sec(found, *cids):
+    return {(f.check_id, f.severity, f.confidence) for f in found if f.check_id in cids}
+
+
+IDS_ID = ("DNL-SEC-005", "DNL-SEC-006", "DNL-SEC-007")
+
+
+def test_password_required_length(tmp_path, mode):
+    f = scan(tmp_path / "a", ident("o.Password.RequiredLength = 4;"), mode)
+    assert ("DNL-SEC-005", "medium", None) in ids(f)
+    f = scan(tmp_path / "b", ident("o.Password.RequiredLength = 12;"), mode)
+    assert not sec(f, *IDS_ID)
+    f = scan(tmp_path / "c", ident("o.Password.RequiredLength = 8;"), mode)
+    assert not sec(f, *IDS_ID)
+
+
+def test_password_required_length_all_entry_points(tmp_path, mode):
+    for i, call in enumerate(("AddDefaultIdentity<IdentityUser>", "AddIdentityCore<IdentityUser>")):
+        f = scan(tmp_path / str(i), ident("o.Password.RequiredLength = 4;", call), mode)
+        assert ("DNL-SEC-005", "medium", None) in ids(f), call
+    f = scan(tmp_path / "cfg", prog("builder.Services.Configure<IdentityOptions>(o => { o.Password.RequiredLength = 4; });"), mode)
+    assert ("DNL-SEC-005", "medium", None) in ids(f)
+    f = scan(tmp_path / "other", prog("builder.Services.Configure<SomeOptions>(o => { o.Password.RequiredLength = 4; });"), mode)
+    assert not sec(f, *IDS_ID)
+
+
+def test_password_required_length_not_literal_is_review(tmp_path, mode):
+    f = scan(tmp_path, ident("o.Password.RequiredLength = n;"), mode)
+    assert sec(f, "DNL-SEC-005") == {("DNL-SEC-005", "medium", "REVIEW")}
+
+
+def test_password_required_length_conditional(tmp_path, mode):
+    f = scan(tmp_path / "a", ident("if (flag) { o.Password.RequiredLength = 4; }"), mode)
+    assert sec(f, "DNL-SEC-005") == {("DNL-SEC-005", "medium", "REVIEW")}
+    # a conditional good value never clears an earlier bad one
+    f = scan(tmp_path / "b", ident("o.Password.RequiredLength = 4; if (flag) { o.Password.RequiredLength = 12; }"), mode)
+    assert sec(f, "DNL-SEC-005") == {("DNL-SEC-005", "medium", "REVIEW")}
+    # an unconditional good value after it does
+    f = scan(tmp_path / "c", ident("o.Password.RequiredLength = 4; o.Password.RequiredLength = 12;"), mode)
+    assert not sec(f, "DNL-SEC-005")
+
+
+def test_password_complexity_flags(tmp_path, mode):
+    f = scan(tmp_path / "a", ident("o.Password.RequireDigit = false;"), mode)
+    assert ("DNL-SEC-005", "low", None) in ids(f)
+    f = scan(tmp_path / "b", ident("o.Password.RequireDigit = true;"), mode)
+    assert not sec(f, *IDS_ID)
+    # one finding per assignment
+    three = ident("o.Password.RequireLowercase = false;\n o.Password.RequireUppercase = false;\n"
+                  " o.Password.RequireNonAlphanumeric = false;")
+    f = scan(tmp_path / "c", three, mode)
+    assert len([x for x in f if x.check_id == "DNL-SEC-005"]) == 3
+    # non-literal complexity flags are not reported; unique chars are ignored
+    f = scan(tmp_path / "d", ident("o.Password.RequireDigit = cfg; o.Password.RequiredUniqueChars = 0;"), mode)
+    assert not sec(f, *IDS_ID)
+    f = scan(tmp_path / "e", ident("if (flag) { o.Password.RequireDigit = false; }"), mode)
+    assert sec(f, "DNL-SEC-005") == {("DNL-SEC-005", "low", "REVIEW")}
+
+
+def test_password_object_initializer(tmp_path, mode):
+    f = scan(tmp_path / "a", ident("o.Password = new PasswordOptions { RequiredLength = 4 };"), mode)
+    assert ("DNL-SEC-005", "medium", None) in ids(f)
+    f = scan(tmp_path / "b", ident("o.Password = BuildPasswordOptions();"), mode)
+    assert ("DNL-SEC-005", "medium", "REVIEW") in ids(f)
+
+
+def test_lockout_options(tmp_path, mode):
+    f = scan(tmp_path / "a", ident("o.Lockout.AllowedForNewUsers = false;"), mode)
+    assert ("DNL-SEC-006", "medium", None) in ids(f)
+    f = scan(tmp_path / "b", ident("o.Lockout.AllowedForNewUsers = true;"), mode)
+    assert not sec(f, *IDS_ID)
+    f = scan(tmp_path / "c", ident("o.Lockout.MaxFailedAccessAttempts = 1000;"), mode)
+    assert ("DNL-SEC-006", "medium", None) in ids(f)
+    f = scan(tmp_path / "d", ident("o.Lockout.MaxFailedAccessAttempts = 5;"), mode)
+    assert not sec(f, *IDS_ID)
+    f = scan(tmp_path / "e", ident("o.Lockout.MaxFailedAccessAttempts = 20;"), mode)
+    assert not sec(f, *IDS_ID)
+
+
+def test_lockout_not_literal_or_conditional_is_review(tmp_path, mode):
+    f = scan(tmp_path / "a", ident("o.Lockout.MaxFailedAccessAttempts = n;"), mode)
+    assert sec(f, "DNL-SEC-006") == {("DNL-SEC-006", "medium", "REVIEW")}
+    f = scan(tmp_path / "b", ident("o.Lockout.AllowedForNewUsers = cfg;"), mode)
+    assert sec(f, "DNL-SEC-006") == {("DNL-SEC-006", "medium", "REVIEW")}
+    f = scan(tmp_path / "c", ident("o.Lockout.AllowedForNewUsers = false; if (flag) { o.Lockout.AllowedForNewUsers = true; }"), mode)
+    assert sec(f, "DNL-SEC-006") == {("DNL-SEC-006", "medium", "REVIEW")}
+    f = scan(tmp_path / "d", ident("o.Lockout = LockoutDefaults();"), mode)
+    assert ("DNL-SEC-006", "medium", "REVIEW") in ids(f)
+
+
+SIGNIN = ("using Microsoft.AspNetCore.Identity;\nusing Microsoft.AspNetCore.Mvc;\n"
+          "public class AccountController : Controller {{\n"
+          "  private readonly SignInManager<IdentityUser> signIn;\n"
+          "  public AccountController(SignInManager<IdentityUser> s) {{ signIn = s; }}\n"
+          "  public async Task<IActionResult> Login(IdentityUser u, string p, bool remember, bool lockout) {{\n"
+          "    {stmt}\n    return Ok();\n  }}\n}}\n")
+
+
+def signin(call: str, tmp_path, mode, wrap: str = "var r = await CALL;"):
+    body = SIGNIN.format(stmt=wrap.replace("CALL", call))
+    return scan(tmp_path, {**prog(""), "AccountController.cs": body}, mode)
+
+
+def test_password_sign_in_lockout_off(tmp_path, mode):
+    f = signin("signIn.PasswordSignInAsync(u, p, false, lockoutOnFailure: false)", tmp_path / "a", mode)
+    hit = [x for x in f if x.check_id == "DNL-SEC-006"]
+    assert [(x.severity, x.confidence) for x in hit] == [("medium", None)]
+    assert hit[0].file.endswith("AccountController.cs") and hit[0].line == 7
+    f = signin("signIn.PasswordSignInAsync(u, p, remember, false)", tmp_path / "b", mode)
+    assert ("DNL-SEC-006", "medium", None) in ids(f)
+    f = signin("signIn.PasswordSignInAsync(u, p, remember, lockoutOnFailure: true)", tmp_path / "c", mode)
+    assert not sec(f, "DNL-SEC-006")
+    f = signin("signIn.PasswordSignInAsync(u, p, remember, true)", tmp_path / "d", mode)
+    assert not sec(f, "DNL-SEC-006")
+
+
+def test_check_password_sign_in_lockout_off(tmp_path, mode):
+    f = signin("signIn.CheckPasswordSignInAsync(u, p, false)", tmp_path / "a", mode)
+    assert ("DNL-SEC-006", "medium", None) in ids(f)
+    f = signin("signIn.CheckPasswordSignInAsync(u, p, lockoutOnFailure: false)", tmp_path / "b", mode)
+    assert ("DNL-SEC-006", "medium", None) in ids(f)
+    f = signin("signIn.CheckPasswordSignInAsync(u, p, true)", tmp_path / "c", mode)
+    assert not sec(f, "DNL-SEC-006")
+    # the third argument of PasswordSignInAsync is isPersistent, not the lockout flag
+    f = signin("signIn.PasswordSignInAsync(u, p, false, true)", tmp_path / "d", mode)
+    assert not sec(f, "DNL-SEC-006")
+
+
+def test_sign_in_lockout_not_literal_or_omitted_is_review(tmp_path, mode):
+    f = signin("signIn.PasswordSignInAsync(u, p, remember, lockout)", tmp_path / "a", mode)
+    assert sec(f, "DNL-SEC-006") == {("DNL-SEC-006", "medium", "REVIEW")}
+    f = signin("signIn.CheckPasswordSignInAsync(u, p, lockoutOnFailure: !lockout)", tmp_path / "b", mode)
+    assert sec(f, "DNL-SEC-006") == {("DNL-SEC-006", "medium", "REVIEW")}
+    # The framework methods have no default for lockoutOnFailure, so an omitted argument means a wrapper
+    # (or extension) whose default this rule cannot see: REVIEW, never clean.
+    f = signin("signIn.PasswordSignInAsync(u, p)", tmp_path / "c", mode)
+    assert sec(f, "DNL-SEC-006") == {("DNL-SEC-006", "medium", "REVIEW")}
+    f = signin("signIn.PasswordSignInAsync(u, p, isPersistent: remember)", tmp_path / "d", mode)
+    assert sec(f, "DNL-SEC-006") == {("DNL-SEC-006", "medium", "REVIEW")}
+
+
+def test_sign_in_under_environment_guard(tmp_path, mode):
+    call = "signIn.PasswordSignInAsync(u, p, remember, false)"
+    f = signin(call, tmp_path / "a", mode, "if (env.IsDevelopment()) { var r = await CALL; }")
+    assert not sec(f, "DNL-SEC-006")
+    f = signin(call, tmp_path / "b", mode, "if (Check()) { var r = await CALL; }")
+    assert ("DNL-SEC-006", "medium", None) in ids(f)
+
+
+def test_sign_in_confirmation_options(tmp_path, mode):
+    f = scan(tmp_path / "a", ident("o.SignIn.RequireConfirmedAccount = false;"), mode)
+    assert ("DNL-SEC-007", "low", None) in ids(f)
+    f = scan(tmp_path / "b", ident("o.SignIn.RequireConfirmedEmail = false;"), mode)
+    assert ("DNL-SEC-007", "low", None) in ids(f)
+    f = scan(tmp_path / "c", ident("o.SignIn.RequireConfirmedAccount = true;"), mode)
+    assert not sec(f, *IDS_ID)
+    f = scan(tmp_path / "d", ident("o.SignIn.RequireConfirmedAccount = cfg;"), mode)
+    assert not sec(f, *IDS_ID)
+    f = scan(tmp_path / "e", ident("if (flag) { o.SignIn.RequireConfirmedEmail = false; }"), mode)
+    assert sec(f, "DNL-SEC-007") == {("DNL-SEC-007", "low", "REVIEW")}
+    f = scan(tmp_path / "f", ident("o.SignIn.RequireConfirmedEmail = false; if (flag) { o.SignIn.RequireConfirmedEmail = true; }"), mode)
+    assert sec(f, "DNL-SEC-007") == {("DNL-SEC-007", "low", "REVIEW")}
+    f = scan(tmp_path / "g", ident("o.SignIn = LoadSignIn();"), mode)
+    assert ("DNL-SEC-007", "low", "REVIEW") in ids(f)
+
+
+def test_identity_without_options_is_silent(tmp_path, mode):
+    f = scan(tmp_path / "a", prog("builder.Services.AddDefaultIdentity<IdentityUser>();"), mode)
+    assert not sec(f, *IDS_ID)
+    f = scan(tmp_path / "b", prog("builder.Services.AddIdentity<IdentityUser, IdentityRole>();"), mode)
+    assert not sec(f, *IDS_ID)
+
+
+def test_identity_opaque_options_are_review(tmp_path, mode):
+    calls = ("builder.Services.AddIdentity<IdentityUser, IdentityRole>(ConfigureIdentity);",
+             "builder.Services.AddDefaultIdentity<IdentityUser>(identityOpts);",
+             "builder.Services.AddIdentityCore<IdentityUser>(o => Harden(o));",
+             "builder.Services.Configure<IdentityOptions>(builder.Configuration.GetSection(\"Identity\"));")
+    for i, call in enumerate(calls):
+        f = scan(tmp_path / str(i), prog(call), mode)
+        got = sec(f, *IDS_ID)
+        assert {c for c, _, _ in got} == set(IDS_ID), call
+        assert all(k == "REVIEW" for _, _, k in got), call
+
+
+def test_identity_weak_options_in_development(tmp_path, mode):
+    weak = "o.Password.RequiredLength = 4; o.Lockout.AllowedForNewUsers = false; o.SignIn.RequireConfirmedAccount = false;"
+    dev = ("if (builder.Environment.IsDevelopment()) { builder.Services.AddIdentity<IdentityUser, IdentityRole>(o => { "
+           + weak + " }); }")
+    f = scan(tmp_path / "a", prog(dev), mode)
+    assert not sec(f, *IDS_ID)
+    # the guard inside the lambda
+    f = scan(tmp_path / "b", ident("if (builder.Environment.IsDevelopment()) { " + weak + " }"), mode)
+    assert not sec(f, *IDS_ID)
+    unparsed = ("if (Settings.Relaxed()) { builder.Services.AddIdentity<IdentityUser, IdentityRole>(o => "
+                "{ o.Password.RequiredLength = 4; }); }")
+    f = scan(tmp_path / "c", prog(unparsed), mode)
+    assert sec(f, "DNL-SEC-005") == {("DNL-SEC-005", "medium", "REVIEW")}
+    f = scan(tmp_path / "d", ident("if (!builder.Environment.IsDevelopment()) { o.Password.RequiredLength = 4; }"), mode)
+    assert ("DNL-SEC-005", "medium", None) in ids(f)
