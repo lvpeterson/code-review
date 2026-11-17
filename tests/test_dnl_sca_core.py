@@ -195,7 +195,7 @@ def test_eol_suffix_stripped(tmp_path):
         '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net6.0-windows</TargetFramework>'
         "</PropertyGroup></Project>", encoding="utf-8")
     findings, _ = _run(tmp_path)
-    assert [f.title for f in _by(findings, "DNL-SCA-003")] == ["Target framework net6.0 is past end of support"]
+    assert "Target framework net6.0 is past end of support" in [f.title for f in _by(findings, "DNL-SCA-003")]
 
 
 # -- wwwroot JS (SCA-002) --------------------------------------------------
@@ -437,3 +437,13 @@ def test_detector_deps_survives_a_file_that_resolves_outside_its_owner(tmp_path,
     monkeypatch.setattr(core_detector, "iter_dnl_files",
                         lambda target, exts: iter([outside]) if ".js" in exts else real(target, exts))
     assert "deps" not in core_detector.detect_frameworks(root)
+
+
+def test_eos_framework_in_a_conditional_group_is_reported(tmp_path):
+    (tmp_path / "Directory.Build.props").write_text(
+        "<Project><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>"
+        "<PropertyGroup Condition=\"'$(Old)' == 'true'\"><TargetFramework>net6.0</TargetFramework></PropertyGroup></Project>",
+        encoding="utf-8")
+    (tmp_path / "A.csproj").write_text('<Project Sdk="Microsoft.NET.Sdk"></Project>', encoding="utf-8")
+    findings, _ = _run(tmp_path)
+    assert "Target framework net6.0 is past end of support" in [f.title for f in _by(findings, "DNL-SCA-003")]

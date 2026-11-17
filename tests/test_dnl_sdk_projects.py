@@ -281,3 +281,98 @@ def test_no_tfm_anywhere_keeps_note(tmp_path):
     notes: list[str] = []
     app = _by_name(load_projects(tmp_path, notes), "App")
     assert app.profile == "netcore" and any("assuming modern" in n for n in notes)
+
+
+def test_conditional_tfms_are_a_union(tmp_path):
+    (tmp_path / "Directory.Build.props").write_text(
+        "<Project><PropertyGroup Condition=\"'$(A)' == 'x'\"><TargetFramework>net6.0</TargetFramework></PropertyGroup>"
+        "<PropertyGroup Condition=\"'$(A)' != 'x'\"><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>")
+    _sdk_csproj(tmp_path / "App")
+    app = _by_name(load_projects(tmp_path), "App")
+    assert app.target_frameworks == ["net6.0", "net8.0"]
+
+
+def test_unresolved_tfm_value_adds_a_note(tmp_path):
+    (tmp_path / "Directory.Build.props").write_text(
+        "<Project><PropertyGroup><TargetFramework>$(DefaultTfm)</TargetFramework></PropertyGroup></Project>")
+    _sdk_csproj(tmp_path / "App")
+    notes: list[str] = []
+    app = _by_name(load_projects(tmp_path, notes), "App")
+    assert app.target_frameworks == []
+    assert any("Directory.Build.props" in n and "$(DefaultTfm)" in n for n in notes)
+
+
+def test_tfm_property_reference_resolves_from_earlier_props(tmp_path):
+    (tmp_path / "Directory.Build.props").write_text(
+        "<Project><PropertyGroup><DefaultTfm>net7.0</DefaultTfm>"
+        "<TargetFramework>$(DefaultTfm)</TargetFramework></PropertyGroup></Project>")
+    _sdk_csproj(tmp_path / "App")
+    notes: list[str] = []
+    app = _by_name(load_projects(tmp_path, notes), "App")
+    assert app.target_frameworks == ["net7.0"]
+
+
+def test_nearer_non_chaining_build_props_hides_parent(tmp_path):
+    (tmp_path / "Directory.Build.props").write_text(
+        "<Project><PropertyGroup><TargetFramework>net6.0</TargetFramework></PropertyGroup></Project>")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "Directory.Build.props").write_text(
+        "<Project><PropertyGroup><ImplicitUsings>enable</ImplicitUsings></PropertyGroup></Project>")
+    _sdk_csproj(tmp_path / "src" / "App")
+    app = _by_name(load_projects(tmp_path), "App")
+    assert app.target_frameworks == []
+
+
+@pytest.mark.parametrize("imp", [
+    "$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))",
+    "../Directory.Build.props",
+])
+def test_chaining_build_props_inherits_parent(tmp_path, imp):
+    (tmp_path / "Directory.Build.props").write_text(
+        "<Project><PropertyGroup><TargetFramework>net6.0</TargetFramework></PropertyGroup></Project>")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "Directory.Build.props").write_text(
+        f'<Project><Import Project="{imp}" /><PropertyGroup><ImplicitUsings>enable</ImplicitUsings></PropertyGroup></Project>')
+    _sdk_csproj(tmp_path / "src" / "App")
+    app = _by_name(load_projects(tmp_path), "App")
+    assert app.target_frameworks == ["net6.0"]
+
+
+def test_test_project_detection(tmp_path):
+    for name in ("MyUnitTests", "Shop.Test", "Latest", "Web"):
+        _sdk_csproj_named(tmp_path / "src" / name, name)
+    (tmp_path / "src" / "Web" / "Controllers" / "Test").mkdir(parents=True)
+    (tmp_path / "src" / "Web" / "Controllers" / "Test" / "B.cs").write_text("class B {}")
+    model = project.ProjectModel(tmp_path.resolve(), load_projects(tmp_path), {}, "x")
+    assert model.is_core_test_file("src/MyUnitTests/A.cs")
+    assert model.is_core_test_file("src/Shop.Test/A.cs")
+    assert not model.is_core_test_file("src/Latest/A.cs")
+    assert not model.is_core_test_file("src/Web/A.cs")
+    assert not model.is_core_test_file("src/Web/Controllers/Test/B.cs")
+
+
+def _sdk_csproj_named(d, name):
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{name}.csproj").write_text(
+        '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>')
+    (d / "A.cs").write_text("class A {}")
+
+
+def test_conditional_tfm_does_not_move_a_project_between_packages(tmp_path):
+    (tmp_path / "Directory.Build.props").write_text(
+        "<Project><PropertyGroup><TargetFramework>net48</TargetFramework></PropertyGroup>"
+        "<PropertyGroup Condition=\"'$(UseModern)' == 'true'\"><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>")
+    _sdk_csproj(tmp_path / "App")
+    app = _by_name(load_projects(tmp_path), "App")
+    assert app.owner == "dotnet_legacy" and app.profile == "net48"
+    # the conditional framework is still reported
+    assert app.target_frameworks == ["net48", "net8.0"]
+
+
+def test_unconditional_modern_tfm_with_conditional_old_one_stays_core(tmp_path):
+    (tmp_path / "Directory.Build.props").write_text(
+        "<Project><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>"
+        "<PropertyGroup Condition=\"'$(Old)' == 'true'\"><TargetFramework>net472</TargetFramework></PropertyGroup></Project>")
+    _sdk_csproj(tmp_path / "App")
+    app = _by_name(load_projects(tmp_path), "App")
+    assert app.owner == "dotnet" and app.target_frameworks == ["net8.0", "net472"]

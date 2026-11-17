@@ -34,4 +34,9 @@ public class Hashing
     {
         return SHA256.HashData(data);
     }
+
+    public byte[] HmacSha1(byte[] key, byte[] data)
+    {
+        return HMACSHA1.HashData(key, data);
+    }
 }

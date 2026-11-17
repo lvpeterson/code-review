@@ -43,10 +43,18 @@ def test_d4_static_weak_hash_calls_fire(findings):
     assert all(g[1] == "medium" for g in got)
 
 
-def test_n4_key_name_and_sentence_literals_skipped(findings):
-    got = _of(findings, "DNL-SEC-003", SECRETS)
-    assert [g[0] for g in got] == [10]           # only the real-looking signing secret
-    assert got[0][1] == "high" and got[0][2] is None
+def test_n4_key_name_literals_skipped_weak_looking_ones_demoted(findings):
+    got = {g[0]: g[1:] for g in _of(findings, "DNL-SEC-003", SECRETS)}
+    # accessToken / user_token / __RequestVerificationToken / id_token (lines 7-10): skipped
+    assert not {7, 8, 9, 10} & set(got)
+    assert got[11] == ("high", None)             # real-looking secret unchanged
+    # name-shaped literals on a secret-like variable, or too long, or without a key word: never dropped
+    for line in (16, 17, 18, 19, 20, 21, 22, 26):
+        assert got[line] == ("low", "REVIEW"), line
+
+
+def test_hmacsha1_hashdata_is_not_flagged(findings):
+    assert 40 not in [g[0] for g in _of(findings, "DNL-CRY-001", HASH)]
 
 
 def test_n4_test_project_findings_demoted(findings):
@@ -58,6 +66,15 @@ def test_n4_test_project_findings_demoted(findings):
     assert _of(findings, "DNL-SSRF-001", PROXY) == [(14, "high", None)]
 
 
+GATES = {"src/Misc3d/Services/GateNested.cs", "src/Misc3d/Services/GateStaticUsing.cs",
+         "src/Misc3d/Services/GateExtension.cs", "src/Misc3d/Services/GateGeneric.cs"}
+
+
+def test_n7_scoped_resolution_keeps_real_gates(findings):
+    # nested class -> outer method, `using static` helper, extension method via this., generic base
+    assert {f.file for f in findings if f.check_id == "DNL-ERR-001"} == GATES
+
+
 def test_n7_no_fail_open_catch_for_modelstate_and_service_calls(findings):
     # An unqualified call must not resolve to a same-named method of an unrelated type.
-    assert [f for f in findings if f.check_id == "DNL-ERR-001"] == []
+    assert not [f for f in findings if f.check_id == "DNL-ERR-001" and "Checkout" in f.file]

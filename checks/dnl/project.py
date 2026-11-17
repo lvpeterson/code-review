@@ -65,7 +65,9 @@ class Project:
         return self.path is not None and not self.is_legacy
 
 
-_TEST_NAME = re.compile(r"(?i)(?:^|\.)(?:unit|integration|functional|e2e)?tests?$")
+# A test project's own name or folder: `Shop.Tests`, `shop-test`, `tests`, `MyUnitTests` (a capital T
+# after another character; `Latest` is not one).
+_TEST_NAME = re.compile(r"(?:^|[._-])(?i:tests?)$|[A-Za-z0-9]Tests?$")
 
 
 @dataclass
@@ -196,16 +198,13 @@ class ProjectModel:
         return proj is not None and proj.owner == "dotnet"
 
     def is_core_test_file(self, rel: str) -> bool:
-        """A modern .NET file of a test project: the project name ends with .Tests / .Test /
-        .UnitTests / .IntegrationTests (or `Tests` / `Test`), or a folder of the path (below the
-        scan root) is named tests / test or ends with .Tests / .Test."""
+        """A modern .NET file of a test project: the project's own name or the folder of its project
+        file is test-like (`Shop.Tests`, `MyUnitTests`, `tests`). A `Test` folder inside a production
+        project does not count."""
         proj = self.project_of(rel)
         if proj is None or proj.owner != "dotnet":
             return False
-        if _TEST_NAME.search(proj.name or ""):
-            return True
-        return any(seg.lower() in ("tests", "test") or _TEST_NAME.search(seg)
-                   for seg in rel.replace("\\", "/").split("/")[:-1])
+        return bool(_TEST_NAME.search(proj.name or "") or _TEST_NAME.search(proj.dir.name or ""))
 
 
 # -- project loading ------------------------------------------------------
@@ -294,71 +293,122 @@ def _child_or_attr(el, name: str) -> str | None:
 @dataclass
 class _Facts:
     sdk: str | None = None
+    # Every framework named (conditional groups included): what end-of-support checks report.
     tfms: list[str] = field(default_factory=list)
+    # The effective frameworks (unconditional values; nearest file wins): they decide profile and owner.
+    effective: list[str] = field(default_factory=list)
     packages: dict[str, str] = field(default_factory=dict)
     framework_refs: set[str] = field(default_factory=set)
     usings: list[str] = field(default_factory=list)
+    unresolved: list[str] = field(default_factory=list)
+
+
+_ABOVE = re.compile(r"GetPathOfFileAbove|GetDirectoryNameOfFileAbove", re.I)
+_ABOVE_NAME = re.compile(r"GetPathOfFileAbove\(\s*['\"]?([^,'\")$]+)", re.I)
+
+
+def _nearest_above(start: Path, root: Path, name: str) -> Path | None:
+    """The nearest `name` file in start or a folder above it, never above the scan root."""
+    chain = _props_chain(start, root, name)
+    return chain[-1] if chain else None
 
 
 def _props_layers(start: Path, root: Path) -> list:
-    """Parsed Directory.*.props files from the scan root down to start (farthest first, nearest
-    last; within one folder Directory.Build.props, then the others by name). A literal
-    `<Import Project="x.props">` is followed (relative to its file) and applies before its importer."""
-    out: list = []
+    """(file name, parsed XML) layers of Directory.Build.props / Directory.Packages.props for a project in
+    `start`, farthest first. As MSBuild does, only the NEAREST file of each name applies, unless it imports
+    its parent (`GetPathOfFileAbove(..)`, `GetDirectoryNameOfFileAbove(..)` or an explicit
+    `<Import Project="../Directory.Build.props">`), in which case the parent applies first. Other literal
+    imports (`<Import Project="common.props">`) are followed and apply before their importer."""
+    layers: list = []
     seen: set[Path] = set()
+    rroot = root.resolve()
 
-    def load(f: Path, depth: int) -> None:
+    def load(f: Path, depth: int, rank: int) -> None:
         f = f.resolve()
-        if f in seen or depth > 5:
+        if f in seen or depth > 6:
             return
         seen.add(f)
         t = _parse_xml(f)
         if t is None:
             return
         for el in t.iter():
-            ref = el.get("Project") if _local(el.tag) == "Import" else None
-            if ref and "$(" not in ref and "*" not in ref:
-                load(f.parent / ref.replace("\\", "/"), depth + 1)
-        out.append(t)
+            ref = (el.get("Project") or "").strip() if _local(el.tag) == "Import" else ""
+            if not ref:
+                continue
+            parent = None
+            if _ABOVE.search(ref):
+                m = _ABOVE_NAME.search(ref)
+                if f.parent != rroot and f.parent.parent.is_relative_to(rroot):
+                    parent = _nearest_above(f.parent.parent, rroot, m.group(1).strip() if m else f.name)
+            elif "$(" not in ref and "*" not in ref:
+                target = (f.parent / ref.replace("\\", "/")).resolve()
+                if target.is_file():
+                    parent = target
+            if parent is not None:
+                load(parent, depth + 1, rank)
+        layers.append((len(f.parent.parts), rank, (f.name, t)))
 
-    cur = start.resolve()
-    root = root.resolve()
-    dirs: list[Path] = []
-    while True:
-        dirs.append(cur)
-        if cur == root or not cur.is_relative_to(root) or cur.parent == cur:
-            break
-        cur = cur.parent
-    for d in reversed(dirs):
-        if not d.is_dir():
-            continue
-        try:
-            names = [c for c in d.iterdir() if c.is_file() and c.name.lower().startswith("directory.")
-                     and c.name.lower().endswith(".props")]
-        except OSError:
-            continue
-        for f in sorted(names, key=lambda c: (c.name.lower() != "directory.build.props", c.name.lower())):
-            load(f, 0)
-    return out
+    for rank, name in enumerate(("Directory.Build.props", "Directory.Packages.props")):
+        nearest = _nearest_above(start, rroot, name)
+        if nearest is not None:
+            load(nearest, 0, rank)
+    layers.sort(key=lambda x: (x[0], x[1]))
+    return [x for _d, _r, x in layers]
+
+
+def _resolve_tfm(value: str, props: dict[str, str]) -> str | None:
+    """A TargetFramework value with `$(X)` references replaced from the known properties; None when one
+    stays unresolved."""
+    for _ in range(5):
+        if "$(" not in value:
+            return value
+        value = re.sub(r"\$\(([A-Za-z0-9_.]+)\)", lambda m: props.get(m.group(1), m.group(0)), value)
+    return None if "$(" in value else value
 
 
 def _sdk_facts(path: Path, tree, root: Path) -> _Facts:
-    """Properties, packages and usings of an SDK project: Directory.Build.props files
-    from the scan root down (nearest wins), then the project file itself; central
-    versions from Directory.Packages.props (nearest wins). A `VersionOverride` beats both."""
+    """Properties, packages and usings of an SDK project: the applicable Directory.Build.props files
+    (nearest, plus parents it chains to), then the project file itself; central versions from
+    the nearest Directory.Packages.props. A `VersionOverride` beats both. TargetFramework(s) of one
+    file are the union over all its (conditional) property groups; a nearer file replaces a farther one."""
     props: dict[str, str] = {}
     refs: list[tuple[str, str | None, str | None]] = []
     usings: list[tuple[str, str]] = []
     fw: set[str] = set()
-    for src in [*_props_layers(path.parent, root), tree]:
+    tfms: list[str] = []
+    effective: list[str] = []
+    unresolved: list[str] = []
+    for src_name, src in [*_props_layers(path.parent, root), (path.name, tree)]:
         if src is None:
             continue
+        file_tfms: list[tuple[str, bool]] = []
         for pg in (e for e in src.iter() if _local(e.tag) == "PropertyGroup"):
-            layer = {_local(c.tag): (c.text or "").strip() for c in pg if (c.text or "").strip()}
-            if "TargetFramework" in layer or "TargetFrameworks" in layer:
-                props.pop("TargetFramework", None)
-                props.pop("TargetFrameworks", None)
-            props.update(layer)
+            for c in pg:
+                key, val = _local(c.tag), (c.text or "").strip()
+                if not val:
+                    continue
+                if key in ("TargetFramework", "TargetFrameworks"):
+                    file_tfms.append((val, bool(pg.get('Condition') or c.get('Condition'))))
+                else:
+                    props[key] = val
+        if file_tfms:
+            # Effective: the unconditional values (all of them when every group is conditional).
+            # Reported: every value, so an end-of-support framework in any group is seen.
+            tfms, effective = [], []
+            has_plain = any(not cond for _v, cond in file_tfms)
+            for val, cond in file_tfms:
+                for tfm in (x.strip() for x in val.split(";")):
+                    if not tfm:
+                        continue
+                    res = _resolve_tfm(tfm, props)
+                    if res is None:
+                        unresolved.append(f"{src_name}: {tfm}")
+                        continue
+                    if (not cond or not has_plain) and res not in effective:
+                        effective.append(res)
+                    if res not in tfms:
+                        tfms.append(res)
+            tfms = effective + [t for t in tfms if t not in effective]
         for el in src.iter():
             tag = _local(el.tag)
             if tag == "PackageReference" and el.get("Include"):
@@ -372,7 +422,7 @@ def _sdk_facts(path: Path, tree, root: Path) -> _Facts:
                 elif el.get("Remove"):
                     usings.append(("remove", el.get("Remove").strip()))
     central: dict[str, str] = {}
-    for f in _props_chain(path.parent, root, "Directory.Packages.props"):
+    for f in _props_chain(path.parent, root, "Directory.Packages.props")[-1:]:
         t = _parse_xml(f)
         for el in (t.iter() if t is not None else ()):
             if _local(el.tag) == "PackageVersion" and el.get("Include"):
@@ -383,11 +433,9 @@ def _sdk_facts(path: Path, tree, root: Path) -> _Facts:
     for el in tree.iter():
         if _local(el.tag) == "Sdk" and el.get("Name") and facts.sdk is None:
             facts.sdk = el.get("Name").strip()
-    for key in ("TargetFramework", "TargetFrameworks"):
-        for tfm in props.get(key, "").split(";"):
-            tfm = tfm.strip()
-            if tfm and "$(" not in tfm and tfm not in facts.tfms:
-                facts.tfms.append(tfm)
+    facts.tfms = tfms
+    facts.effective = effective
+    facts.unresolved = unresolved
     for pid, ver, override in refs:
         facts.packages[pid.lower()] = override or ver or central.get(pid.lower(), "")
     if props.get("ImplicitUsings", "").lower() in ("enable", "true"):
@@ -406,7 +454,7 @@ def sdk_profile(path: Path, root: Path) -> str:
     if tree is None:
         return "netcore"
     facts = _sdk_facts(path, tree, root)
-    return profile_for(facts.tfms) if facts.tfms else "netcore"
+    return profile_for(facts.effective) if facts.effective else "netcore"
 
 
 def _glob_re(spec: str) -> re.Pattern:
@@ -501,8 +549,11 @@ def _load_project(path: Path, notes: list[str], root: Path | None = None) -> Pro
         facts = _sdk_facts(path, tree, root or path.parent)
         proj.sdk, proj.target_frameworks, proj.packages = facts.sdk, facts.tfms, facts.packages
         proj.framework_refs = facts.framework_refs
-        if facts.tfms:
-            proj.profile = profile_for(facts.tfms)
+        for u in facts.unresolved:
+            notes.append(f"{path.name}: TargetFramework value could not be resolved ({u}); "
+                         "end-of-support checks may miss it")
+        if facts.effective:
+            proj.profile = profile_for(facts.effective)
         else:
             proj.profile = "netcore"
             notes.append(f"{path.name}: no TargetFramework found (project file or Directory.*.props); "

@@ -199,6 +199,7 @@ class _Auth:
 
     def __init__(self, model):
         self.model = model
+        self._scopes: dict = {}
         self.by_name: dict = {}
         self.owner: dict = {}
         for t in model.types():
@@ -208,12 +209,38 @@ class _Auth:
         self._memo: dict = {}
 
     def _scope(self, owner) -> set:
-        """Full names of the owner type and its base types found in the solution."""
-        names = {owner.full_name.lower()}
-        for b in self.model.base_chain(owner):
-            for bt in self.model.find_types(b.split(".")[-1]):
-                names.add(bt.full_name.lower())
+        """Full names of the types an unqualified call can bind to: the owner, its enclosing types,
+        base types found in the solution (generic arguments ignored) and the types named by
+        `using static` in the owner's file."""
+        key = id(owner)
+        if key in self._scopes:
+            return self._scopes[key]
+        found = [owner]
+        parts = owner.name.split(".")
+        for i in range(1, len(parts)):
+            found += [ot for ot in self.model.find_types(parts[i - 1]) if ot.namespace == owner.namespace]
+        try:
+            text = (self.model.root / owner.file).read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            text = ""
+        for m in _STATIC_USING.finditer(text):
+            found += self.model.find_types(m.group(1).split(".")[-1])
+        names: set = set()
+        queue = list(found)
+        while queue:
+            cur = queue.pop()
+            if cur.full_name.lower() in names:
+                continue
+            names.add(cur.full_name.lower())
+            for b in cur.bases:
+                queue += self.model.find_types(re.sub(r"<.*", "", b).split(".")[-1])
+        self._scopes[key] = names
         return names
+
+    def _extensions(self, nm: str) -> list:
+        """Extension methods (static class, first parameter marked `this`) with this name."""
+        return [m for t, m in self.by_name.get(nm, ())
+                if "static" in (t.modifiers or []) and m.params and "this" in (m.params[0].modifiers or [])]
 
     def _targets(self, call: dict, owner=None):
         nm = (call_name(call) or "").lower()
@@ -230,7 +257,11 @@ class _Auth:
                 # Without a resolved symbol an unqualified call belongs to the enclosing type (or a base);
                 # a same-named method of an unrelated type is not what runs.
                 scope = self._scope(owner)
-                return [m for t, m in cands if t.full_name.lower() in scope]
+                hit = [m for t, m in cands if t.full_name.lower() in scope]
+                hit += [m for m in self._extensions(nm) if m not in hit]
+                # Nothing bound in scope (a base the solution lacks, a framework member): the old
+                # solution-wide candidates, so a real decision is never lost.
+                return hit or [m for _t, m in cands]
             return [m for _t, m in cands]
         return []
 
@@ -256,6 +287,7 @@ class _Auth:
 
 
 _UNKNOWN = {"k": "?"}
+_STATIC_USING = re.compile(r"(?m)^\s*(?:global\s+)?using\s+static\s+([\w.]+)\s*;")
 
 
 def _value_sources(body: list) -> dict:
