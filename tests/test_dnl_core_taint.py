@@ -5,7 +5,8 @@ from pathlib import Path
 import pytest
 
 import enumerator
-from checks.dnl import project, routes_core, rules_taint
+from checks.dnl import project, routes_core, rules_taint, taint_solver
+from checks.dnl.ir import MethodIR, ParamIR
 from core.owasp_web import tag_results
 
 ROOT = Path(__file__).parent / "fixtures" / "aspnetcore" / "taint_app"
@@ -89,3 +90,80 @@ def test_dotnet_analyzer_reports_taint(roslyn_helper):
     assert found and found[0].route.meta["kind"] == "controller"
     assert found[0].owasp and "A05:2025" in str(found[0].owasp)
     project._CACHE.clear()
+
+
+# -- parameter binding, [BindProperty], minimal-API handler reach -----------------------------
+
+def _route_hits(findings, rule, handler=None, path=None):
+    return [f for f in findings if f.check_id == rule and f.route is not None
+            and (handler is None or f.route.handler_name == handler)
+            and (path is None or f.route.path == path)]
+
+
+def test_di_and_framework_params_are_not_sources(app):
+    for h in ("Di", "Fs", "Ctx"):
+        assert not _route_hits(app[1], "DNL-INJ-002", f"BindController.{h}"), h
+
+
+def test_dto_upload_and_decoy_are_sources(app):
+    # Decoy: a request DTO named like the registered service (Models.Auditor vs the global Auditor).
+    for h in ("Dto", "Upload", "Decoy"):
+        assert _route_hits(app[1], "DNL-INJ-002", f"BindController.{h}"), h
+
+
+def _line_of(rel, text):
+    src = (ROOT / rel).read_text(encoding="utf-8").splitlines()
+    return next(i for i, ln in enumerate(src, 1) if text in ln)
+
+
+def test_bind_property_respects_supports_get(app):
+    page = "Pages/Comment.cshtml.cs"
+    get = _route_hits(app[1], "DNL-INJ-002", "CommentModel.OnGet")
+    # `Text` is not SupportsGet, so only the `tool2` sink (fed by Q) is a hit on GET.
+    assert len(get) == 1 and get[0].line == _line_of(page, '"tool2"') and "[BindProperty] Q" in get[0].description
+    post = _route_hits(app[1], "DNL-INJ-002", "CommentModel.OnPost")
+    assert len(post) == 1 and "[BindProperty] Text" in post[0].description
+
+
+def test_bound_properties_by_verb(app):
+    model, _ = app
+    page = next(r for r in routes_core.discover_all(model) if r.route.handler_name == "CommentModel.OnGet")
+    post = next(r for r in routes_core.discover_all(model) if r.route.handler_name == "CommentModel.OnPost")
+    assert taint_solver.bound_properties(model, page.type, page.method) == {"q"}
+    assert taint_solver.bound_properties(model, post.type, post.method) == {"q", "text"}
+
+
+def test_minimal_api_params_and_as_parameters(app):
+    for p in ("/m/cmd", "/m/args"):
+        assert _route_hits(app[1], "DNL-INJ-002", path=p), p
+
+
+def test_lambda_handler_owns_helper_callee(app):
+    got = [f for f in app[1] if f.check_id == "DNL-INJ-002" and f.file.endswith("Program.cs")
+           and f.route is not None and f.route.path == "/m/helper"]
+    assert len(got) == 1
+
+
+def test_legacy_binding_unchanged(app):
+    # Legacy refs keep `_entry_taint`: every non-primitive parameter is a source, DI-looking ones included.
+    model, _ = app
+    t = next(t for t in model.types() if t.name == "BindController")
+    m = MethodIR("A", params=[ParamIR("a", "IReport"), ParamIR("b", "HttpContext"), ParamIR("n", "int")], line=1)
+    assert set(taint_solver._entry_taint(model, t, m)) == {0, 1}
+
+
+def test_degraded_binding(degraded_app):
+    findings = degraded_app[1]
+    for h in ("Di", "Fs", "Ctx"):
+        assert not _route_hits(findings, "DNL-INJ-002", f"BindController.{h}"), h
+    # Parameter types are source text in both modes, so the decoy (Models.Auditor vs the registered global
+    # Auditor) is told apart by namespace even without symbols.
+    for h in ("Dto", "Upload", "Decoy"):
+        assert _route_hits(findings, "DNL-INJ-002", f"BindController.{h}"), h
+    get = _route_hits(findings, "DNL-INJ-002", "CommentModel.OnGet")
+    assert len(get) == 1 and "[BindProperty] Q" in get[0].description
+    assert len(_route_hits(findings, "DNL-INJ-002", "CommentModel.OnPost")) == 1
+    for p in ("/m/cmd", "/m/args"):
+        assert _route_hits(findings, "DNL-INJ-002", path=p), p
+    # Known degraded gap: `c.Request.Query` on a parameter named `c` is only a source with symbols
+    # (the text table needs a `context`/`page`/`HttpContext.Current` receiver), so /m/helper has no finding here.

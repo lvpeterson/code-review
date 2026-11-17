@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from checks.dnl import taint as TN
-from checks.dnl.ir import MethodIR, ParamIR, TypeIR
+from checks.dnl.ir import MethodIR, ParamIR, TypeIR, attr_key, has_attr
 from checks.dnl.taint import Origin, SinkHit, Taint, merge
 
 MAX_ROUNDS = 24
@@ -480,6 +480,246 @@ def _entry_taint(model, t: TypeIR, m: MethodIR) -> dict[int, Taint]:
     return out
 
 
+# -- ASP.NET Core parameter binding ---------------------------------------
+# Legacy MVC keeps `_entry_taint` (every non-primitive parameter is request input). For a Core
+# route a parameter is request input unless the framework fills it from the container or the
+# request cannot carry it (plan Decision 1); `[BindProperty]` properties are request input too
+# (Decision 2).
+
+_CORE_FRAMEWORK = frozenset("""httpcontext httprequest httpresponse cancellationtoken claimsprincipal ilogger
+iloggerfactory iconfiguration iwebhostenvironment ihostenvironment iserviceprovider ioptions ioptionssnapshot
+ioptionsmonitor ihttpclientfactory httpclient iauthorizationservice usermanager signinmanager linkgenerator
+iurlhelper""".split())
+# Interfaces the binder fills from the request (files, form) or builds a concrete collection for.
+_CORE_BINDABLE_IFACES = frozenset("""iformfile iformfilecollection iformcollection ienumerable icollection ilist
+iset ireadonlylist ireadonlycollection ireadonlyset idictionary ireadonlydictionary iasyncenumerable
+ihtmlcontent""".split())
+_EXTERNAL_IFACE = re.compile(r"^I[A-Z][a-z]")
+# An explicit binding source (or [AsParameters]) overrides every type-based exclusion.
+_BIND_SOURCE_ATTRS = ("FromBody", "FromQuery", "FromForm", "FromRoute", "FromHeader", "AsParameters")
+_SERVICE_ADDS = ("AddScoped", "AddTransient", "AddSingleton", "AddKeyedScoped", "AddKeyedTransient",
+                 "AddKeyedSingleton", "TryAddScoped", "TryAddTransient", "TryAddSingleton", "TryAddKeyedScoped",
+                 "TryAddKeyedTransient", "TryAddKeyedSingleton", "AddDbContext", "AddDbContextPool", "AddHttpClient")
+_USING_RE = re.compile(r"(?m)^\s*(global\s+)?using\s+([A-Za-z_][\w.]*)\s*;")
+_DB_CONTEXTS = {"dbcontext", "identitydbcontext"}
+
+
+def _bare(text: str | None) -> tuple[str, str]:
+    """(type head, generic argument text) of a type name: nullable marks, `global::` and spacing dropped."""
+    t = (text or "").replace(" ", "").rstrip("?")
+    if t.startswith("global::"):
+        t = t[len("global::"):]
+    head, _, rest = t.partition("<")
+    return head, rest.rstrip(">").lower()
+
+
+def _read(model, rel: str) -> str:
+    try:
+        return (model.root / rel).read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return ""
+
+
+def _type_index(model) -> dict:
+    """Project types by lowered full name, plus the usings of each file (read lazily) and every
+    `global using` of the model."""
+    idx = model.cache.get("core_type_index")
+    if idx is None:
+        full: dict[str, list[TypeIR]] = {}
+        for t in model.types():
+            full.setdefault(t.full_name.lower(), []).append(t)
+        glob: set[str] = set()
+        for rel in model.files:
+            glob.update(m.group(2).lower() for m in _USING_RE.finditer(_read(model, rel)) if m.group(1))
+        idx = model.cache["core_type_index"] = {"full": full, "global": glob, "files": {}}
+    return idx
+
+
+def _file_usings(model, rel: str, proj) -> set[str]:
+    idx = _type_index(model)
+    if rel not in idx["files"]:
+        idx["files"][rel] = {m.group(2).lower() for m in _USING_RE.finditer(_read(model, rel))}
+    out = set(idx["files"][rel]) | idx["global"]
+    if proj is not None:
+        out.update(u.lower() for u in proj.global_usings)
+    return out
+
+
+def _type_keys(model, text: str | None, rel: str, ns: str, proj, strict: bool) -> frozenset[str]:
+    """Identity keys of the type a name refers to from code in file `rel`, namespace `ns`:
+    `t:<full name>` for project types, `~<simple name>` for anything else, each with the generic
+    argument text. A simple name follows the C# lookup order (enclosing namespaces, then the
+    global namespace, then using directives); an ambiguous name yields every candidate.
+    `strict` (registrations) yields nothing when no candidate is in scope, where the lenient
+    form (parameters) yields every project type of the name."""
+    head, args = _bare(text)
+    if not head:
+        return frozenset()
+    suffix = f"<{args}>" if args else ""
+    full = _type_index(model)["full"]
+    parts = ns.split(".") if ns else []
+    if "." in head:
+        for i in range(len(parts), -1, -1):
+            hit = full.get(".".join(parts[:i] + [head]).lower())
+            if hit:
+                return frozenset(f"t:{t.full_name.lower()}{suffix}" for t in hit)
+        return frozenset({f"~{head.rsplit('.', 1)[-1].lower()}{suffix}"})
+    cands = [t for t in model.find_types(head) if "." not in t.name]
+    if not cands:
+        return frozenset({f"~{head.lower()}{suffix}"})
+    if len(cands) == 1:
+        return frozenset({f"t:{cands[0].full_name.lower()}{suffix}"})
+    for i in range(len(parts), 0, -1):
+        inner = ".".join(parts[:i]).lower()
+        hit = [t for t in cands if t.namespace.lower() == inner]
+        if hit:
+            return frozenset(f"t:{t.full_name.lower()}{suffix}" for t in hit)
+    usings = _file_usings(model, rel, proj)
+    hit = [t for t in cands if not t.namespace] or [t for t in cands if t.namespace.lower() in usings]
+    if hit:
+        return frozenset(f"t:{t.full_name.lower()}{suffix}" for t in hit)
+    return frozenset() if strict else frozenset(f"t:{t.full_name.lower()}{suffix}" for t in cands)
+
+
+def _enclosing_ns(model, rel: str, line: int) -> str:
+    """Namespace of the type declared around `line` of a file ("" for top-level statements)."""
+    f = model.files.get(rel)
+    if f is None:
+        return ""
+    hit = [t for t in f.types if t.line <= line <= (t.end_line or t.line)]
+    if hit:
+        return hit[0].namespace
+    return f.types[0].namespace if len(f.types) == 1 else ""
+
+
+def core_services(model, proj) -> frozenset[str]:
+    """Identity keys of the types the project registers in the container: the first type argument of
+    every registration that certainly runs in Production (a registration that may not run
+    leaves the type a request source, the safe side)."""
+    cache = model.cache.setdefault("core_services", {})
+    pk = id(proj) if proj is not None else None
+    if pk not in cache:
+        from checks.dnl import pipeline
+        keys: set[str] = set()
+        for c in pipeline.pipeline_for(model, proj).named(*_SERVICE_ADDS, kinds=("services",)):
+            targs = (c.node.get("fn") or {}).get("targs") or []
+            if targs:
+                keys |= _type_keys(model, targs[0], c.file, _enclosing_ns(model, c.file, c.line), proj, True)
+        cache[pk] = frozenset(keys)
+    return cache[pk]
+
+
+def _derives_any(model, t: TypeIR, names: set[str]) -> bool:
+    return any(_bare(b)[0].rsplit(".", 1)[-1].lower() in names for b in model.base_chain(t))
+
+
+def _core_type_excluded(model, text: str | None, rel: str, ns: str, proj, services: frozenset[str]) -> bool:
+    """True when a value of this type is never request input on a Core route."""
+    head, _args = _bare(text)
+    if not head or head.endswith("[]"):
+        return False
+    last = head.rsplit(".", 1)[-1]
+    simple = last.lower()
+    keys = _type_keys(model, text, rel, ns, proj, False)
+    if keys and keys <= services:
+        return True
+    full = _type_index(model)["full"]
+    cands = [t for k in keys if k.startswith("t:") for t in full.get(k[2:].split("<")[0], [])]
+    if not cands:
+        if simple in _CORE_FRAMEWORK:
+            return True
+        return bool(_EXTERNAL_IFACE.match(last)) and simple not in _CORE_BINDABLE_IFACES
+    # A project type named like a framework type is judged as the project type (never silently safe).
+    if all(_derives_any(model, t, _DB_CONTEXTS) for t in cands):
+        return True
+    return simple not in _CORE_BINDABLE_IFACES and all(
+        t.kind == "interface" or "abstract" in [x.lower() for x in t.modifiers] for t in cands)
+
+
+def _owners(model) -> dict[int, TypeIR]:
+    own = model.cache.get("taint_owner")
+    if own is None:
+        own = model.cache["taint_owner"] = {id(m): t for t, m, _acc in _all_methods(model)}
+    return own
+
+
+def core_param_taint(model, ref) -> dict[int, Taint]:
+    """Request-input taint of a Core handler's parameters (see the block comment above)."""
+    m = ref.method
+    t = _owners(model).get(id(m), ref.type)
+    ns = (ref.type or t).namespace
+    services = core_services(model, ref.project)
+    out: dict[int, Taint] = {}
+    for i, p in enumerate(m.params):
+        if not _tainted_param_type(model, p.type):
+            continue
+        if has_attr(p.attributes, "FromServices", "FromKeyedServices"):
+            continue
+        if not has_attr(p.attributes, *_BIND_SOURCE_ATTRS) \
+                and _core_type_excluded(model, p.type, t.file, ns, ref.project, services):
+            continue
+        o = Origin("source", f"request parameter {p.name}", t.file, m.line)
+        out[i] = Taint(frozenset({o}), frozenset())
+    return out
+
+
+_ON_GET = re.compile(r"^On(?:Get|Head)(?![a-z])")
+
+
+def _handler_is_get(m: MethodIR) -> bool | None:
+    """True for a GET/HEAD-only handler, False for another verb, None when the verb is unknown."""
+    if re.match(r"^On[A-Z]", m.name):
+        return bool(_ON_GET.match(m.name))
+    verbs = {attr_key(a.name) for a in m.attributes} & {"httpget", "httphead", "httppost", "httpput", "httpdelete",
+                                                        "httppatch", "acceptverbs"}
+    if not verbs or "acceptverbs" in verbs:
+        return None
+    return verbs <= {"httpget", "httphead"}
+
+
+def _supports_get(a) -> bool:
+    v = (a.named or {}).get("SupportsGet")
+    return isinstance(v, dict) and v.get("v") is True
+
+
+def _bound(model, t: TypeIR, method: MethodIR, proj) -> dict[str, tuple[str, int]]:
+    """Bound property name (lowered) -> (file, line) of its declaration."""
+    get = _handler_is_get(method) is True
+    services = core_services(model, proj)
+    out: dict[str, tuple[str, int]] = {}
+    for d in _chain(model, t):
+        cls = has_attr(d.attributes, "BindProperties")
+        for p in d.properties:
+            attr = has_attr(p.attributes, "BindProperty") or cls
+            if attr is None or has_attr(p.attributes, "BindNever", "FromServices", "FromKeyedServices"):
+                continue
+            if get and not _supports_get(attr):
+                continue
+            if not _tainted_param_type(model, p.type) or _core_type_excluded(model, p.type, d.file, d.namespace, proj, services):
+                continue
+            out.setdefault(p.name.lower(), (d.file, p.line))
+    return out
+
+
+def bound_properties(model, t: TypeIR, method: MethodIR, proj=None) -> set[str]:
+    """Lower-cased names of the properties that are request input for this handler: `[BindProperty]`
+    properties (every property when a class in the chain has `[BindProperties]`; the IR does not
+    say whether a setter exists) of the page model / controller and its project bases; for a
+    GET/HEAD handler only those with `SupportsGet = true`. An unknown verb counts as non-GET.
+    `[BindNever]` / `[FromServices]` properties and types the request cannot carry are left out."""
+    return set(_bound(model, t, method, proj))
+
+
+def _bound_origins(model, t: TypeIR, method: MethodIR, proj) -> dict[str, Taint]:
+    """Field taint for the entry replay: one `[BindProperty] <Name>` source per bound property."""
+    names = {}
+    for d in _chain(model, t):
+        for p in d.properties:
+            names.setdefault(p.name.lower(), p.name)
+    return {names[k]: Taint(frozenset({Origin("source", f"[BindProperty] {names[k]}", f, line)}), frozenset())
+            for k, (f, line) in _bound(model, t, method, proj).items()}
+
+
 def _sources(h: SinkHit) -> list[Origin]:
     return sorted((o for o in h.taint.origins if o.kind == "source"), key=lambda o: (o.detail, o.file, o.line))
 
@@ -545,6 +785,7 @@ def external_hits(model) -> list[SinkHit]:
 
 def entry_hits(model, refs: list) -> list[EntryHit]:
     """Sink hits mapped to the entry point that reaches them (see module docstring)."""
+    from checks.dnl.routes_core import CoreRouteRef
     solve(model)
     state = model.cache["taint"]
     summaries, ft, results = state["summaries"], state["ft"], state["results"]
@@ -575,19 +816,33 @@ def entry_hits(model, refs: list) -> list[EntryHit]:
     cands: list[tuple[Any, SinkHit]] = []
     entry_ids: set[int] = set()
     entry_keys: list[tuple[Any, tuple]] = []
+    extra_calls: dict[tuple, set] = {}
     for ref, t, m, req in entries:
         entry_ids.add(id(m))
         entry_keys.append((ref, _key(t, m)))
         if not m.body:
             continue
         try:
-            r = TN.analyze_method(model, t, m, param_taint=_entry_taint(model, t, m) if req else None,
-                                  field_taint=field_taint(t), summaries=summaries)
+            ftaint = field_taint(t)
+            if not req:
+                ptaint = None
+            elif isinstance(ref, CoreRouteRef):
+                ptaint = core_param_taint(model, ref)
+                bound = _bound_origins(model, t, m, ref.project)
+                if bound:
+                    ftaint = {**ftaint, **{k: merge(ftaint.get(k), v) for k, v in bound.items()}}
+            else:
+                ptaint = _entry_taint(model, t, m)
+            r = TN.analyze_method(model, t, m, param_taint=ptaint, field_taint=ftaint, summaries=summaries)
         except Exception:
             name = f"{t.name}.{m.name}"
             if name not in state["failed_methods"]:
                 state["failed_methods"].append(name)
             continue
+        if _key(t, m) not in results:
+            # A synthetic handler (minimal-API lambda / local function) is not a solved method: its
+            # callees come from this replay so they are attributed to its route.
+            extra_calls.setdefault(_key(t, m), set()).update(r.calls)
         for h in r.hits:
             if any(o.kind == "source" for o in h.taint.origins):
                 cands.append((ref, h))
@@ -599,6 +854,8 @@ def entry_hits(model, refs: list) -> list[EntryHit]:
         for c in r.calls:
             callees.setdefault(key, set()).add(c)
             callers.setdefault(c, set()).add(key)
+    for key, cs in extra_calls.items():
+        callees.setdefault(key, set()).update(cs)
     reachable: dict[tuple, set] = {}
     reach: dict[tuple, list] = {}
     for ref, key in entry_keys:
