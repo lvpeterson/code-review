@@ -28,8 +28,17 @@ _HANDLER_PREFIX = re.compile(r"(?i)^on(get|post|put|delete|patch|head|options)")
 # user-management word. Matched on the action name and on the last literal path segment.
 _ANON_BY_DESIGN = re.compile(
     r"^(login|signin|register|signup|logout|signout|callback|forgot\w*password|reset\w*password"
-    r"|confirm\w*(email|account)|refresh\w*token)|^(token|refresh)(async)?$")
-_DANGEROUS_TOKENS = frozenset("delete remove purge wipe drop all database db manage management admin".split())
+    r"|confirm\w*(email|account)|refresh\w*token|verify\w*(code|token|email|phone)|resend\w*(confirmation|code|email))"
+    r"|^(token|refresh)(async)?$")
+_DANGEROUS_TOKENS = frozenset("""
+delete deletion remove removal purge wipe drop all database db manage management admin close erase destroy terminate
+disable deactivate revoke ban lock unlock grant
+""".split())
+_FLOW_WORDS = frozenset("""
+login signin sign in log out register signup up logout signout token tokens refresh callback forgot reset confirm
+password email account user users external two factor 2 fa verify code phone resend confirmation send link provider
+async post get on handle with google facebook twitter microsoft oidc oauth sso recovery recover authenticate
+""".split())
 _FLOW_TOKENS = frozenset("login signin register signup logout signout".split())
 _UNPROTECTED = ("No [Authorize], RequireAuthorization (endpoint, group or Map call), global filter, "
                 "Razor Pages convention or fallback policy covers this route.")
@@ -54,12 +63,15 @@ def _anonymous_by_design(ref: CoreRouteRef) -> bool:
     segs = [x for x in (r.path or "").split("/") if x and not x.startswith("{") and not x.startswith("[")]
     if segs:
         names.append(segs[-1])
-    for n in names:
-        toks = _tokens(n)
-        bad = _DANGEROUS_TOKENS & set(toks)
-        if ({"user", "users"} & set(toks)) and not (_FLOW_TOKENS & set(toks)):
-            bad = bad | {"user"}
-        if n and not bad and _ANON_BY_DESIGN.match(re.sub(r"[^a-z]", "", n.lower())):
+    toks = [_tokens(n) for n in names if n]
+    # One dangerous word anywhere (action or path) rules the exemption out.
+    if any(_DANGEROUS_TOKENS & set(t) for t in toks):
+        return False
+    for n, t in zip([n for n in names if n], toks):
+        if ({"user", "users"} & set(t)) and not (_FLOW_TOKENS & set(t)):
+            continue
+        # Every word must belong to a credential flow, and the name must start like one.
+        if set(t) <= _FLOW_WORDS and _ANON_BY_DESIGN.match(re.sub(r"[^a-z]", "", n.lower())):
             return True
     return False
 

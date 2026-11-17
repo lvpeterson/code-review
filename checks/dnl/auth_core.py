@@ -80,6 +80,8 @@ _GENERIC_OPTION_CALLS = _CONFIGURE_CALLS | {"AddOptions", "Bind", "BindConfigura
 _AUTH_OPTION_TYPES = frozenset("""
 AuthorizationOptions MvcOptions MvcCoreOptions RazorPagesOptions AuthenticationOptions CookieAuthenticationOptions
 JwtBearerOptions RouteOptions OpenIdConnectOptions IdentityOptions CookiePolicyOptions HubOptions
+GoogleOptions FacebookOptions TwitterOptions MicrosoftAccountOptions OAuthOptions NegotiateOptions
+CertificateAuthenticationOptions BearerTokenOptions IdentityCookieOptions
 """.split())
 _TYPE_PARAM = re.compile(r"^T(\d|[A-Z]\w*)?$")
 # Unresolved registrations whose name, generic arguments or lambda look like authorization keep an
@@ -599,17 +601,35 @@ def _targs_of(call: dict) -> list[str]:
     return [_simple(t) for t in (call.get("fn") or {}).get("targs") or []]
 
 
+_ALIAS = re.compile(r"(?m)^[ \t]*(global[ \t]+)?using[ \t]+(\w+)[ \t]*=[ \t]*([\w.<>?]+)[ \t]*;")
+
+
 def _usings_aliases(model: ProjectModel, file: str) -> dict[str, str]:
-    """`using Alias = Ns.Type;` of one source file, as {Alias: Type}."""
-    try:
-        text = (model.root / file).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return {}
-    return {m.group(1): _simple(m.group(2)) for m in re.finditer(r"\busing\s+(\w+)\s*=\s*([\w.<>?]+)\s*;", text)}
+    """`using Alias = Ns.Type;` of one source file plus the `global using` aliases of every file in the same
+    project, as {Alias: Type}."""
+    def read(rel: str) -> str:
+        try:
+            return (model.root / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+    cache = model.cache.setdefault("auth_core_aliases", {})
+    if file in cache:
+        return cache[file]
+    out: dict[str, str] = cache.setdefault(file, {})
+    own = model.files.get(file)
+    proj = own.project if own is not None else None
+    for rel, f in model.files.items():
+        if rel != file and (proj is None or f.project != proj):
+            continue
+        for m in _ALIAS.finditer(read(rel)):
+            if rel == file or m.group(1):
+                out[m.group(2)] = _simple(m.group(3))
+    return out
 
 
 def _auth_options_type(model: ProjectModel, name: str, depth: int = 0) -> bool:
-    if name in _AUTH_OPTION_TYPES or name.endswith("AuthorizationOptions") or _TYPE_PARAM.match(name):
+    if (name in _AUTH_OPTION_TYPES or name.endswith(("AuthorizationOptions", "AuthenticationOptions", "AuthenticationSchemeOptions"))
+            or _TYPE_PARAM.match(name)):
         return True
     # A solution class deriving from an authorization options type.
     return depth < 5 and any(_auth_options_type(model, _simple(b), depth + 1)
@@ -892,6 +912,53 @@ def _convention_benign(model: ProjectModel, call: dict, depth: int = 0) -> bool:
     return _convention_type_benign(model, _simple(new.get("type")), new, depth)
 
 
+def _root(e) -> str | None:
+    """Innermost receiver of a member / call chain: a name, `new T`, a literal marker, or None."""
+    for _ in range(40):
+        if not isinstance(e, dict):
+            return None
+        k = e.get("k")
+        if k == "member":
+            e = e.get("obj")
+        elif k == "call":
+            e = e.get("fn")
+        elif k == "name":
+            return e.get("id")
+        elif k == "new":
+            return "new " + _simple(e.get("type"))
+        elif k == "lit":
+            return "<lit>"
+        else:
+            return None
+    return None
+
+
+_BCL_STATICS = frozenset("string String Path Enumerable Uri Regex Char Math".split())
+
+
+def _framework_vars(model: ProjectModel, m: MethodIR) -> set[str]:
+    """Names in a method that hold values derived from its parameters (the convention's model argument): the
+    parameters, loop variables over them, locals initialised from them, lambda parameters of calls on them."""
+    fw = {p.name for p in m.params if not model.find_types(_simple(p.type))}
+    for _ in range(6):
+        before = len(fw)
+        for n in walk(m.body):
+            k = n.get("k")
+            if k == "loop" and len(n.get("header") or []) == 2:
+                var, it = n["header"]
+                if isinstance(var, dict) and var.get("k") == "name" and _root(it) in fw:
+                    fw.add(var.get("id"))
+            elif k == "local" and _root(n.get("init")) in fw:
+                fw.add(n.get("name"))
+            elif k == "call" and _root((n.get("fn") or {}).get("obj")) in fw:
+                for a in n.get("args") or []:
+                    if isinstance(a, dict) and a.get("k") == "lambda":
+                        fw.update(x for x in a.get("params") or [] if isinstance(x, str))
+        if len(fw) == before:
+            break
+    return fw
+
+
 def _convention_type_benign(model: ProjectModel, tn: str, new: dict | None, depth: int) -> bool:
     types = [t for t in model.find_types(tn) if t.kind in ("class", "struct", "record")] if depth < 4 else []
     if new is not None and any(isinstance(n, dict) and n.get("k") == "lambda" for n in walk(new.get("args"))):
@@ -908,22 +975,39 @@ def _convention_type_benign(model: ProjectModel, tn: str, new: dict | None, dept
             if not model.find_types(bn) or not _convention_type_benign(model, bn, None, depth + 1):
                 return False
         own = {m.name for m in t.methods}
+        members = {f.name for f in t.fields} | {p.name for p in t.properties}
+        solution_methods = {x.name for u in model.types() for x in u.methods}
         for m in t.methods:
             if _AUTHZ_TOUCH.search(_body_text(m.body)):
                 return False
+            fw = _framework_vars(model, m)
             for n in walk(m.body):
                 if n.get("k") != "call":
                     continue
                 fn = n.get("fn") or {}
                 callee = call_name(n) or ""
                 recv = receiver_text(fn.get("obj")) if fn.get("k") == "member" else ""
-                if callee in _CONVENTION_SAFE_CALLS:
-                    continue
-                # Any other call may carry the model (or something taken from it) into code this module does
-                # not read: only the convention's own methods, which are scanned here, are followed.
-                if callee in own and (fn.get("k") == "name" or recv in ("this", "base", t.name)):
-                    continue
-                return False
+                root = _root(fn.get("obj")) if fn.get("k") == "member" else None
+                is_own = callee in own and (fn.get("k") == "name" or recv in ("this", "base", t.name))
+                if not is_own:
+                    # An allowlisted BCL name is safe only on a receiver that is the model or a value derived
+                    # from it (or a BCL static / literal): never on a solution type, a local object or a member.
+                    if callee not in _CONVENTION_SAFE_CALLS or root is None or not (
+                            root in fw or root == "<lit>" or (root in _BCL_STATICS and not model.find_types(root))):
+                        return False
+                # A name / member argument that is not a lambda may be a method group: it must be model-derived,
+                # a plain member of this class (not a method), or a BCL static member.
+                for a in list(n.get("args") or []) + list((n.get("named") or {}).values()):
+                    if not (isinstance(a, dict) and a.get("k") in ("name", "member")):
+                        continue
+                    ar, last = _root(a), (a.get("id") if a.get("k") == "name" else a.get("name"))
+                    if ar in fw or (ar in _BCL_STATICS and not model.find_types(ar)):
+                        continue
+                    if (ar in members or (a.get("k") == "member" and ar in ("this", "base"))) and last not in solution_methods:
+                        continue
+                    if last in own and (a.get("k") == "name" or ar in ("this", "base", t.name)):
+                        continue
+                    return False
     return True
 
 

@@ -328,6 +328,74 @@ public class OpsController : ControllerBase
                        "OpsController.Run1", "OpsController.Run2"}
 
 
+TAGS = ("using Microsoft.AspNetCore.Mvc.ApplicationModels;\n"
+        "public class Tags { public static void Add(ApplicationModel m) { foreach (var c in m.Controllers) "
+        "{ c.Filters.Add(new AllowAnonymousFilter()); } }\n"
+        "  public void Run(ApplicationModel m) { Add(m); }\n"
+        "  public override string ToString() { Tags.Add(null!); return \"\"; } }\n")
+GATE = ("using Microsoft.AspNetCore.Mvc.ApplicationModels;\n"
+        "public static class Gate { public static bool Open(ControllerModel c) { c.Filters.Add(new AllowAnonymousFilter()); return true; } }\n")
+
+
+@pytest.mark.parametrize("body, extra", [
+    # R2-1: an allowlisted callee name on a solution receiver (type name, local, own-type instance)
+    ("Tags.Add(application);", {"Tags.cs": TAGS}),
+    ("var t = new Tags(); t.Add(application);", {"Tags.cs": TAGS}),
+    ("new Tags().ToString();", {"Tags.cs": TAGS}),
+    ("var t = new Tags(); t.Equals(application);", {"Tags.cs": TAGS}),
+    # R2-2: a method group handed to a framework call
+    ("var q = application.Controllers.Where(Gate.Open).ToList();", {"Gate.cs": GATE}),
+    ("application.Controllers.Any(VendorGate.Open);", {}),
+])
+def test_r2_allowlisted_names_and_method_groups_cannot_hide_an_opt_out(tmp_path, mode, body, extra):
+    files = _conv("SneakyConvention", body)
+    files.update(extra)
+    a = _with_convention(tmp_path, mode, "new SneakyConvention()", files)
+    assert a.state == UNKNOWN and any("Conventions.Add" in r for r in a.reasons), body
+
+
+def test_r2_framework_receivers_and_own_members_stay_benign(tmp_path, mode):
+    body = ("foreach (var c in application.Controllers.Where(x => x.ControllerName.StartsWith(\"A\")).ToList()) "
+            "{ foreach (var s in c.Selectors) { s.AttributeRouteModel!.Template = string.Join(\"/\", Prefix, "
+            "s.AttributeRouteModel.Template!.Trim().ToLowerInvariant()); } }")
+    files = {"Pre.cs": CONV_BASE.format(name="PrefixConvention", body=body).replace(
+        "{\n    public void Apply", "{\n    private const string Prefix = \"v1\";\n    public void Apply", 1)}
+    assert _with_convention(tmp_path, mode, "new PrefixConvention()", files).state == PROTECTED
+
+
+@pytest.mark.parametrize("t", ["GoogleOptions", "FacebookOptions", "TwitterOptions", "MicrosoftAccountOptions", "OAuthOptions",
+                               "NegotiateOptions", "CertificateAuthenticationOptions", "BearerTokenOptions",
+                               "IdentityCookieOptions", "VendorAuthenticationOptions", "VendorAuthenticationSchemeOptions"])
+def test_r2_more_authentication_option_types(tmp_path, mode, t):
+    prog = _program(f"builder.Services.Configure<{t}>(builder.Configuration.GetSection(\"x\"));\n")
+    assert _state(tmp_path, mode, prog).state == UNKNOWN, t
+
+
+def test_r2_global_using_alias_from_another_file(tmp_path, mode):
+    prog = _program("builder.Services.Configure<Opts>(builder.Configuration.GetSection(\"x\"));\n")
+    files = {"Globals.cs": "global using Opts = Microsoft.AspNetCore.Mvc.MvcOptions;\n"}
+    assert _state(tmp_path, mode, prog, files=files).state == UNKNOWN
+
+
+def test_r2_account_closure_names_are_not_anonymous_by_design(tmp_path, mode):
+    ctl = '''
+[ApiController, Route("api/account")]
+public class AccountController : ControllerBase
+{
+    [HttpPost("confirm-account-deletion"), AllowAnonymous] public IActionResult ConfirmAccountDeletion() => Ok();
+    [HttpPost("a"), AllowAnonymous] public IActionResult ResetPasswordAndCloseAccount() => Ok();
+    [HttpPost("login"), AllowAnonymous] public IActionResult WipeEverything() => Ok();
+    [HttpPost("b"), AllowAnonymous] public IActionResult DisableTwoFactor() => Ok();
+    [HttpPost("c"), AllowAnonymous] public IActionResult VerifyTwoFactorCode() => Ok();
+    [HttpPost("d"), AllowAnonymous] public IActionResult ConfirmEmail() => Ok();
+}
+'''
+    fs = _findings(tmp_path, mode, _program(extra=ctl))
+    flagged = {f.route.handler_name for f in fs if f.check_id == "DNL-AUTHZ-002"}
+    assert flagged == {"AccountController.ConfirmAccountDeletion", "AccountController.ResetPasswordAndCloseAccount",
+                       "AccountController.WipeEverything", "AccountController.DisableTwoFactor"}
+
+
 def test_d9_minimal_hosting_adds_authorization_middleware_itself(tmp_path, mode):
     assert not any(f.check_id == "DNL-AUTHZ-008" for f in _findings(tmp_path, mode, MINIMAL_NO_AUTHZ_MW))
 
