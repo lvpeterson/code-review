@@ -70,7 +70,10 @@ _CORE_REJECT_TYPES = ("forbid", "challenge")
 _REJECT_STATUS = {401, 403, 404, "401", "403", "404"}
 _REJECT_STATUS_MEMBERS = {"status401unauthorized", "status403forbidden", "status404notfound"}
 _AUTHZ_CALLS = {"authorizeasync", "authorize"}
-_SENSITIVE = re.compile(r"(?i)^(password|role)|hash$|token$|secret$|^isadmin$")
+_SENSITIVE = re.compile(r"(?i)^(password|role)|hash$|tokens?$|secrets?$|apikey|secretkey|salt|securitystamp|^isadmin$")
+# Identity base types that carry PasswordHash / SecurityStamp (the base is external, so its members are unseen).
+_IDENTITY_BASE = re.compile(r"^Identity(User|Role)(?![A-Za-z])")
+_IDENTITY_CTX = re.compile(r"\bIdentityDbContext\s*<([^{;]*)>")
 _TRY_UPDATE = {"tryupdatemodelasync", "tryupdatemodel"}
 # Whether the route being analysed is an ASP.NET Core one: set by check() around each route, read by the
 # user-marker and rejection helpers (legacy routes must see exactly the original tables).
@@ -98,11 +101,47 @@ def _dbset_map(model: ProjectModel) -> dict[str, str]:
     return cached
 
 
+def _split_args(txt: str) -> list[str]:
+    """Top-level comma split of generic type arguments."""
+    out, depth, cur = [], 0, ""
+    for ch in txt:
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    return out + [cur.strip()]
+
+
+def _identity_entities(model: ProjectModel, t: TypeIR) -> set[str]:
+    """`IdentityDbContext<TUser, TRole, ...>` on an ASP.NET Core project: TUser (and TRole when given)
+    are entities although the context itself declares no DbSet for them. The IR keeps base names
+    without type arguments, so the declaration is read from the source."""
+    proj = model.project_of(t.file)
+    if proj is None or proj.owner != "dotnet":
+        return set()
+    try:
+        lines = (model.root / t.file).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return set()
+    head = " ".join(lines[max(t.line - 1, 0):t.line + 3])
+    m = _IDENTITY_CTX.search(head)
+    if not m:
+        return set()
+    return {_simple(a) for a in _split_args(m.group(1))[:2] if a}
+
+
 def entity_types(model: ProjectModel) -> set[str]:
     """Simple names of entity types: `DbSet<T>` / `IDbSet<T>` element types on DbContext /
     ObjectContext subclasses, plus types with a [Table] attribute or a [Key] property."""
     out = set(_dbset_map(model).values())
     for t in model.types():
+        if model.derives_from(t, {"IdentityDbContext"}):
+            out |= _identity_entities(model, t)
         if has_attr(t.attributes, "Table") or any(has_attr(p.attributes, "Key") for p in t.properties):
             out.add(t.name.split(".")[-1])
     return out
@@ -250,9 +289,60 @@ def _principal(expr, principals: set[str]) -> bool:
     return expr.get("k") == "member" and (expr.get("name") or "").lower() == "user"
 
 
+def _polarity(cond) -> str | None:
+    """"pass" when the condition is true exactly when authorization succeeded (`r.Succeeded`), "fail" when it
+    is true when it failed (`!r.Succeeded`, `r.Succeeded == false`), None when the shape is unknown."""
+    if not isinstance(cond, dict):
+        return None
+    k = cond.get("k")
+    if k == "unary" and cond.get("op") == "!":
+        return {"pass": "fail", "fail": "pass"}.get(_polarity(cond.get("e")) or "")
+    if k == "member" and (cond.get("name") or "").lower() == "succeeded":
+        return "pass"
+    if k == "bin" and cond.get("op") in ("==", "!="):
+        for a, b in ((cond.get("l"), cond.get("r")), (cond.get("r"), cond.get("l"))):
+            if isinstance(b, dict) and b.get("k") == "lit" and str(b.get("v")).lower() in ("true", "false"):
+                p = _polarity(a)
+                if p is None:
+                    return None
+                flip = (str(b.get("v")).lower() == "false") == (cond.get("op") == "==")
+                return {"pass": "fail", "fail": "pass"}[p] if flip else p
+    return None
+
+
+def _following(body, node) -> list:
+    """The statements after `node` in the block that holds it."""
+    stack = [body]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, list):
+            for i, x in enumerate(cur):
+                if x is node:
+                    return cur[i + 1:]
+            stack.extend(x for x in cur if isinstance(x, (dict, list)))
+        elif isinstance(cur, dict):
+            stack.extend(v for v in cur.values() if isinstance(v, (dict, list)))
+    return []
+
+
+def _denies_on_failure(body, node, cond, then, other) -> bool:
+    """Does a rejection run when the authorization result fails, given an `if` / ternary on it. A
+    rejection that has nothing to do with the result (a null check) never counts."""
+    pol = _polarity(cond)
+    if pol == "fail":
+        return _rejects(then)
+    if pol == "pass":
+        if _rejects(other):
+            return True
+        # `if (r.Succeeded) { return Ok(o); } return Forbid();`
+        return any(x.get("k") == "return" for x in walk(then)) and _rejects(_following(body, node))
+    return _rejects(then) or _rejects(other)
+
+
 def _authz_gates(body: list, record: set[str], principals: set[str]) -> bool:
     """Resource-based authorization: `IAuthorizationService.AuthorizeAsync(User, <record>, ...)` whose
-    result gates a rejection (an `if` / ternary on the result, or on the call itself, that rejects)."""
+    result gates a rejection that runs when it fails (an `if` / ternary on the result, or on the call
+    itself)."""
     calls = [n for n in walk(body) if n.get("k") == "call" and (call_name(n) or "").lower() in _AUTHZ_CALLS
              and len(n.get("args") or []) >= 2 and _principal(n["args"][0], principals)
              and _names(n["args"][1]) & record]
@@ -272,14 +362,12 @@ def _authz_gates(body: list, record: set[str], principals: set[str]) -> bool:
     def gating(cond) -> bool:
         return any(x is c for c in calls for x in walk(cond)) or bool(_names(cond) & results)
 
-    # A rejection anywhere in the method counts too: `if (r.Succeeded) return Ok(o); return Forbid();`.
-    rejects_somewhere = _rejects(body)
     for n in walk(body):
         if n.get("k") == "if" and gating(n.get("cond")):
-            if rejects_somewhere or _rejects(n.get("then")) or _rejects(n.get("else")):
+            if _denies_on_failure(body, n, n.get("cond"), n.get("then"), n.get("else")):
                 return True
         elif n.get("k") == "cond" and gating(n.get("c")):
-            if _rejects(n.get("f")) or _rejects(n.get("t")) or rejects_somewhere:
+            if _denies_on_failure(body, n, n.get("c"), n.get("t"), n.get("f")):
                 return True
     return False
 
@@ -639,11 +727,27 @@ def _core_overposted(model: ProjectModel, ref: RouteRef, entities: set[str]) -> 
     return None
 
 
+_MANAGER_LOOKUPS = {"getuserasync", "findbyidasync", "findbynameasync", "findbyemailasync", "findbyloginasync"}
+
+
+def _manager_lookup(call: dict, ents: set[str], env: dict[str, str]) -> bool:
+    """`userManager.GetUserAsync(User)` / `FindByIdAsync(id)` on a `UserManager<TUser>` with an entity TUser."""
+    fn = call.get("fn") or {}
+    if (call_name(call) or "").lower() not in _MANAGER_LOOKUPS or fn.get("k") != "member":
+        return False
+    obj = fn.get("obj") or {}
+    nm = obj.get("id") if obj.get("k") == "name" else obj.get("name") if obj.get("k") == "member" else None
+    typ = env.get(nm or "", "")
+    return "UserManager" in typ and bool(_entity_hits(typ, ents))
+
+
 def _entity_expr(expr, ents: set[str], env: dict[str, str], dbsets: dict[str, str], body, depth: int = 3) -> bool:
     """Does the expression evaluate to an entity: `_entity_valued` plus a local (`var o = db.Orders.Find(id)`)
     resolved through its initializer, which `var` leaves untyped when EF is not referenced."""
     if not isinstance(expr, dict):
         return False
+    if expr.get("k") == "call" and _manager_lookup(expr, ents, env):
+        return True
     if expr.get("k") == "call":
         # A DbSet chain is entity-valued only for the entity that DbSet holds.
         ent = _on_dbset(expr.get("fn") or {}, dbsets)
@@ -680,12 +784,27 @@ def _has_include(call: dict, env: dict[str, str]) -> bool:
     return False
 
 
+def _ignored(attrs) -> bool:
+    """[JsonIgnore] (no Condition, or Condition = Always) or [IgnoreDataMember]: never serialized."""
+    if has_attr(attrs, "IgnoreDataMember"):
+        return True
+    a = has_attr(attrs, "JsonIgnore")
+    if a is None:
+        return False
+    cond = {k.lower(): v for k, v in (a.named or {}).items()}.get("condition")
+    return cond is None or "always" in str(cond).lower()
+
+
 def _sensitive_entities(model: ProjectModel, entities: set[str]) -> set[str]:
-    """Entities with a sensitive-looking member (Password*, *Hash, *Token, *Secret, IsAdmin, Role*)."""
+    """Entities with a sensitive-looking member that would be serialized (Password*, *Hash, *Token(s),
+    *Secret(s), ApiKey, Salt, SecurityStamp, IsAdmin, Role*; not [JsonIgnore]d), or that derive from
+    the external IdentityUser / IdentityRole (PasswordHash, SecurityStamp live on the base)."""
     out = set()
     for e in entities:
         for t in model.find_types(e):
-            if any(_SENSITIVE.search(p.name) for d in _chain_types(model, t) for p in d.properties):
+            if any(_IDENTITY_BASE.match(b) for b in model.base_chain(t)) or any(
+                    _SENSITIVE.search(p.name) and not _ignored(p.attributes)
+                    for d in _chain_types(model, t) for p in d.properties):
                 out.add(e)
     return out
 
@@ -710,11 +829,54 @@ def _core_exposed(model: ProjectModel, ref: RouteRef, entities: set[str]) -> str
             continue
         # Ok(e) / Json(e) anywhere in the returned expression (a ternary may pick between results).
         for c in walk(v):
-            if c.get("k") == "call" and (call_name(c) or "").lower() in ("ok", "json") and c.get("args")                     and _entity_expr(c["args"][0], ents, env, dbsets, m.body):
+            if c.get("k") == "call" and (call_name(c) or "").lower() in ("ok", "json") and c.get("args") \
+                    and _entity_expr(c["args"][0], ents, env, dbsets, m.body):
                 return f"{call_name(c)}(...) of an entity"
         if kind == "minimalapi" and _entity_expr(v, ents, env, dbsets, m.body):
             return "the handler returns an entity"
     return None
+
+
+def _check_ref(model: ProjectModel, summaries: dict, ref: RouteRef, entities: set[str], core: bool) -> list[Finding]:
+    """The findings of one route."""
+    out: list[Finding] = []
+    r = ref.route
+    api = bool(r.meta.get("api_surface"))
+    hid = r.handler_name
+    why = _idor(model, summaries, ref, entities)
+    if why:
+        out.append(dnl_finding(
+            "DNL-AUTHZ-005", "low", "Object-level authorization gap (IDOR)",
+            f"Identifier parameter {why} selects a record in {hid}, and nothing in the action or the methods on "
+            f"that path ties the lookup to the signed-in user (an ownership condition that rejects the "
+            f"request, or a user-scoped query). Any caller who can reach the route may read or change other "
+            f"users' objects; verify an ownership check exists.",
+            r.file, r.line, route=r, api_surface=api, confidence="REVIEW"))
+    over = _core_overposted(model, ref, entities) if core else _overposted(model, ref, entities)
+    if over:
+        why, excl = over[:2]
+        note = (" Only a [Bind(Exclude=...)] list is present: every field not excluded stays bindable, so "
+                "switch to an Include whitelist.") if excl else ""
+        if core:
+            text = (f"{hid} binds an entity directly from the request ({why}) with no include list, so a "
+                    f"client can set any property (ownership, role, price). Bind a view model, whitelist the "
+                    f"fields ([Bind(Include=...)] on form binding, an include list on TryUpdateModel) or "
+                    f"copy individual fields.")
+        else:
+            text = (f"Parameter '{why}' of {hid} is an entity type bound directly from the request with no "
+                    f"[Bind(Include=...)] list, so a client can set any property (ownership, role, price). "
+                    f"Bind a view model or whitelist the fields.")
+        out.append(dnl_finding(
+            "DNL-AUTHZ-006", "medium", "Over-posting (entity bound from request)", text + note,
+            r.file, r.line, route=r, api_surface=api, confidence="REVIEW" if excl else None))
+    why = _core_exposed(model, ref, entities) if core else _exposed(model, ref, entities)
+    if why:
+        out.append(dnl_finding(
+            "DNL-AUTHZ-007", "low", "Entity returned from an API (over-exposure)",
+            f"{hid} returns a data-model entity ({why}), serializing every property including internal ones. "
+            f"Return a DTO that lists only the fields the client needs.",
+            r.file, r.line, route=r, api_surface=api))
+    return out
 
 
 def check(model: ProjectModel, refs: list[RouteRef]) -> list[Finding]:
@@ -724,46 +886,18 @@ def check(model: ProjectModel, refs: list[RouteRef]) -> list[Finding]:
     entities = entity_types(model)
     summaries = taint_solver.solve(model)
     out: list[Finding] = []
-    for ref in refs:
-        kind = ref.route.meta.get("kind")
-        if ref.method is None or ref.type is None or kind not in _LEGACY_KINDS + _CORE_KINDS:
-            continue
-        core = kind in _CORE_KINDS
-        _MODE["core"] = core
-        r = ref.route
-        api = bool(r.meta.get("api_surface"))
-        hid = r.handler_name
-        why = _idor(model, summaries, ref, entities)
-        if why:
-            out.append(dnl_finding(
-                "DNL-AUTHZ-005", "low", "Object-level authorization gap (IDOR)",
-                f"Identifier parameter {why} selects a record in {hid}, and nothing in the action or the methods on "
-                f"that path ties the lookup to the signed-in user (an ownership condition that rejects the "
-                f"request, or a user-scoped query). Any caller who can reach the route may read or change other "
-                f"users' objects; verify an ownership check exists.",
-                r.file, r.line, route=r, api_surface=api, confidence="REVIEW"))
-        over = _core_overposted(model, ref, entities) if core else _overposted(model, ref, entities)
-        if over:
-            why, excl = over[:2]
-            note = (" Only a [Bind(Exclude=...)] list is present: every field not excluded stays bindable, so "
-                    "switch to an Include whitelist.") if excl else ""
-            if core:
-                text = (f"{hid} binds an entity directly from the request ({why}) with no include list, so a "
-                        f"client can set any property (ownership, role, price). Bind a view model, whitelist the "
-                        f"fields ([Bind(Include=...)] on form binding, an include list on TryUpdateModel) or "
-                        f"copy individual fields.")
-            else:
-                text = (f"Parameter '{why}' of {hid} is an entity type bound directly from the request with no "
-                        f"[Bind(Include=...)] list, so a client can set any property (ownership, role, price). "
-                        f"Bind a view model or whitelist the fields.")
-            out.append(dnl_finding(
-                "DNL-AUTHZ-006", "medium", "Over-posting (entity bound from request)", text + note,
-                r.file, r.line, route=r, api_surface=api, confidence="REVIEW" if excl else None))
-        why = _core_exposed(model, ref, entities) if core else _exposed(model, ref, entities)
-        if why:
-            out.append(dnl_finding(
-                "DNL-AUTHZ-007", "low", "Entity returned from an API (over-exposure)",
-                f"{hid} returns a data-model entity ({why}), serializing every property including internal ones. "
-                f"Return a DTO that lists only the fields the client needs.",
-                r.file, r.line, route=r, api_surface=api))
+    try:
+        for ref in refs:
+            kind = ref.route.meta.get("kind")
+            if ref.method is None or ref.type is None or kind not in _LEGACY_KINDS + _CORE_KINDS:
+                continue
+            _MODE["core"] = kind in _CORE_KINDS
+            try:
+                out += _check_ref(model, summaries, ref, entities, kind in _CORE_KINDS)
+            except Exception as exc:  # noqa: BLE001
+                # One route that breaks the analysis must not hide the others; say which and why.
+                model.notes.append(f"rules_object failed on {ref.route.handler_name} "
+                                   f"({type(exc).__name__}: {exc}); its object-level findings are missing")
+    finally:
+        _MODE["core"] = False
     return out

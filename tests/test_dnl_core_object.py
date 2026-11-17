@@ -1,5 +1,6 @@
 """Object- and property-level rules (IDOR, over-posting, excessive exposure) on ASP.NET Core routes of the
 synthetic taint_app fixture, with the Roslyn helper and without it, plus the dotnet analyzer wiring."""
+import shutil
 from pathlib import Path
 
 import pytest
@@ -50,11 +51,11 @@ def _check(findings):
                                              "FormsController.EditSafe"}
     assert on(findings, "DNL-AUTHZ-006") == {"OrdersController.Put", "FormsController.Edit", "EditOrderModel.OnPost",
                                              "/m/orders"}
-    assert on(findings, "DNL-AUTHZ-007") == {"OrdersController.Users", "/m/users/{id}"}
+    assert on(findings, "DNL-AUTHZ-007") == {"OrdersController.Users", "/m/users/{id}", "AccountsController.Me"}
 
 
 def test_entity_types(app):
-    assert rules_object.entity_types(app[0]) == {"Order", "User"}
+    assert rules_object.entity_types(app[0]) == {"Order", "User", "ApplicationUser"}
 
 
 def test_idor(app):
@@ -72,7 +73,7 @@ def test_overposting(app):
 
 def test_exposure(app):
     got = on(app[2], "DNL-AUTHZ-007")
-    assert {"OrdersController.Users", "/m/users/{id}"} <= got
+    assert {"OrdersController.Users", "/m/users/{id}", "AccountsController.Me"} <= got
     assert "OrdersController.All" not in got
 
 
@@ -150,4 +151,185 @@ def test_finer_cases(tmp_path, monkeypatch):
     assert on(fs, "DNL-AUTHZ-006") == {"DocController.D"}
     assert {"DocController.A", "/y/{id}"} <= on(fs, "DNL-AUTHZ-007")
     assert "DocController.E" not in on(fs, "DNL-AUTHZ-005")
+    project._CACHE.clear()
+
+
+# -- fix round: authorization gating, identity entities, [JsonIgnore], isolation, mixed solution ----
+
+_CSPROJ = ('<Project Sdk="Microsoft.NET.Sdk.Web"><PropertyGroup>'
+           '<TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>')
+
+_FIX2 = '''
+using System.Security.Claims;
+using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+public class Doc { public int Id { get; set; } public string OwnerId { get; set; } public decimal Total { get; set; } }
+public class Db : DbContext { public DbSet<Doc> Docs { get; set; } public DbSet<Acct> Accts { get; set; }
+                              public DbSet<Key> Keys { get; set; } public DbSet<Hidden> Hiddens { get; set; } }
+public class Acct { public int Id { get; set; } public string ApiKeys { get; set; } }
+public class Key { public int Id { get; set; } public string SecretKey { get; set; } }
+public class Hidden { public int Id { get; set; } [JsonIgnore] public string PasswordHash { get; set; }
+                      [IgnoreDataMember] public string Salt { get; set; }
+                      [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public string Token { get; set; } }
+public class Hidden2 { public int Id { get; set; } [JsonIgnore] public string PasswordHash { get; set; } }
+public class Db2 : DbContext { public DbSet<Hidden2> Hidden2s { get; set; } }
+[ApiController]
+public class ADocController : ControllerBase
+{
+    private readonly Db db;
+    private readonly IAuthorizationService authz;
+    private readonly UserManager<IdentityUser> userManager;
+    [HttpGet("n/{id}")] public async Task<IActionResult> NullOnly(int id)
+    { var o = db.Docs.Find(id); if (o == null) return NotFound(); var r = await authz.AuthorizeAsync(User, o, "p"); if (r.Succeeded) { Audit(); } return Ok(o); }
+    [HttpGet("p1/{id}")] public async Task<IActionResult> Pos(int id)
+    { var o = db.Docs.Find(id); var r = await authz.AuthorizeAsync(User, o, "p"); if (r.Succeeded) { return Ok(o); } return Forbid(); }
+    [HttpGet("p2/{id}")] public async Task<IActionResult> Neg(int id)
+    { var o = db.Docs.Find(id); var r = await authz.AuthorizeAsync(User, o, "p"); if (r.Succeeded == false) return Forbid(); return Ok(o); }
+    [HttpGet("p3/{id}")] public async Task<IActionResult> Else(int id)
+    { var o = db.Docs.Find(id); var r = await authz.AuthorizeAsync(User, o, "p"); if (r.Succeeded) { Audit(); } else { return Forbid(); } return Ok(o); }
+    [HttpGet("p4/{id}")] public async Task<IActionResult> Inline(int id)
+    { var o = db.Docs.Find(id); if (!(await authz.AuthorizeAsync(User, o, "p")).Succeeded) return Forbid(); return Ok(o); }
+    [HttpGet("um/{id}")] public IActionResult Um(int id)
+    { var o = db.Docs.Find(id); if (o.OwnerId != userManager.GetUserId(User)) return Forbid(); return Ok(o); }
+    [HttpPost("bf")] public IActionResult BindBody([Bind("Total")][FromBody] Doc d) { db.Update(d); return Ok(); }
+    [HttpPost("ba")] public IActionResult BindApi([Bind("Total")] Doc d) { db.Update(d); return Ok(); }
+    [HttpGet("ak")] public IActionResult Keys() => Ok(db.Accts.ToList());
+    [HttpGet("sk")] public IActionResult Sk() => Ok(db.Keys.ToList());
+    [HttpGet("hd")] public IActionResult Hd() => Ok(db.Hiddens.ToList());
+    private void Audit() { }
+}
+public class FormBodyController : Controller
+{
+    private readonly Db db;
+    [HttpPost("fb")] public IActionResult FromBodyBind([Bind("Total")][FromBody] Doc d) { db.Update(d); return Ok(); }
+    [HttpPost("fi")] public IActionResult FormInclude([Bind("Total")] Doc d) { db.Update(d); return Ok(); }
+}
+'''
+
+_LEGACY_SHAPE = '''
+using System.Web.Mvc;
+namespace Legacy.Controllers
+{
+    public class Doc { public int Id { get; set; } public string OwnerId { get; set; } }
+    public class LegacyDb : System.Data.Entity.DbContext { public System.Data.Entity.DbSet<Doc> Docs { get; set; } }
+    public class DocsController : Controller
+    {
+        private readonly LegacyDb db = new LegacyDb();
+        public ActionResult Show(int id)
+        {
+            var d = db.Docs.Find(id);
+            if (d.OwnerId != User.FindFirstValue("sub")) return new HttpUnauthorizedResult();
+            return View(d);
+        }
+    }
+}
+'''
+
+_MODERN_SHAPE = '''
+using System.Security.Claims;
+using Microsoft.AspNetCore.Mvc;
+public class MDoc { public int Id { get; set; } public string OwnerId { get; set; } }
+public class MDb : DbContext { public DbSet<MDoc> Docs { get; set; } }
+[ApiController]
+public class DocsController : ControllerBase
+{
+    private readonly MDb db;
+    [HttpGet("docs/{id}")] public IActionResult Show(int id)
+    {
+        var d = db.Docs.Find(id);
+        if (d.OwnerId != User.FindFirstValue("sub")) return Forbid();
+        return Ok(1);
+    }
+}
+'''
+
+
+def _scan(tmp_path, monkeypatch, files):
+    monkeypatch.setattr("checks.dnl.helper.find_helper", lambda *a, **k: None)
+    monkeypatch.setattr("checks.dnl.helper.sdk_available", lambda *a, **k: False)
+    (tmp_path / "A.csproj").write_text(_CSPROJ)
+    for name, text in files.items():
+        (tmp_path / name).write_text(text)
+    project._CACHE.clear()
+    project.prepare(tmp_path, True)
+    model = project.get_model(tmp_path, "dotnet")
+    return model, routes_core.discover_all(model)
+
+
+def test_authz_result_must_gate_a_rejection(tmp_path, monkeypatch):
+    model, refs = _scan(tmp_path, monkeypatch, {"A.cs": _FIX2})
+    idor = on(rules_object.check(model, refs), "DNL-AUTHZ-005")
+    # A null-check NotFound next to an AuthorizeAsync whose failure rejects nothing is no guard.
+    assert "ADocController.NullOnly" in idor
+    for ok in ("Pos", "Neg", "Else", "Inline", "Um"):
+        assert f"ADocController.{ok}" not in idor, ok
+    project._CACHE.clear()
+
+
+def test_bind_rules_on_json_and_api_controllers(tmp_path, monkeypatch):
+    model, refs = _scan(tmp_path, monkeypatch, {"A.cs": _FIX2})
+    over = on(rules_object.check(model, refs), "DNL-AUTHZ-006")
+    assert {"ADocController.BindBody", "ADocController.BindApi", "FormBodyController.FromBodyBind"} <= over
+    # Plain form binding on a non-ApiController honours [Bind(Include)].
+    assert "FormBodyController.FormInclude" not in over
+    project._CACHE.clear()
+
+
+def test_sensitive_variants_and_json_ignore(tmp_path, monkeypatch):
+    model, refs = _scan(tmp_path, monkeypatch, {"A.cs": _FIX2})
+    exposed = on(rules_object.check(model, refs), "DNL-AUTHZ-007")
+    # ApiKeys (plural) and SecretKey are sensitive; Hiddens still has a Token that is only ignored when
+    # null (JsonIgnore with a Condition other than Always), so it is exposed through that member.
+    assert {"ADocController.Keys", "ADocController.Sk", "ADocController.Hd"} <= exposed
+    sens = rules_object._sensitive_entities(model, {"Hidden", "Hidden2"})
+    assert sens == {"Hidden"}
+    project._CACHE.clear()
+
+
+def test_identity_user_is_sensitive_and_entity(app):
+    model = app[0]
+    assert "ApplicationUser" in rules_object.entity_types(model)
+    assert "ApplicationUser" in rules_object._sensitive_entities(model, {"ApplicationUser", "Order"})
+    assert "Order" not in rules_object._sensitive_entities(model, {"Order"})
+
+
+def test_one_route_failure_is_isolated(tmp_path, monkeypatch):
+    model, refs = _scan(tmp_path, monkeypatch, {"A.cs": _FIX2})
+    real = rules_object._idor
+
+    def boom(model_, summaries, ref, entities):
+        if ref.route.handler_name == "ADocController.Pos":
+            raise RuntimeError("synthetic")
+        return real(model_, summaries, ref, entities)
+
+    monkeypatch.setattr(rules_object, "_idor", boom)
+    fs = rules_object.check(model, refs)
+    assert any("ADocController.Pos" in n and "synthetic" in n for n in model.notes)
+    assert "ADocController.NullOnly" in on(fs, "DNL-AUTHZ-005")
+    assert rules_object._MODE["core"] is False
+    project._CACHE.clear()
+
+
+def test_legacy_result_unchanged_in_mixed_solution(tmp_path, monkeypatch):
+    root = tmp_path / "sol"
+    shutil.copytree(Path(__file__).parent / "fixtures" / "aspnetcore" / "mixed_solution", root)
+    (root / "Legacy" / "Controllers" / "DocsController.cs").write_text(_LEGACY_SHAPE)
+    proj = root / "Legacy" / "Legacy.csproj"
+    proj.write_text(proj.read_text().replace(
+        '<Compile Include="Controllers\\HomeController.cs" />',
+        '<Compile Include="Controllers\\HomeController.cs" /><Compile Include="Controllers\\DocsController.cs" />'))
+    (root / "Modern" / "Controllers" / "DocsController.cs").write_text(_MODERN_SHAPE)
+    monkeypatch.setattr("checks.dnl.helper.find_helper", lambda *a, **k: None)
+    monkeypatch.setattr("checks.dnl.helper.sdk_available", lambda *a, **k: False)
+    project._CACHE.clear()
+    res = enumerator.enumerate_target(root, allow_degraded=True)
+    fs = [f for r in res for f in r.findings if f.check_id == "DNL-AUTHZ-005" and f.route is not None]
+    by_lang = {(r.language, f.route.handler_name) for r in res for f in r.findings
+               if f.check_id == "DNL-AUTHZ-005" and f.route is not None}
+    # Legacy MVC keeps its tables: User.FindFirstValue is not an ownership signal there, so it reports.
+    assert ("dotnet_legacy", "DocsController.Show") in by_lang
+    # The same shape in the Core project is an ownership check.
+    assert ("dotnet", "DocsController.Show") not in by_lang
     project._CACHE.clear()
