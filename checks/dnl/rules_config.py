@@ -10,13 +10,14 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from checks.dnl.auth_core import PLACEHOLDER
 from checks.dnl.findings import dnl_finding
 from checks.dnl.webconfig import LINE, NOTES, ORIGIN, WebConfig, anonymous_denied, config_chain, effective
 from core.models import Finding
 
 # A placeholder is a whole-value token. `{...}` only counts as a single `{identifier}`:
 # ADO.NET lets a braced value hold anything (`Password={Secr3t;x}`).
-_PLACEHOLDER = re.compile(r"(?i)^(\$\(.*\)|\{[a-z_]\w*\}|#\{.*\}|__.*__|\*+|x+|)$")
+_PLACEHOLDER = PLACEHOLDER    # defined in auth_core so the ASP.NET Core rules share it
 # Value is a braced or single-quoted ADO.NET token, else it runs to the next `;`.
 _CONN_PW = re.compile(r"(?i)\b(password|pwd)\s*=\s*(\{[^}]*\}?|'[^']*'?|[^;\"]+)")
 _SECRET_KEY = re.compile(r"(?i)password|pwd|secret|apikey|api_key|token|privatekey|clientsecret")

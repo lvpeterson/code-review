@@ -882,7 +882,8 @@ def _cors(ctx: Ctx) -> None:
 # (name, fn(ctx)) in run order; each fn appends to ctx.out.
 _GROUPS: list = [("errors", _errors), ("transport", _transport), ("cors", _cors),
                  ("cookies", rules_pipeline_auth.check_cookies),
-                 ("antiforgery", rules_pipeline_auth.check_antiforgery)]
+                 ("antiforgery", rules_pipeline_auth.check_antiforgery),
+                 ("tokens", rules_pipeline_auth.check_tokens)]
 
 
 def check(model: ProjectModel, refs: list[CoreRouteRef]) -> list[Finding]:

@@ -538,3 +538,237 @@ def test_csrf002_page_attribute_directive(tmp_path, mode):
 def test_csrf001_expression_bodied_options_lambda_clears(tmp_path, mode):
     f = scan(tmp_path, mvc(ctl=SAVE, mvc_opts="o => o.Filters.Add(new AutoValidateAntiforgeryTokenAttribute())"), mode)
     assert not af(f)
+
+
+# -- JWT and OIDC validation (DNL-SESS-010, DNL-SESS-011, DNL-CFG-012, DNL-SEC-004) -------------------------
+
+def jwt(lines: str, extra: str = "") -> dict:
+    return prog(extra + "builder.Services.AddAuthentication().AddJwtBearer(o => { " + lines + " });")
+
+
+def tvp(inits: str) -> dict:
+    return jwt("o.TokenValidationParameters = new TokenValidationParameters { " + inits + " };")
+
+
+def tok(found, *cids):
+    return {(f.check_id, f.severity, f.confidence) for f in found if f.check_id in cids}
+
+
+def test_validate_flags_false_are_medium(tmp_path, mode):
+    f = scan(tmp_path, tvp("ValidateIssuer = false, ValidateAudience = false"), mode)
+    hits = [x for x in f if x.check_id == "DNL-SESS-010"]
+    assert len(hits) == 2 and tok(f, "DNL-SESS-010") == {("DNL-SESS-010", "medium", None)}
+
+
+def test_lifetime_and_expiration_false(tmp_path, mode):
+    f = scan(tmp_path, tvp("ValidateLifetime = false, RequireExpirationTime = false"), mode)
+    assert len([x for x in f if x.check_id == "DNL-SESS-010"]) == 2
+    assert tok(f, "DNL-SESS-010") == {("DNL-SESS-010", "medium", None)}
+
+
+def test_signature_checks_off_are_high(tmp_path, mode):
+    f = scan(tmp_path / "a", tvp("ValidateIssuerSigningKey = false"), mode)
+    assert tok(f, "DNL-SESS-010") == {("DNL-SESS-010", "high", None)}
+    f = scan(tmp_path / "b", tvp("RequireSignedTokens = false"), mode)
+    assert tok(f, "DNL-SESS-010") == {("DNL-SESS-010", "high", None)}
+
+
+def test_signature_validator_returning_token_unchecked(tmp_path, mode):
+    f = scan(tmp_path / "a", tvp("SignatureValidator = (t, p) => new JwtSecurityToken(t)"), mode)
+    assert tok(f, "DNL-SESS-010") == {("DNL-SESS-010", "high", None)}
+    f = scan(tmp_path / "b", tvp("SignatureValidator = (t, p) => { return new JsonWebToken(t); }"), mode)
+    assert tok(f, "DNL-SESS-010") == {("DNL-SESS-010", "high", None)}
+
+
+def test_custom_signature_validator_is_review(tmp_path, mode):
+    f = scan(tmp_path, tvp("SignatureValidator = (t, p) => MyLib.Verify(t)"), mode)
+    assert tok(f, "DNL-SESS-010") == {("DNL-SESS-010", "high", "REVIEW")}
+
+
+def test_non_literal_validate_value_is_review(tmp_path, mode):
+    f = scan(tmp_path / "a", tvp('ValidateIssuer = cfg.GetValue<bool>("V")'), mode)
+    assert tok(f, "DNL-SESS-010") == {("DNL-SESS-010", "medium", "REVIEW")}
+    assert "cfg.GetValue" in [x for x in f if x.check_id == "DNL-SESS-010"][0].description
+    f = scan(tmp_path / "b", tvp("ValidateAudience = Flags.Audience"), mode)     # enum-looking member
+    assert tok(f, "DNL-SESS-010") == {("DNL-SESS-010", "medium", "REVIEW")}
+
+
+def test_validation_on_is_clean(tmp_path, mode):
+    f = scan(tmp_path, tvp('ValidateLifetime = true, ValidateIssuer = true, ValidAudience = "api"'), mode)
+    assert not tok(f, "DNL-SESS-010", "DNL-SESS-011")
+
+
+def test_valid_audience_does_not_excuse_literal_false(tmp_path, mode):
+    f = scan(tmp_path, tvp('ValidateAudience = false, ValidAudience = "api"'), mode)
+    assert tok(f, "DNL-SESS-010") == {("DNL-SESS-010", "medium", None)}
+
+
+def test_member_assignment_form(tmp_path, mode):
+    f = scan(tmp_path, jwt("o.TokenValidationParameters.ValidateIssuer = false;"), mode)
+    assert tok(f, "DNL-SESS-010") == {("DNL-SESS-010", "medium", None)}
+
+
+def test_tvp_in_local_resolved(tmp_path, mode):
+    lines = ("var p = new TokenValidationParameters { ValidateIssuer = false };\n"
+             "p.ValidateLifetime = false;\no.TokenValidationParameters = p;")
+    f = scan(tmp_path, jwt(lines), mode)
+    assert len([x for x in f if x.check_id == "DNL-SESS-010"]) == 2
+    assert tok(f, "DNL-SESS-010") == {("DNL-SESS-010", "medium", None)}
+
+
+def test_tvp_in_enclosing_method_local(tmp_path, mode):
+    files = prog("var p = new TokenValidationParameters { ValidateIssuer = false };\n"
+                 "builder.Services.AddAuthentication().AddJwtBearer(o => { o.TokenValidationParameters = p; });")
+    assert tok(scan(tmp_path, files, mode), "DNL-SESS-010") == {("DNL-SESS-010", "medium", None)}
+
+
+def test_tvp_from_helper_or_unknown_local_is_review(tmp_path, mode):
+    for i, expr in enumerate(("Build(cfg)", "unknownLocal", "_field", "this.Params")):
+        f = scan(tmp_path / str(i), jwt(f"o.TokenValidationParameters = {expr};"), mode)
+        assert ("DNL-SESS-010", "medium", "REVIEW") in tok(f, "DNL-SESS-010"), expr
+
+
+def test_tvp_local_handed_to_helper_is_review(tmp_path, mode):
+    lines = "var p = new TokenValidationParameters();\nHarden(p);\no.TokenValidationParameters = p;"
+    f = scan(tmp_path, jwt(lines), mode)
+    assert ("DNL-SESS-010", "medium", "REVIEW") in tok(f, "DNL-SESS-010")
+
+
+def test_options_handed_to_helper_or_method_group_is_review(tmp_path, mode):
+    f = scan(tmp_path / "a", prog("builder.Services.AddAuthentication().AddJwtBearer(o => Harden(o));"), mode)
+    assert ("DNL-SESS-010", "medium", "REVIEW") in tok(f, "DNL-SESS-010")
+    assert ("DNL-CFG-012", "medium", "REVIEW") in tok(f, "DNL-CFG-012")
+    f = scan(tmp_path / "b", prog("builder.Services.AddAuthentication().AddJwtBearer(ConfigureJwt);"), mode)
+    assert ("DNL-SESS-010", "medium", "REVIEW") in tok(f, "DNL-SESS-010")
+    f = scan(tmp_path / "c", prog("builder.Services.AddAuthentication().AddJwtBearer();"), mode)
+    assert not tok(f, "DNL-SESS-010", "DNL-CFG-012")
+
+
+def test_conditional_values(tmp_path, mode):
+    f = scan(tmp_path / "a", jwt("if (cfg.Strict) { o.TokenValidationParameters.ValidateIssuer = false; }"), mode)
+    assert tok(f, "DNL-SESS-010") == {("DNL-SESS-010", "medium", "REVIEW")}
+    lines = ("o.TokenValidationParameters.ValidateIssuer = false;\n"
+             "if (cfg.Strict) { o.TokenValidationParameters.ValidateIssuer = true; }")
+    f = scan(tmp_path / "b", jwt(lines), mode)      # a conditional good value never clears a bad one
+    assert tok(f, "DNL-SESS-010") == {("DNL-SESS-010", "medium", "REVIEW")}
+
+
+def test_development_guard_in_lambda(tmp_path, mode):
+    lines = ("if (builder.Environment.IsDevelopment()) { o.RequireHttpsMetadata = false;\n"
+             " o.TokenValidationParameters.ValidateIssuer = false; }")
+    assert not tok(scan(tmp_path / "a", jwt(lines), mode), "DNL-SESS-010", "DNL-CFG-012")
+    lines = ("if (builder.Environment.IsDevelopment()) { o.RequireHttpsMetadata = true; }\n"
+             "else { o.RequireHttpsMetadata = false; }")
+    assert tok(scan(tmp_path / "b", jwt(lines), mode), "DNL-CFG-012") == {("DNL-CFG-012", "medium", None)}
+    lines = "if (Check(builder.Environment)) { o.RequireHttpsMetadata = false; }"
+    assert tok(scan(tmp_path / "c", jwt(lines), mode), "DNL-CFG-012") == {("DNL-CFG-012", "medium", "REVIEW")}
+
+
+def test_development_only_registration_not_flagged(tmp_path, mode):
+    files = prog("if (builder.Environment.IsDevelopment()) { builder.Services.AddAuthentication()"
+                 ".AddJwtBearer(o => { o.RequireHttpsMetadata = false; }); }")
+    assert not tok(scan(tmp_path, files, mode), "DNL-CFG-012")
+
+
+def test_clock_skew(tmp_path, mode):
+    f = scan(tmp_path / "a", tvp("ClockSkew = TimeSpan.FromHours(1)"), mode)
+    assert tok(f, "DNL-SESS-011") == {("DNL-SESS-011", "low", None)}
+    for i, v in enumerate(("TimeSpan.Zero", "TimeSpan.FromMinutes(5)", "TimeSpan.FromMinutes(10)")):
+        assert not tok(scan(tmp_path / f"ok{i}", tvp(f"ClockSkew = {v}"), mode), "DNL-SESS-011"), v
+    f = scan(tmp_path / "r", tvp("ClockSkew = cfg.Skew"), mode)
+    assert tok(f, "DNL-SESS-011") == {("DNL-SESS-011", "low", "REVIEW")}
+
+
+def test_require_https_metadata_false(tmp_path, mode):
+    f = scan(tmp_path / "a", jwt("o.RequireHttpsMetadata = false;"), mode)
+    assert tok(f, "DNL-CFG-012") == {("DNL-CFG-012", "medium", None)}
+    f = scan(tmp_path / "b", jwt("o.RequireHttpsMetadata = !builder.Environment.IsDevelopment();"), mode)
+    assert tok(f, "DNL-CFG-012") == {("DNL-CFG-012", "medium", "REVIEW")}
+    f = scan(tmp_path / "c", jwt("o.RequireHttpsMetadata = true;"), mode)
+    assert not tok(f, "DNL-CFG-012")
+
+
+def test_require_https_metadata_oidc_and_configure(tmp_path, mode):
+    f = scan(tmp_path / "a", prog("builder.Services.AddAuthentication().AddOpenIdConnect(o => "
+                                  "{ o.RequireHttpsMetadata = false; });"), mode)
+    assert tok(f, "DNL-CFG-012") == {("DNL-CFG-012", "medium", None)}
+    f = scan(tmp_path / "b", prog("builder.Services.Configure<JwtBearerOptions>(o => "
+                                  "{ o.RequireHttpsMetadata = false; });"), mode)
+    assert tok(f, "DNL-CFG-012") == {("DNL-CFG-012", "medium", None)}
+    f = scan(tmp_path / "c", prog("builder.Services.Configure<SomethingElse>(o => { o.RequireHttpsMetadata = false; });"),
+             mode)
+    assert not tok(f, "DNL-CFG-012")
+
+
+def test_appsettings_require_https_metadata(tmp_path, mode):
+    base = prog("builder.Services.AddAuthentication().AddJwtBearer();")
+    f = scan(tmp_path / "a", {**base, "appsettings.json": '{\n  "Auth": {\n    "RequireHttpsMetadata": false\n  }\n}\n'}, mode)
+    hits = [x for x in f if x.check_id == "DNL-CFG-012"]
+    assert [(h.file, h.line, h.severity, h.confidence) for h in hits] == [("appsettings.json", 3, "medium", None)]
+    f = scan(tmp_path / "b", {**base, "appsettings.json": '{"Auth": {"RequireHttpsMetadata": false}}',
+                              "appsettings.Production.json": '{"Auth": {"RequireHttpsMetadata": true}}'}, mode)
+    assert not tok(f, "DNL-CFG-012")
+    f = scan(tmp_path / "c", {**base, "appsettings.Development.json": '{"Auth": {"RequireHttpsMetadata": false}}'}, mode)
+    assert not tok(f, "DNL-CFG-012")
+    f = scan(tmp_path / "d", {**base, "appsettings.json": '{"Auth": {"RequireHttpsMetadata": "${X}"}}'}, mode)
+    assert tok(f, "DNL-CFG-012") == {("DNL-CFG-012", "medium", "REVIEW")}
+
+
+KEY = 'new SymmetricSecurityKey(Encoding.UTF8.GetBytes("super-secret-signing-key-123456"))'
+
+
+def test_symmetric_key_literal(tmp_path, mode):
+    f = scan(tmp_path, tvp("IssuerSigningKey = " + KEY), mode)
+    assert tok(f, "DNL-SEC-004") == {("DNL-SEC-004", "high", None)}
+    hit = [x for x in f if x.check_id == "DNL-SEC-004"][0]
+    assert (hit.file, hit.line) == ("Program.cs", 2)
+
+
+def test_symmetric_key_other_literal_forms(tmp_path, mode):
+    for i, src in enumerate(('Convert.FromBase64String("c3VwZXItc2VjcmV0LXNpZ25pbmcta2V5")',
+                             'Encoding.ASCII.GetBytes("changeme")')):
+        f = scan(tmp_path / str(i), prog(f"var k = new SymmetricSecurityKey({src});"), mode)
+        assert tok(f, "DNL-SEC-004") == {("DNL-SEC-004", "high", None)}, src
+
+
+def test_symmetric_key_via_const_and_field(tmp_path, mode):
+    files = prog('const string K = "super-secret-signing-key-123456";\n'
+                 "var k = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(K));")
+    assert tok(scan(tmp_path / "a", files, mode), "DNL-SEC-004") == {("DNL-SEC-004", "high", None)}
+    files = {"Keys.cs": 'public static class Keys { public const string Jwt = "super-secret-signing-key-123456"; }\n'
+                        "public class Maker { public object Make() => new SymmetricSecurityKey("
+                        "Encoding.UTF8.GetBytes(Keys.Jwt)); }\n"}
+    assert tok(scan(tmp_path / "b", files, mode), "DNL-SEC-004") == {("DNL-SEC-004", "high", None)}
+    files = {"Maker.cs": 'public class Maker { private static readonly string K = "super-secret-signing-key-123456";\n'
+                         "public object Make() => new SymmetricSecurityKey(Encoding.UTF8.GetBytes(K)); }\n"}
+    assert tok(scan(tmp_path / "c", files, mode), "DNL-SEC-004") == {("DNL-SEC-004", "high", None)}
+
+
+def test_symmetric_key_from_config_is_silent(tmp_path, mode):
+    for i, src in enumerate(('Encoding.UTF8.GetBytes(config["Jwt:Key"])', "Encoding.UTF8.GetBytes(unknownLocal)",
+                             'Encoding.UTF8.GetBytes(Environment.GetEnvironmentVariable("K"))',
+                             'Encoding.UTF8.GetBytes("")', 'Encoding.UTF8.GetBytes("<your key here>")',
+                             'Encoding.UTF8.GetBytes("{JwtKey}")')):
+        f = scan(tmp_path / str(i), prog(f"var k = new SymmetricSecurityKey({src});"), mode)
+        assert not tok(f, "DNL-SEC-004"), src
+
+
+def test_symmetric_key_reassigned_local_is_silent(tmp_path, mode):
+    files = prog('var s = "super-secret-signing-key-123456";\ns = config["Jwt:Key"];\n'
+                 "var k = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(s));")
+    assert not tok(scan(tmp_path, files, mode), "DNL-SEC-004")
+
+
+def test_symmetric_key_environment_guards(tmp_path, mode):
+    dev = prog("if (builder.Environment.IsDevelopment()) { var k = " + KEY + "; }")
+    assert not tok(scan(tmp_path / "a", dev, mode), "DNL-SEC-004")
+    odd = prog("if (Check(builder.Environment)) { var k = " + KEY + "; }")
+    assert tok(scan(tmp_path / "b", odd, mode), "DNL-SEC-004") == {("DNL-SEC-004", "high", "REVIEW")}
+    prod = prog("if (!builder.Environment.IsDevelopment()) { var k = " + KEY + "; }")
+    assert tok(scan(tmp_path / "c", prod, mode), "DNL-SEC-004") == {("DNL-SEC-004", "high", None)}
+
+
+def test_microsoft_identity_web_api_config_section_is_not_opaque(tmp_path, mode):
+    files = prog("builder.Services.AddAuthentication().AddMicrosoftIdentityWebApi("
+                 'builder.Configuration.GetSection("AzureAd"));')
+    assert not tok(scan(tmp_path, files, mode), "DNL-SESS-010", "DNL-CFG-012")

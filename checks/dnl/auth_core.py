@@ -78,6 +78,8 @@ _KNOWN_DENY_REQS = frozenset("""
 DenyAnonymousAuthorizationRequirement RolesAuthorizationRequirement ClaimsAuthorizationRequirement
 NameAuthorizationRequirement AssertionRequirement
 """.split())
+# A whole-value placeholder (shared with rules_config): `{...}` only counts as a single `{identifier}`.
+PLACEHOLDER = re.compile(r"(?i)^(\$\(.*\)|\{[a-z_]\w*\}|#\{.*\}|__.*__|\*+|x+|)$")
 _CTX = _Ctx()
 _UNK = ("unknown",)
 _SUPPRESS = "SuppressCheckForUnhandledSecurityMetadata"

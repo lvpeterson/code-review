@@ -1,7 +1,8 @@
 """Authentication-related ASP.NET Core configuration rules, called from the rules_pipeline aggregator.
 
-Groups: cookies and session (DNL-SESS-001/002/003 reused, DNL-SESS-009) and antiforgery (DNL-CSRF-001
-reused, DNL-CSRF-002). Later tasks add token validation and Identity groups to this module.
+Groups: cookies and session (DNL-SESS-001/002/003 reused, DNL-SESS-009), antiforgery (DNL-CSRF-001
+reused, DNL-CSRF-002) and JWT / OIDC token validation (DNL-SESS-010, DNL-SESS-011, DNL-CFG-012,
+DNL-SEC-004). Later tasks add the Identity group to this module.
 
 Like the other rules_pipeline* modules it must not import rules_auth_core (static inventory test);
 shared helpers live in auth_core.py.
@@ -11,12 +12,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from checks.dnl.auth_core import _NON_AUTHZ_EXTENSIONS
+from checks.dnl.auth_core import _NON_AUTHZ_EXTENSIONS, PLACEHOLDER
 from checks.dnl.cfgctx import Ctx
-from checks.dnl.ir import attr_key, call_name, receiver_text
-from checks.dnl.options import (Opt, const, lambda_args, opaque_reason, options_of, timespan_minutes, verdict,
-                                walk_conditional)
-from checks.dnl.pipeline import PipeCall, Pipeline
+from checks.dnl.ir import attr_key, call_name, const_str, receiver_text, walk
+from checks.dnl.options import (Opt, assignments, const, lambda_args, opaque_reason, options_of, param_escapes,
+                                timespan_minutes, verdict, walk_conditional)
+from checks.dnl.pipeline import PipeCall, Pipeline, _Ctx, _eval, _pred
 from checks.dnl.routes_core import CoreRouteRef, _chain_types
 
 # -- cookies and session (DNL-SESS-001, DNL-SESS-002, DNL-SESS-003, DNL-SESS-009) ---------------------
@@ -602,3 +603,545 @@ def check_antiforgery(ctx: Ctx) -> None:
                 desc += " The route is registered under an environment condition that is not plain Production."
             add("DNL-CSRF-002", f"Antiforgery validation disabled on {r.handler_name}", desc, ref,
                 "REVIEW" if soft else None)
+
+
+# -- JWT and OIDC token validation (DNL-SESS-010, DNL-SESS-011, DNL-CFG-012, DNL-SEC-004) -----------------
+
+# Calls whose options carry JwtBearerOptions / OpenIdConnectOptions settings; `Configure<T>` and
+# `PostConfigure<T>` count only for the option types below. AddCookie is read for RequireHttpsMetadata only.
+_TOKEN_CALLS = ("AddJwtBearer", "AddOpenIdConnect", "AddMicrosoftIdentityWebApi", "AddMicrosoftIdentityWebApp",
+                "AddCookie", "Configure", "PostConfigure")
+_TOKEN_OPTION_TYPES = ("JwtBearerOptions", "OpenIdConnectOptions")
+_MS_IDENTITY_CALLS = ("AddMicrosoftIdentityWebApi", "AddMicrosoftIdentityWebApp")
+_TVP = "TokenValidationParameters"
+_TVP_PREFIX = _TVP.lower() + "."
+_UNCHECKED_TOKEN_TYPES = ("JwtSecurityToken", "JsonWebToken")
+# (option, severity, what switching it off allows)
+_VALIDATE_FLAGS = (
+    ("validateissuer", "medium", "tokens from any issuer are accepted"),
+    ("validateaudience", "medium", "tokens issued for any other API or client are accepted"),
+    ("validatelifetime", "medium", "expired tokens are accepted"),
+    ("requireexpirationtime", "medium", "tokens that never expire are accepted"),
+    ("validateissuersigningkey", "high", "the key that signed the token is not checked, so a forged token can pass"),
+    ("requiresignedtokens", "high", "unsigned tokens are accepted, so anyone can forge one"),
+)
+_MAX_SKEW_MINUTES = 10
+_SEC004_TITLE = "Hardcoded symmetric signing key"
+
+
+def _scope_of(ctx: Ctx, pipe: Pipeline) -> str | None:
+    """The settings scope of a pipeline's project: its directory relative to the model root ("" = the
+    root), or None when no appsettings file sits there (effective() must never get an unknown scope)."""
+    if pipe.project is None or ctx.settings is None:
+        return None
+    rel = ctx.model.rel(pipe.project.dir)
+    scope = "" if rel in (".", "") else rel
+    return scope if scope in ctx.settings.scopes() else None
+
+
+def _env_branches(pred) -> tuple[bool | None, bool | None]:
+    """(runs in Production when the condition is true, ... when false) for an environment predicate; None
+    for a branch whose Production behaviour cannot be told. (True, False) / (False, True) are decided."""
+    v = _eval(pred, "production")
+    return (None, None) if v is None else (v, not v)
+
+
+def _prune(node):
+    """A copy of the node as Production sees it: an `if` or ternary whose condition is an environment check
+    that evaluates for Production is replaced by the branch that runs there (so a Development-only block
+    vanishes and its else part is unconditional). Conditions that read no environment, or that could not be
+    parsed, stay: the options reader then marks what sits under them conditional (REVIEW)."""
+    if isinstance(node, list):
+        out: list = []
+        for x in node:
+            kept = _decided_if(x)
+            if kept is None:
+                out.append(_prune(x))
+            else:
+                out.extend(_prune(kept))
+        return out
+    if not isinstance(node, dict):
+        return node
+    if node.get("k") == "cond":
+        pred = _pred(node.get("c"), {}, _Ctx())
+        if pred is not None and _eval(pred, "production") is not None:
+            return _prune(node.get("t") if _eval(pred, "production") else node.get("f"))
+    return {k: _prune(v) if isinstance(v, (dict, list)) else v for k, v in node.items()}
+
+
+def _decided_if(s) -> list | None:
+    """The statements of the branch an environment `if` takes in Production; None for any other node."""
+    if not (isinstance(s, dict) and s.get("k") == "if"):
+        return None
+    pred = _pred(s.get("cond"), {}, _Ctx())
+    if pred is None:
+        return None
+    v = _eval(pred, "production")
+    if v is None:
+        return None
+    return list((s.get("then") if v else s.get("else")) or [])
+
+
+def _text(e) -> str:
+    """Source-like text of an expression for a REVIEW message."""
+    if not isinstance(e, dict):
+        return "an expression"
+    if e.get("text"):
+        return str(e["text"])
+    k = e.get("k")
+    if k == "lit":
+        return repr(e.get("v"))
+    if k in ("name", "member"):
+        return receiver_text(e) or "an expression"
+    if k == "call":
+        fn = e.get("fn") if isinstance(e.get("fn"), dict) else {}
+        return f"{receiver_text(fn) or call_name(e) or 'a call'}(...)"
+    if k == "new":
+        return f"new {e.get('type') or ''}(...)".replace("new (", "new(")
+    return "an expression"
+
+
+def _token_calls(ctx: Ctx, pipe: Pipeline) -> list[tuple[PipeCall, str | None]]:
+    def wanted(c: PipeCall) -> bool:
+        if c.name not in ("Configure", "PostConfigure"):
+            return True
+        targs = (c.node.get("fn") or {}).get("targs") or []
+        return any(str(x).strip().split(".")[-1] in _TOKEN_OPTION_TYPES for x in targs)
+    return [(c, conf) for c, conf in _calls(ctx, pipe, *_TOKEN_CALLS) if wanted(c)]
+
+
+def _without_config_sections(node: dict) -> dict:
+    """AddMicrosoftIdentityWebApi(configuration.GetSection("AzureAd")): the section binds the Microsoft
+    Identity options (instance, tenant, client id), which hold no validation switches, so it is the normal
+    way to call it and not an unreadable options source. The option lambdas next to it are still read."""
+    def is_section(a) -> bool:
+        if not isinstance(a, dict) or a.get("k") in ("lambda", "new", "lit"):
+            return False
+        return any((n.get("k") == "call" and call_name(n) == "GetSection")
+                   or "config" in str(n.get("id") or n.get("name") or "").lower() for n in walk(a))
+    out = dict(node)
+    out["args"] = [a for a in node.get("args") or [] if not is_section(a)]
+    out["named"] = {k: v for k, v in (node.get("named") or {}).items() if not is_section(v)}
+    return out
+
+
+def _enclosing_body(ctx: Ctx, c: PipeCall):
+    """The statement list of the method (or accessor) the call node was written in; None when not found."""
+    for f in ctx.model.files.values():
+        for t in f.types:
+            if t.file != c.file:
+                continue
+            bodies = [m.body for m in t.methods]
+            for p in t.properties:
+                bodies += [x for x in (p.get, p.set) if x]
+            for body in bodies:
+                if any(n is c.node for n in walk(body)):
+                    return body
+    return None
+
+
+def _chain_root(target) -> tuple[str | None, str]:
+    """(root name, dotted path below it) of `p.A.B`; (None, "") for anything else."""
+    names: list[str] = []
+    n = target
+    while isinstance(n, dict) and n.get("k") == "member":
+        names.append(n.get("name") or "")
+        n = n.get("obj")
+    if isinstance(n, dict) and n.get("k") == "name" and all(names):
+        return n.get("id"), ".".join(reversed(names))
+    return None, ""
+
+
+def _resolve_local(ctx: Ctx, c: PipeCall, node: dict, name: str) -> tuple[list[Opt] | None, str]:
+    """(settings read from the local `name`, "") or (None, why not): the local's `new TokenValidationParameters`
+    initializer plus `name.X = v` assignments, one level, in the lambda that declares it or else the
+    enclosing method. A local that is handed to another call, reassigned or copied is out of sight."""
+    root = node
+    decl = [n for n in walk(root) if n.get("k") == "local" and n.get("name") == name]
+    if not decl:
+        body = _enclosing_body(ctx, c)
+        if body is None:
+            return None, f"{name} is not declared where this code can see it"
+        root = _prune(body)
+        decl = [n for n in walk(root) if n.get("k") == "local" and n.get("name") == name]
+    if len(decl) != 1:
+        return None, f"{name} is not declared exactly once where this code can see it"
+    init = decl[0].get("init")
+    simple = str(decl[0].get("type") or "").split(".")[-1]
+    is_tvp = (isinstance(init, dict) and init.get("k") == "new"
+              and (str(init.get("type") or "").split(".")[-1] == _TVP
+                   or (not init.get("type") and simple == _TVP)))
+    if not is_tvp:
+        return None, f"{name} is not a plain new {_TVP}"
+    ok: set = set()
+    out = list(assignments(init))
+    for n, cond in walk_conditional(root):
+        if n.get("k") == "member":
+            r = n
+            while isinstance(r, dict) and r.get("k") == "member":
+                r = r.get("obj")
+            if isinstance(r, dict) and r.get("k") == "name" and r.get("id") == name:
+                ok.add(id(r))
+        elif n.get("k") == "assign" and n.get("op") == "=":
+            rname, path = _chain_root(n.get("target"))
+            v = n.get("value")
+            if isinstance(v, dict) and v.get("k") == "name" and v.get("id") == name:
+                ok.add(id(v))
+            if rname == name and path:
+                out.append(Opt(path, v, n.get("line") or 0, cond))
+    if param_escapes(root, name, ok):
+        return None, f"{name} is passed to another call, copied or reassigned, so it is changed where this code cannot see"
+    return out, ""
+
+
+def _tvp_settings(ctx: Ctx, c: PipeCall, node: dict, opts: list[Opt]) -> tuple[list[Opt], list[tuple[str, int]]]:
+    """([settings of the TokenValidationParameters, paths relative to it], [(why unreadable, line)]). It reads
+    `o.TokenValidationParameters = new ... { }`, `o.TokenValidationParameters.X = v` and a local initialised
+    with `new TokenValidationParameters` (one level). Anything else assigned to it (a helper call, a field,
+    a parameter, a derived type) is unreadable."""
+    out = [Opt(o.path[len(_TVP_PREFIX):], o.value, o.line, o.conditional)
+           for o in opts if o.path.lower().startswith(_TVP_PREFIX)]
+    unreadable: list[tuple[str, int]] = []
+    for o in opts:
+        if o.path.lower() != _TVP.lower():
+            continue
+        v = o.value
+        if isinstance(v, dict) and v.get("k") == "new":
+            t = str(v.get("type") or "").split(".")[-1]
+            if t not in ("", _TVP):
+                unreadable.append((f"it is built as {v.get('type')}, a type this code does not read", o.line))
+        elif isinstance(v, dict) and v.get("k") == "name":
+            extra, why = _resolve_local(ctx, c, node, v.get("id") or "")
+            if extra is None:
+                unreadable.append((why, o.line))
+            else:
+                out += extra
+        else:
+            unreadable.append((f"it is set from {_text(v)}", o.line))
+    return out, unreadable
+
+
+def _skew_kind(o: Opt) -> str:
+    """"bad" (over ten minutes), "good" or "unknown" for a ClockSkew value."""
+    text = receiver_text(o.value) if isinstance(o.value, dict) and o.value.get("k") == "member" else ""
+    if text.endswith(("TimeSpan.Zero", "DefaultClockSkew")):
+        return "good"
+    if text.endswith("TimeSpan.MaxValue"):
+        return "bad"
+    m = timespan_minutes(o.value)
+    if m is None:
+        return "unknown"
+    return "bad" if m > _MAX_SKEW_MINUTES else "good"
+
+
+def _flag_kind(o: Opt) -> str:
+    """"bad" (literal false), "good" (literal true) or "unknown" for a validation switch."""
+    v = const(o.value)
+    return "unknown" if not isinstance(v, bool) else "good" if v else "bad"
+
+
+def _signature_kind(o: Opt) -> str:
+    """"unchecked" (a lambda that wraps its token argument without checking it), "good" (literal null) or
+    "custom" (any other validator: it replaces the signature check and its body is not proven sound)."""
+    v = o.value
+    if isinstance(v, dict) and v.get("k") == "lit" and v.get("v") is None:
+        return "good"
+    if not (isinstance(v, dict) and v.get("k") == "lambda"):
+        return "custom"
+    params = [p for p in v.get("params") or [] if isinstance(p, str)]
+    body = v.get("body")
+    rets = [body] if isinstance(body, dict) else [n.get("value") for n in walk(body) if n.get("k") == "return"]
+    if not params or not rets:
+        return "custom"
+
+    def wraps(r) -> bool:
+        return (isinstance(r, dict) and r.get("k") == "new"
+                and str(r.get("type") or "").split(".")[-1] in _UNCHECKED_TOKEN_TYPES
+                and len(r.get("args") or []) == 1 and isinstance(r["args"][0], dict)
+                and r["args"][0].get("k") == "name" and r["args"][0].get("id") == params[0])
+    return "unchecked" if all(wraps(r) for r in rets) else "custom"
+
+
+def _validation(opts: list[Opt], c: PipeCall, conf, add) -> None:
+    """DNL-SESS-010 and DNL-SESS-011 over the settings of one TokenValidationParameters."""
+    title = "Token validation switched off"
+    for leaf, sev, what in _VALIDATE_FLAGS:
+        o, uncertain = verdict(opts, leaf, bad=lambda x: _flag_kind(x) != "good")
+        if o is None or _flag_kind(o) == "good":
+            continue
+        name = next((x.path for x in opts if x.path.lower() == leaf), leaf)
+        if _flag_kind(o) == "bad" and not uncertain:
+            add("DNL-SESS-010", sev, title,
+                f"{_TVP}.{name} is false, so {what}. Leave it at its default (true).", c, o.line, conf)
+        elif _flag_kind(o) == "bad":
+            add("DNL-SESS-010", sev, title,
+                f"{_TVP}.{name} is false, so {what}, but some assignment to it sits under a condition, so it "
+                "may not apply in Production; confirm.", c, o.line, "REVIEW")
+        else:
+            add("DNL-SESS-010", sev, title,
+                f"{_TVP}.{name} is set from {_text(o.value)}, which is not a compile-time value, so it may be "
+                f"false in Production (then {what}); confirm it is true.", c, o.line, "REVIEW")
+    o, uncertain = verdict(opts, "signaturevalidator", bad=lambda x: _signature_kind(x) != "good")
+    if o is not None and _signature_kind(o) != "good":
+        if _signature_kind(o) == "unchecked" and not uncertain:
+            add("DNL-SESS-010", "high", title,
+                f"{_TVP}.SignatureValidator returns the token it is given without checking its signature, so a "
+                "forged token passes. Remove it, or verify the signature before returning.", c, o.line, conf)
+        else:
+            add("DNL-SESS-010", "high", title,
+                f"{_TVP}.SignatureValidator replaces the signature check with code this rule cannot prove "
+                "verifies the token (or assigns it only under a condition); confirm it does.", c, o.line, "REVIEW")
+    o, uncertain = verdict(opts, "clockskew", bad=lambda x: _skew_kind(x) != "good")
+    if o is not None and _skew_kind(o) != "good":
+        low = "Token clock skew over ten minutes"
+        if _skew_kind(o) == "bad" and not uncertain:
+            m = timespan_minutes(o.value)
+            span = f"{m:g} minutes" if m is not None else _text(o.value)
+            add("DNL-SESS-011", "low", low,
+                f"{_TVP}.ClockSkew is {span}, so a token stays valid for that long after it expires. Keep it "
+                f"to {_MAX_SKEW_MINUTES} minutes or less.", c, o.line, conf)
+        else:
+            add("DNL-SESS-011", "low", low,
+                f"{_TVP}.ClockSkew is {_text(o.value)}, which is not a compile-time span of {_MAX_SKEW_MINUTES} "
+                "minutes or less (or is set under a condition); confirm it is short.", c, o.line, "REVIEW")
+
+
+def _https_metadata(opts: list[Opt], c: PipeCall, conf, add) -> None:
+    o, uncertain = verdict(opts, "requirehttpsmetadata", bad=lambda x: _flag_kind(x) != "good")
+    if o is None or _flag_kind(o) == "good":
+        return
+    title = "OIDC metadata may be fetched over HTTP"
+    if _flag_kind(o) == "bad" and not uncertain:
+        add("DNL-CFG-012", "medium", title,
+            "RequireHttpsMetadata is false, so the signing keys and issuer metadata can be fetched over plain "
+            "HTTP and swapped by anyone on the network path. Leave it true outside Development.",
+            c, o.line, conf)
+    else:
+        why = (" but some assignment to it sits under a condition" if _flag_kind(o) == "bad"
+               else f" from {_text(o.value)}, which is not a compile-time value")
+        add("DNL-CFG-012", "medium", title,
+            f"RequireHttpsMetadata is set{why}, so it may be false in Production; confirm it is true.",
+            c, o.line, "REVIEW")
+
+
+def _token_options(ctx: Ctx, c: PipeCall, conf, add) -> None:
+    node = _prune(c.node)
+    probe = _without_config_sections(node) if c.name in _MS_IDENTITY_CALLS else node
+    reason = None if c.name == "AddCookie" else opaque_reason(probe)
+    if reason is not None:
+        for cid, sev, title, what in (
+                ("DNL-SESS-010", "medium", "Token validation could not be read", "validation switches"),
+                ("DNL-SESS-011", "low", "Token clock skew could not be read", "ClockSkew"),
+                ("DNL-CFG-012", "medium", "OIDC metadata may be fetched over HTTP", "RequireHttpsMetadata")):
+            add(cid, sev, title, f"The {what} of {c.name} could not be read: {reason}. Confirm token validation "
+                                 "is fully on, ClockSkew is short and RequireHttpsMetadata is true.",
+                c, c.line, "REVIEW")
+    opts = options_of(node)
+    _https_metadata(opts, c, conf, add)
+    if c.name == "AddCookie":
+        return
+    tvp, unreadable = _tvp_settings(ctx, c, node, opts)
+    for why, line in unreadable:
+        for cid, sev in (("DNL-SESS-010", "medium"), ("DNL-SESS-011", "low")):
+            add(cid, sev, "Token validation could not be read",
+                f"{_TVP} of {c.name} could not be read: {why}. Confirm token validation is fully on and "
+                "ClockSkew is ten minutes or less.", c, line, "REVIEW")
+    _validation(tvp, c, conf, add)
+
+
+def _settings_https(ctx: Ctx, pipe: Pipeline, add_cfg) -> None:
+    """`RequireHttpsMetadata` (any section) in the effective Production settings of the pipeline's project."""
+    scope = _scope_of(ctx, pipe)
+    if scope is None:
+        return
+    for key, e in ctx.settings.effective("Production", scope).items():
+        if key.split(":")[-1] != "requirehttpsmetadata" or e.value is None:
+            continue
+        text = str(e.value).strip().lower()
+        if e.value is True or text == "true":
+            continue
+        firm = e.value is False or text == "false"
+        desc = (f"{e.key} is false in the Production configuration, so signing keys and issuer metadata can be "
+                "fetched over plain HTTP. Leave it true outside Development." if firm else
+                f"{e.key} is {e.value!r} in the Production configuration, which could not be read as a boolean, "
+                "so metadata may be fetched over plain HTTP; confirm it is true.")
+        add_cfg(desc, e.file, e.line, None if firm else "REVIEW")
+
+
+# -- DNL-SEC-004: a symmetric signing key written in code -----------------------------------------------
+
+_BYTE_SOURCES = {"getbytes": "encoding", "frombase64string": "convert", "fromhexstring": "convert",
+                 "decodebytes": "any", "base64urldecode": "any"}
+
+
+def _env_walk(node, state: str = "run"):
+    """Pre-order (node, state) with state "run" (runs in Production), "skip" (Development only) or "review"
+    (under an environment condition that could not be parsed). Conditions that read no environment keep the
+    state: a key under an ordinary `if` still sits in the code."""
+    if isinstance(node, list):
+        for x in node:
+            yield from _env_walk(x, state)
+        return
+    if not isinstance(node, dict):
+        return
+    yield node, state
+    k = node.get("k")
+    t_state = e_state = state
+    t_key, e_key = ("then", "else") if k == "if" else ("t", "f")
+    if k in ("if", "cond"):
+        pred = _pred(node.get("cond" if k == "if" else "c"), {}, _Ctx())
+        if pred is not None and state != "skip":
+            t_runs, e_runs = _env_branches(pred)
+            t_state = "review" if t_runs is None else "run" if t_runs else "skip"
+            e_state = "review" if e_runs is None else "run" if e_runs else "skip"
+    for key, v in node.items():
+        if isinstance(v, (dict, list)):
+            yield from _env_walk(v, t_state if key == t_key else e_state if key == e_key else state)
+
+
+def _is_literal_key(text: str) -> bool:
+    """A whole-value placeholder (empty, `<...>`, `{...}`, `$(...)`, `#{...}`, `__x__`, `***`) is not a key."""
+    t = text.strip()
+    return not (PLACEHOLDER.match(t) or re.fullmatch(r"<[^>]*>|\{[^}]*\}", t))
+
+
+def _local_literal(body, name: str) -> str | None:
+    """The literal a local is initialised with, when every declaration of it is a literal and nothing
+    reassigns it to anything else."""
+    vals = []
+    for n in walk(body):
+        if n.get("k") == "local" and n.get("name") == name:
+            vals.append(const_str(n.get("init")))
+        elif (n.get("k") == "assign" and isinstance(n.get("target"), dict) and n["target"].get("k") == "name"
+              and n["target"].get("id") == name and const_str(n.get("value")) is None):
+            return None
+    return vals[0] if vals and all(v is not None for v in vals) else None
+
+
+def _field_literal(t, name: str) -> str | None:
+    """The literal a field of type `t` is initialised with, unless a method of the type assigns it something
+    else (the IR does not say `readonly`, so a reassignment is the only sign it is not constant)."""
+    f = next((x for x in t.fields if x.name == name), None)
+    lit = const_str(f.init) if f is not None else None
+    if lit is None:
+        return None
+    for m in t.methods:
+        for n in walk(m.body):
+            if n.get("k") == "assign" and n.get("op") == "=":
+                tgt = n.get("target")
+                if (isinstance(tgt, dict) and (tgt.get("id") == name or tgt.get("name") == name)
+                        and const_str(n.get("value")) is None):
+                    return None
+    return lit
+
+
+def _literal_of(model, t, body, e) -> str | None:
+    """The string literal an expression stands for, resolved one level: a literal, a local or field of the
+    enclosing type, or `Type.Member`."""
+    lit = const_str(e)
+    if lit is not None or not isinstance(e, dict):
+        return lit
+    if e.get("k") == "name":
+        got = _local_literal(body, e.get("id") or "")
+        return got if got is not None else _field_literal(t, e.get("id") or "")
+    if e.get("k") == "member":
+        parts = receiver_text(e).split(".")
+        if len(parts) >= 2:
+            owner = t.name.split(".")[-1] if parts[-2] == "this" else parts[-2]
+            for ot in ([t] if owner == t.name.split(".")[-1] else []) + list(model.find_types(owner)):
+                got = _field_literal(ot, parts[-1])
+                if got is not None:
+                    return got
+    return None
+
+
+def _key_literal(model, t, body, new: dict) -> str | None:
+    """The literal behind `new SymmetricSecurityKey(<bytes>)`: Encoding.*.GetBytes(x), Convert.FromBase64String(x)
+    and the like. None for any other source (configuration, environment, Key Vault, a parameter)."""
+    args = new.get("args") or []
+    if len(args) != 1 or not isinstance(args[0], dict) or args[0].get("k") != "call":
+        return None
+    call = args[0]
+    kind = _BYTE_SOURCES.get((call_name(call) or "").lower())
+    fn = call.get("fn") if isinstance(call.get("fn"), dict) else {}
+    recv = receiver_text(fn.get("obj")) or str((fn.get("obj") or {}).get("type") or "")
+    if kind is None or not call.get("args"):
+        return None
+    if (kind == "encoding" and "Encoding" not in recv) or (kind == "convert" and not recv.endswith("Convert")):
+        return None
+    return _literal_of(model, t, body, call["args"][0])
+
+
+def _symmetric_news(root):
+    """((new node, state), ...) of every `new SymmetricSecurityKey(...)` under root, including the target-typed
+    `new(...)` of a local declared SymmetricSecurityKey or assigned to IssuerSigningKey."""
+    seen: set = set()
+    for n, state in _env_walk(root):
+        found = []
+        k = n.get("k")
+        if k == "new" and str(n.get("type") or "").split(".")[-1] == "SymmetricSecurityKey":
+            found.append(n)
+        elif k == "local" and str(n.get("type") or "").split(".")[-1] == "SymmetricSecurityKey":
+            found.append(n.get("init"))
+        elif k == "assign" and isinstance(n.get("target"), dict) and n["target"].get("name") == "IssuerSigningKey":
+            found.append(n.get("value"))
+        if k == "new":
+            found += [e.get("value") for e in n.get("init") or []
+                      if isinstance(e, dict) and e.get("name") == "IssuerSigningKey"]
+        for f in found:
+            typed = not f.get("type") or str(f["type"]).split(".")[-1] == "SymmetricSecurityKey" if isinstance(f, dict) else False
+            if typed and f.get("k") == "new" and id(f) not in seen:
+                seen.add(id(f))
+                yield f, state
+
+
+def _signing_keys(ctx: Ctx) -> None:
+    seen: set = set()
+    for f in ctx.model.files.values():
+        for t in f.types:
+            roots = [(m.body, m.body) for m in t.methods]
+            for p in t.properties:
+                roots += [(b, b) for b in (p.get, p.set) if b]
+                if p.init is not None:
+                    roots.append((p.init, []))
+            roots += [(fl.init, []) for fl in t.fields if fl.init is not None]
+            for root, body in roots:
+                for new, state in _symmetric_news(root):
+                    lit = _key_literal(ctx.model, t, body, new)
+                    key = (t.file, new.get("line"))
+                    if lit is None or not _is_literal_key(lit) or state == "skip" or key in seen:
+                        continue
+                    seen.add(key)
+                    desc = ("The symmetric key that signs and verifies tokens is a string written in the source, "
+                            "so anyone with the code (or the compiled assembly) can forge tokens. Load the key "
+                            "from configuration, an environment variable or a key vault.")
+                    if state == "review":
+                        desc += " The code sits under an environment condition that could not be parsed."
+                    ctx.add("DNL-SEC-004", "high", _SEC004_TITLE, desc, t.file, new.get("line") or t.line,
+                            confidence="REVIEW" if state == "review" else None)
+
+
+def check_tokens(ctx: Ctx) -> None:
+    seen: set = set()
+
+    def add(cid: str, sev: str, title: str, desc: str, c: PipeCall, line: int, conf: str | None) -> None:
+        if c.runs_in("Production") is None:
+            conf = "REVIEW"
+            desc += " The call sits under an environment condition that could not be parsed."
+        key = (cid, c.file, line, conf, title, desc)
+        if key not in seen:
+            seen.add(key)
+            ctx.add(cid, sev, title, desc, c.file, line, confidence=conf)
+
+    for pipe in ctx.pipes:
+        for c, conf in _token_calls(ctx, pipe):
+            _token_options(ctx, c, conf, add)
+
+        def add_cfg(desc, file, line, conf) -> None:
+            key = ("DNL-CFG-012", file, line)
+            if key not in seen:
+                seen.add(key)
+                ctx.add("DNL-CFG-012", "medium", "OIDC metadata may be fetched over HTTP", desc, file, line,
+                        confidence=conf)
+        _settings_https(ctx, pipe, add_cfg)
+    _signing_keys(ctx)
