@@ -569,3 +569,184 @@ def test_conditional_customize_does_not_suppress_missing_handler(tmp_path, mode)
     services = ("builder.Services.AddProblemDetails(o => { if (Flags.Detail()) { o.CustomizeProblemDetails = c => "
                 "{ c.ProblemDetails.Detail = \"x\"; }; } });")
     assert ("DNL-CFG-009", "low", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseRouting();", services=services))
+
+
+# -- CORS (DNL-CFG-007, DNL-CFG-015) -----------------------------------------------------------------
+
+def _cors(tmp_path, mode, policy, body="app.UseRouting();", extra=None, services_extra=""):
+    services = f"builder.Services.AddCors(o => {{ {policy} }});\n{services_extra}"
+    return _scan(tmp_path, mode, body, services, extra)
+
+
+def _add_policy(chain, name="p"):
+    return f'o.AddPolicy("{name}", b => {chain});'
+
+
+def test_cors_any_origin_is_medium(tmp_path, mode):
+    found = _cors(tmp_path, mode, _add_policy("b.AllowAnyOrigin().AllowAnyHeader()"))
+    assert ("DNL-CFG-007", "medium", None) in ids(found)
+
+
+def test_cors_any_origin_with_credentials_is_high_once(tmp_path, mode):
+    found = _cors(tmp_path, mode, _add_policy("b.AllowAnyOrigin().AllowCredentials()"))
+    hits = _of(found, "DNL-CFG-007")
+    assert [(f.severity, f.confidence) for f in hits] == [("high", None)]
+    assert "throws" in hits[0].description
+
+
+def test_cors_always_true_origin_callback_with_credentials_is_high(tmp_path, mode):
+    found = _cors(tmp_path, mode, _add_policy("b.SetIsOriginAllowed(_ => true).AllowCredentials()"))
+    assert ("DNL-CFG-007", "high", None) in ids(found)
+
+
+def test_cors_with_origins_star_is_medium(tmp_path, mode):
+    found = _cors(tmp_path, mode, _add_policy('b.WithOrigins("*")'))
+    assert ("DNL-CFG-007", "medium", None) in ids(found)
+
+
+def test_cors_wildcard_subdomains_with_bare_star_is_flagged(tmp_path, mode):
+    found = _cors(tmp_path, mode, _add_policy('b.WithOrigins("*").SetIsOriginAllowedToAllowWildcardSubdomains()'))
+    assert ("DNL-CFG-007", "medium", None) in ids(found)
+
+
+def test_cors_wildcard_subdomains_of_real_origin_is_clean(tmp_path, mode):
+    found = _cors(tmp_path, mode,
+                  _add_policy('b.WithOrigins("https://*.example.test").SetIsOriginAllowedToAllowWildcardSubdomains()'))
+    assert not _of(found, "DNL-CFG-007")
+
+
+def test_cors_restrictive_callback_is_clean(tmp_path, mode):
+    found = _cors(tmp_path, mode, _add_policy('b.SetIsOriginAllowed(o => o.EndsWith(".example.test"))'))
+    assert not _of(found, "DNL-CFG-007")
+
+
+def test_cors_listed_origin_is_clean(tmp_path, mode):
+    found = _cors(tmp_path, mode, _add_policy('b.WithOrigins("https://a.example.test").AllowCredentials()'))
+    assert not _of(found, "DNL-CFG-007")
+
+
+def test_cors_policy_under_development_guard_is_clean(tmp_path, mode):
+    services = ("if (builder.Environment.IsDevelopment())\n{\n"
+                "    builder.Services.AddCors(o => { o.AddPolicy(\"p\", b => b.AllowAnyOrigin()); });\n}")
+    assert not _of(_scan(tmp_path, mode, "app.UseRouting();", services), "DNL-CFG-007")
+
+
+def test_cors_policy_under_unparseable_guard_is_review(tmp_path, mode):
+    services = ("if (Flags.Open())\n{\n"
+                "    builder.Services.AddCors(o => { o.AddPolicy(\"p\", b => b.AllowAnyOrigin()); });\n}")
+    assert ("DNL-CFG-007", "medium", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseRouting();", services))
+
+
+def test_cors_default_policy_any_origin(tmp_path, mode):
+    found = _cors(tmp_path, mode, "o.AddDefaultPolicy(b => b.AllowAnyOrigin());")
+    assert ("DNL-CFG-007", "medium", None) in ids(found)
+
+
+def test_cors_inline_use_cors_policy(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseCors(b => b.AllowAnyOrigin());")
+    assert ("DNL-CFG-007", "medium", None) in ids(found)
+
+
+def test_cors_policy_built_by_helper_is_review(tmp_path, mode):
+    helper_cs = ("public static class CorsHelper { public static void Open(object b) { } }\n")
+    found = _cors(tmp_path, mode, _add_policy("CorsHelper.Open(b)"), extra={"CorsHelper.cs": helper_cs})
+    assert ("DNL-CFG-007", "medium", "REVIEW") in ids(found)
+
+
+def test_cors_policy_method_group_is_review(tmp_path, mode):
+    found = _cors(tmp_path, mode, 'o.AddPolicy("p", Configure);',
+                  extra={"X.cs": "public static class X { public static void Configure(object b) {} }\n"})
+    assert ("DNL-CFG-007", "medium", "REVIEW") in ids(found)
+
+
+def test_cors_named_policy_used_but_not_defined_is_review(tmp_path, mode):
+    found = _scan(tmp_path, mode, 'app.UseCors("ghost");')
+    assert ("DNL-CFG-007", "medium", "REVIEW") in ids(found)
+
+
+def test_cors_named_policy_used_and_defined_is_clean(tmp_path, mode):
+    found = _cors(tmp_path, mode, _add_policy('b.WithOrigins("https://a.example.test")', "tight"),
+                  body='app.UseCors("tight");')
+    assert not _of(found, "DNL-CFG-007")
+
+
+def test_cors_conditional_wildcard_is_review(tmp_path, mode):
+    chain = "{ if (Flags.Open()) { b.AllowAnyOrigin(); } else { b.WithOrigins(\"https://a.example.test\"); } }"
+    found = _cors(tmp_path, mode, f'o.AddPolicy("p", b => {chain});')
+    assert ("DNL-CFG-007", "medium", "REVIEW") in ids(found)
+
+
+def test_cors_conditional_good_origin_does_not_clear_wildcard(tmp_path, mode):
+    chain = "{ b.AllowAnyOrigin(); if (Flags.Tight()) { b.WithOrigins(\"https://a.example.test\"); } }"
+    found = _cors(tmp_path, mode, f'o.AddPolicy("p", b => {chain});')
+    assert ("DNL-CFG-007", "medium", None) in ids(found)
+
+
+def test_cors_origins_from_configuration_are_review(tmp_path, mode):
+    found = _cors(tmp_path, mode, _add_policy('b.WithOrigins(builder.Configuration["Cors:Origin"])'))
+    assert ("DNL-CFG-007", "medium", "REVIEW") in ids(found)
+
+
+ADMIN = """
+using Microsoft.AspNetCore.Cors;
+using Microsoft.AspNetCore.Mvc;
+public class AdminController : Controller
+{
+    [EnableCors("%s")]
+    public IActionResult Reset() => Ok();
+}
+"""
+MVC = "builder.Services.AddControllers();\n"
+TIGHT = _add_policy('b.WithOrigins("https://a.example.test")', "tight")
+
+
+def _admin(tmp_path, mode, policy, attr_name="tight", controller=None):
+    ctl = controller or ADMIN % attr_name
+    return _cors(tmp_path, mode, policy, body="app.MapControllers();", extra={"AdminController.cs": ctl},
+                 services_extra=MVC)
+
+
+def test_enable_cors_on_sensitive_route(tmp_path, mode):
+    found = _admin(tmp_path, mode, TIGHT)
+    hits = _of(found, "DNL-CFG-015")
+    assert ("DNL-CFG-015", "low", "REVIEW") in ids(found) and hits[0].route is not None
+    assert not _of(found, "DNL-CFG-007")
+
+
+def test_enable_cors_under_wildcard_policy_is_cfg007_only(tmp_path, mode):
+    found = _admin(tmp_path, mode, _add_policy("b.AllowAnyOrigin()", "tight"))
+    assert not _of(found, "DNL-CFG-015") and ("DNL-CFG-007", "medium", None) in ids(found)
+
+
+def test_enable_cors_with_undefined_policy_is_still_reported(tmp_path, mode):
+    found = _admin(tmp_path, mode, _add_policy('b.WithOrigins("https://a.example.test")', "other"))
+    assert ("DNL-CFG-015", "low", "REVIEW") in ids(found)
+
+
+def test_enable_cors_on_class_and_mutating_action(tmp_path, mode):
+    ctl = ('using Microsoft.AspNetCore.Cors;\nusing Microsoft.AspNetCore.Mvc;\n[EnableCors("tight")]\n'
+           'public class ItemsController : Controller\n{\n    [HttpPost]\n    public IActionResult Save() => Ok();\n}\n')
+    assert ("DNL-CFG-015", "low", "REVIEW") in ids(_admin(tmp_path, mode, TIGHT, controller=ctl))
+
+
+def test_enable_cors_on_harmless_read_is_not_reported(tmp_path, mode):
+    ctl = ('using Microsoft.AspNetCore.Cors;\nusing Microsoft.AspNetCore.Mvc;\npublic class ItemsController : Controller\n'
+           '{\n    [EnableCors("tight")]\n    [HttpGet]\n    public IActionResult List() => Ok();\n}\n')
+    assert not _of(_admin(tmp_path, mode, TIGHT, controller=ctl), "DNL-CFG-015")
+
+
+def test_disable_cors_is_ignored(tmp_path, mode):
+    ctl = ('using Microsoft.AspNetCore.Cors;\nusing Microsoft.AspNetCore.Mvc;\npublic class AdminController : Controller\n'
+           '{\n    [DisableCors]\n    public IActionResult Reset() => Ok();\n}\n')
+    assert not _of(_admin(tmp_path, mode, TIGHT, controller=ctl), "DNL-CFG-015")
+
+
+def test_require_cors_on_sensitive_minimal_route(tmp_path, mode):
+    body = 'app.MapPost("/admin/reset", () => "ok").RequireCors("tight");'
+    assert ("DNL-CFG-015", "low", "REVIEW") in ids(_cors(tmp_path, mode, TIGHT, body=body))
+
+
+def test_require_cors_through_group_under_wildcard_is_cfg007_only(tmp_path, mode):
+    body = 'var g = app.MapGroup("/admin").RequireCors("tight");\ng.MapPost("/reset", () => "ok");'
+    found = _cors(tmp_path, mode, _add_policy("b.AllowAnyOrigin()", "tight"), body=body)
+    assert not _of(found, "DNL-CFG-015") and ("DNL-CFG-007", "medium", None) in ids(found)

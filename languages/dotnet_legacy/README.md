@@ -367,7 +367,7 @@ either mode.
 | List | Code | Category | Rules |
 |---|---|---|---|
 | 2025 | A01 | Broken Access Control | DNL-AUTHZ-001, DNL-AUTHZ-002, DNL-AUTHZ-003, DNL-AUTHZ-004, DNL-AUTHZ-005, DNL-AUTHZ-008, DNL-CSRF-001, DNL-PATH-001, DNL-REDIR-001, DNL-SSRF-001 |
-| 2025 | A02 | Security Misconfiguration | DNL-CFG-001, DNL-CFG-002, DNL-CFG-003, DNL-CFG-004, DNL-CFG-005, DNL-CFG-006, DNL-CFG-007, DNL-CFG-008, DNL-CFG-009, DNL-CFG-010, DNL-CFG-011, DNL-CFG-013, DNL-CFG-014, DNL-INV-001, DNL-INV-002, DNL-WCF-001, DNL-WCF-002, DNL-WCF-003, DNL-XXE-001, DNL-XXE-002 |
+| 2025 | A02 | Security Misconfiguration | DNL-CFG-001, DNL-CFG-002, DNL-CFG-003, DNL-CFG-004, DNL-CFG-005, DNL-CFG-006, DNL-CFG-007, DNL-CFG-008, DNL-CFG-009, DNL-CFG-010, DNL-CFG-011, DNL-CFG-013, DNL-CFG-014, DNL-CFG-015, DNL-INV-001, DNL-INV-002, DNL-WCF-001, DNL-WCF-002, DNL-WCF-003, DNL-XXE-001, DNL-XXE-002 |
 | 2025 | A03 | Software Supply Chain Failures | DNL-SCA-001, DNL-SCA-002, DNL-SCA-003, DNL-SCA-004, DNL-SCA-005 |
 | 2025 | A04 | Cryptographic Failures | DNL-CRY-001, DNL-CRY-002, DNL-CRY-003, DNL-CRY-004, DNL-CRY-005, DNL-CRY-007, DNL-CRY-008, DNL-SESS-005 |
 | 2025 | A05 | Injection | DNL-INJ-001, DNL-INJ-002, DNL-INJ-003, DNL-INJ-004, DNL-INJ-005, DNL-INJ-006, DNL-XSS-001, DNL-XSS-002, DNL-XSS-003, DNL-XSS-004 |
@@ -380,7 +380,7 @@ either mode.
 | 2021 | A02 | Cryptographic Failures | DNL-CRY-001, DNL-CRY-002, DNL-CRY-003, DNL-CRY-004, DNL-CRY-005, DNL-CRY-007, DNL-CRY-008, DNL-SESS-005 |
 | 2021 | A03 | Injection | DNL-INJ-001, DNL-INJ-002, DNL-INJ-003, DNL-INJ-004, DNL-INJ-005, DNL-INJ-006, DNL-XSS-001, DNL-XSS-002, DNL-XSS-003, DNL-XSS-004 |
 | 2021 | A04 | Insecure Design | DNL-AUTHZ-006, DNL-AUTHZ-007, DNL-DES-001, DNL-ERR-001, DNL-ERR-003, DNL-RES-001, DNL-RES-002, DNL-RES-003, DNL-WCF-004 |
-| 2021 | A05 | Security Misconfiguration | DNL-CFG-001, DNL-CFG-002, DNL-CFG-003, DNL-CFG-004, DNL-CFG-005, DNL-CFG-006, DNL-CFG-007, DNL-CFG-008, DNL-CFG-009, DNL-CFG-010, DNL-CFG-011, DNL-CFG-013, DNL-CFG-014, DNL-ERR-002, DNL-INV-001, DNL-INV-002, DNL-WCF-001, DNL-WCF-002, DNL-WCF-003, DNL-XXE-001, DNL-XXE-002 |
+| 2021 | A05 | Security Misconfiguration | DNL-CFG-001, DNL-CFG-002, DNL-CFG-003, DNL-CFG-004, DNL-CFG-005, DNL-CFG-006, DNL-CFG-007, DNL-CFG-008, DNL-CFG-009, DNL-CFG-010, DNL-CFG-011, DNL-CFG-013, DNL-CFG-014, DNL-CFG-015, DNL-ERR-002, DNL-INV-001, DNL-INV-002, DNL-WCF-001, DNL-WCF-002, DNL-WCF-003, DNL-XXE-001, DNL-XXE-002 |
 | 2021 | A06 | Vulnerable and Outdated Components | DNL-SCA-001, DNL-SCA-002, DNL-SCA-003, DNL-SCA-004 |
 | 2021 | A07 | Identification and Authentication Failures | DNL-SEC-001, DNL-SEC-002, DNL-SEC-003, DNL-SESS-001, DNL-SESS-002, DNL-SESS-003, DNL-SESS-004, DNL-SESS-006, DNL-SESS-007, DNL-SESS-008 |
 | 2021 | A08 | Software and Data Integrity Failures | DNL-CONSUME-001, DNL-CONSUME-002, DNL-CRY-006, DNL-DESER-001, DNL-DESER-002, DNL-DESER-003, DNL-INT-001, DNL-INT-002, DNL-INT-003, DNL-INT-004, DNL-SCA-005 |
@@ -393,7 +393,7 @@ either mode.
 | api2023 | API5 | Broken Function Level Authorization | DNL-AUTHZ-001, DNL-AUTHZ-002, DNL-AUTHZ-003, DNL-AUTHZ-004, DNL-AUTHZ-008 |
 | api2023 | API6 | Unrestricted Access to Sensitive Business Flows | DNL-DES-001 |
 | api2023 | API7 | Server Side Request Forgery | DNL-SSRF-001 |
-| api2023 | API8 | Security Misconfiguration | DNL-CFG-001, DNL-CFG-002, DNL-CFG-003, DNL-CFG-004, DNL-CFG-005, DNL-CFG-006, DNL-CFG-007, DNL-CFG-008, DNL-CFG-009, DNL-CFG-010, DNL-CFG-011, DNL-CFG-013, DNL-CFG-014, DNL-ERR-002, DNL-INJ-001, DNL-INJ-002, DNL-INJ-003, DNL-INJ-004, DNL-INJ-005, DNL-INJ-006, DNL-WCF-001, DNL-WCF-002, DNL-XXE-001, DNL-XXE-002 |
+| api2023 | API8 | Security Misconfiguration | DNL-CFG-001, DNL-CFG-002, DNL-CFG-003, DNL-CFG-004, DNL-CFG-005, DNL-CFG-006, DNL-CFG-007, DNL-CFG-008, DNL-CFG-009, DNL-CFG-010, DNL-CFG-011, DNL-CFG-013, DNL-CFG-014, DNL-CFG-015, DNL-ERR-002, DNL-INJ-001, DNL-INJ-002, DNL-INJ-003, DNL-INJ-004, DNL-INJ-005, DNL-INJ-006, DNL-WCF-001, DNL-WCF-002, DNL-XXE-001, DNL-XXE-002 |
 | api2023 | API9 | Improper Inventory Management | DNL-INV-001, DNL-INV-002, DNL-SCA-003, DNL-WCF-003 |
 | api2023 | API10 | Unsafe Consumption of APIs | DNL-CONSUME-001, DNL-CONSUME-002, DNL-CRY-006 |
 
@@ -425,6 +425,7 @@ DNL-INV-001, which always carries it.
 | DNL-CFG-011 | low | ASP.NET Core only (`languages/dotnet`): no `UseHsts` and no `Strict-Transport-Security` header literal in the Production pipeline (`AddHsts` alone does not count; REVIEW as for DNL-CFG-010, or when a `UseMiddleware<T>` could set the header) | A02:2025 | A05:2021 | API8:2023 |
 | DNL-CFG-013 | low | ASP.NET Core only (`languages/dotnet`): Kestrel option lambdas (`Listen*` without `UseHttps`), `UseUrls("http://...")`, or the effective Production `Urls` / `Kestrel:Endpoints:*:Url` settings serve plain HTTP only (loopback URLs exempt; any HTTPS listener clears it; REVIEW when a listener value is not a literal) | A02:2025 | A05:2021 | API8:2023 |
 | DNL-CFG-014 | low | ASP.NET Core only (`languages/dotnet`): `AllowedHosts` is `*` (or has a `*` segment) in the effective Production settings | A02:2025 | A05:2021 | API8:2023 |
+| DNL-CFG-015 | low | ASP.NET Core only (`languages/dotnet`): (REVIEW, route-bound) `[EnableCors]` / `RequireCors` on a sensitive or mutating handler whose policy CFG-007 does not already report (a named policy that is not defined in code is noted) | A02:2025 | A05:2021 | API8:2023 |
 | DNL-XSS-002 | medium | `validateRequest="false"` (in a WebForms project dir) or `requestValidationMode="2.x"` | A05:2025 | A03:2021 | -- |
 | DNL-SESS-001 | medium | Forms auth cookie without `requireSSL="true"` | A07:2025 | A07:2021 | API2:2023 |
 | DNL-SESS-002 | low | `httpOnlyCookies` not enforced (app-root configs only) | A07:2025 | A07:2021 | API2:2023 |

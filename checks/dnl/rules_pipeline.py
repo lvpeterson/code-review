@@ -5,13 +5,15 @@ never hides the others. Later tasks add their group to _GROUPS.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field
 
+from checks.dnl.auth_core import _sensitive
 from checks.dnl.cfgctx import Ctx, build_ctx
-from checks.dnl.ir import call_name, const_str, literal_str, receiver_text, walk
-from checks.dnl.options import const, opt, options_of, verdict, walk_conditional
+from checks.dnl.ir import attr_key, call_chain, call_name, const_str, literal_str, receiver_text, walk
+from checks.dnl.options import always_true, const, opt, options_of, verdict, walk_conditional
 from checks.dnl.pipeline import PipeCall, Pipeline
 from checks.dnl.project import ProjectModel
-from checks.dnl.routes_core import CoreRouteRef
+from checks.dnl.routes_core import CoreRouteRef, _chain_types
 from core.models import Finding
 
 
@@ -509,8 +511,373 @@ def _transport(ctx: Ctx) -> None:
         _allowed_hosts(ctx, pipe, add)
 
 
+# -- CORS (DNL-CFG-007, DNL-CFG-015) ---------------------------------------------------------------------
+
+_MUTATING = {"POST", "PUT", "DELETE", "PATCH"}
+
+# Methods of CorsPolicyBuilder; any other call on the builder (an extension method) could do anything.
+_CORS_BUILDER = frozenset("""allowanyorigin allowanyheader allowanymethod allowcredentials disallowcredentials
+withorigins withheaders withmethods withexposedheaders setisoriginallowed
+setisoriginallowedtoallowwildcardsubdomains setpreflightmaxage build""".split())
+_POLICY_DEFS = ("AddPolicy", "AddDefaultPolicy")
+_DEFAULT_POLICY = ""        # the name key of the default policy (AddDefaultPolicy, [EnableCors], UseCors())
+_CREDENTIALS_NOTE = (" The framework throws at runtime when AllowAnyOrigin() is combined with AllowCredentials(), "
+                     "so the app either fails or the policy is built another way; fix it either way.")
+
+
+@dataclass
+class _Policy:
+    name: str | None            # None: the name is not a compile-time string
+    file: str
+    line: int                   # the AddPolicy / UseCors / RequireCors call
+    guard: str | None = None    # REVIEW when the call sits under an unparsed environment condition
+    bad: list = field(default_factory=list)       # [(what, line, conditional)] wildcard origins
+    maybe: list = field(default_factory=list)     # [(why, line)] values that could not be read
+    creds: bool = False         # AllowCredentials() runs unconditionally
+    creds_cond: bool = False    # AllowCredentials() appears, but only under a condition
+
+
+def _escapes(root, param: str, ok_ids: set) -> bool:
+    """True when the builder parameter is used anywhere but as the root of a call chain or a member whose
+    node id is in `ok_ids` (passed to a helper, assigned, read as a property): its policy is then built
+    where this code cannot see."""
+    def uses(n) -> bool:
+        if isinstance(n, list):
+            return any(uses(x) for x in n)
+        if not isinstance(n, dict):
+            return False
+        if n.get("k") == "lambda" and param in (n.get("params") or []):
+            return False        # a nested lambda that redeclares the name shadows it
+        if n.get("k") == "name" and n.get("id") == param and id(n) not in ok_ids:
+            return True
+        return any(uses(v) for v in n.values() if isinstance(v, (dict, list)))
+    return uses(root)
+
+
+def _chain_root(call: dict):
+    root, _ = call_chain(call)
+    return root
+
+
+def _origin_args(call: dict) -> tuple[list[str], bool]:
+    """([string literals], every argument readable) for WithOrigins(...): literals and arrays of literals."""
+    out: list[str] = []
+    readable = True
+    for a in call.get("args") or []:
+        s = literal_str(a)
+        if s is not None:
+            out.append(s)
+            continue
+        inner = [literal_str(n) for n in walk(a)]
+        if (isinstance(a, dict) and a.get("k") in ("new", "array", "collection") and
+                all(n.get("k") in ("new", "array", "collection", "lit") or n is a for n in walk(a))
+                and any(x is not None for x in inner)):
+            out += [x for x in inner if x is not None]
+        else:
+            readable = False
+    return out, readable
+
+
+def _read_policy(pol: _Policy, arg, base_cond: bool) -> None:
+    """Fill a policy from its builder argument: a lambda `b => b.AllowAnyOrigin()...` (statements, ifs and
+    early exits included), or an inline `new CorsPolicyBuilder()...Build()` chain. Anything else, a builder
+    handed to a helper, or an unknown builder method leaves a `maybe` entry."""
+    steps: list[tuple[dict, bool]] = []
+    if isinstance(arg, dict) and arg.get("k") == "lambda":
+        params = [p for p in arg.get("params") or [] if isinstance(p, str)]
+        param = params[0] if params else None
+        if param is None:
+            pol.maybe.append(("the policy builder lambda has no parameter", pol.line))
+            return
+        roots: set = set()
+        for n, cd in walk_conditional(arg, base_cond):
+            if n.get("k") == "call":
+                r = _chain_root(n)
+                if isinstance(r, dict) and r.get("k") == "name" and r.get("id") == param:
+                    steps.append((n, cd))
+                    roots.add(id(r))
+        if _escapes(arg.get("body"), param, roots):
+            pol.maybe.append(("the policy builder is used outside a call chain (passed to a helper or "
+                              "assigned), so its policy is built where this code cannot see", pol.line))
+    else:
+        root, calls = call_chain(arg) if isinstance(arg, dict) else (None, [])
+        if isinstance(root, dict) and root.get("k") == "new" and (root.get("type") or "").endswith("CorsPolicyBuilder"):
+            steps = [(c, base_cond) for c in calls]
+        else:
+            pol.maybe.append(("the policy is not a lambda over the builder (a method group, a variable or a "
+                              "helper call)", pol.line))
+            return
+    for n, cd in steps:
+        name = (call_name(n) or "").lower()
+        line = n.get("line") or pol.line
+        if name not in _CORS_BUILDER:
+            pol.maybe.append((f"{call_name(n)}() is not a CorsPolicyBuilder method and may set any origin", line))
+        elif name == "allowanyorigin":
+            pol.bad.append(("AllowAnyOrigin()", line, cd))
+        elif name == "withorigins":
+            origins, readable = _origin_args(n)
+            if "*" in origins:
+                pol.bad.append(('WithOrigins("*")', line, cd))
+            elif not readable:
+                pol.maybe.append(("WithOrigins(...) takes origins that are not literals (configuration or a "
+                                  "variable); confirm none of them is *", line))
+        elif name == "setisoriginallowed":
+            fn = (n.get("args") or [None])[0]
+            if always_true(fn):
+                pol.bad.append(("SetIsOriginAllowed(always true)", line, cd))
+            elif not (isinstance(fn, dict) and fn.get("k") == "lambda"):
+                pol.maybe.append(("SetIsOriginAllowed takes a callback that is not a lambda", line))
+        elif name == "allowcredentials":
+            if cd:
+                pol.creds_cond = True
+            else:
+                pol.creds = True
+        elif name == "disallowcredentials":
+            if cd:
+                pol.creds_cond = True
+            else:
+                pol.creds = pol.creds_cond = False
+
+
+def _policy_verdict(pol: _Policy) -> tuple[str, str, str | None, str, int] | None:
+    """(severity, title, confidence, description, line) of a policy's CFG-007 finding, or None when it is
+    clean. A wildcard that always runs is firm; one only under a condition, or a value that could not be
+    read, is REVIEW; a conditional good origin never clears a wildcard."""
+    firm = [b for b in pol.bad if not b[2]]
+    cond = [b for b in pol.bad if b[2]]
+    label = f"policy {pol.name!r}" if pol.name else "the default policy" if pol.name == _DEFAULT_POLICY else "a policy"
+    if firm or cond:
+        what = ", ".join(dict.fromkeys(b[0] for b in (firm or cond)))
+        line = (firm or cond)[0][1]
+        high = pol.creds or (not firm and pol.creds_cond)
+        desc = (f"CORS {label} accepts requests from any origin ({what})"
+                + (" with credentials allowed, so any site can make authenticated cross-origin calls and read the "
+                   "responses." if high else ", so any site can read its responses cross-origin."))
+        if high and any(b[0] == "AllowAnyOrigin()" for b in (firm or cond)):
+            desc += _CREDENTIALS_NOTE
+        if not firm:
+            desc += " The wildcard sits under a condition inside the policy lambda, so it may not apply; confirm."
+        elif pol.creds_cond and not pol.creds:
+            desc += " AllowCredentials() sits under a condition inside the policy lambda."
+        title = "CORS policy allows any origin" + (" with credentials" if high else "")
+        return ("high" if high else "medium", title, None if firm else "REVIEW", desc, line)
+    if pol.maybe:
+        why, line = pol.maybe[0]
+        return ("medium", "CORS policy could not be read",
+                "REVIEW", f"CORS {label} could not be read: {why}. Confirm it does not allow any origin.", line)
+    return None
+
+
+def _cors_option_policies(c: PipeCall, conf: str | None) -> tuple[list[_Policy], list[tuple[str, int]]]:
+    """([policy], [(reason, line)] not readable) from the options lambda of an AddCors / Configure<CorsOptions>
+    call. A non-lambda argument (a method group) or an options object used outside AddPolicy / AddDefaultPolicy
+    makes the whole set unreadable."""
+    pols: list[_Policy] = []
+    opaque: list[tuple[str, int]] = []
+    args = list(c.node.get("args") or []) + list((c.node.get("named") or {}).values())
+    for a in args:
+        if not isinstance(a, dict):
+            continue
+        if a.get("k") != "lambda":
+            opaque.append(("the CORS options are not a lambda (a method group or a variable)", c.line))
+            continue
+        params = [p for p in a.get("params") or [] if isinstance(p, str)]
+        param = params[0] if params else None
+        if param is None:
+            continue
+        ok: set = set()
+        for n, cd in walk_conditional(a):
+            if n.get("k") != "call" or call_name(n) not in _POLICY_DEFS:
+                if (n.get("k") == "member" and n.get("name") == "DefaultPolicyName"
+                        and isinstance(n.get("obj"), dict) and n["obj"].get("id") == param):
+                    ok.add(id(n["obj"]))
+                continue
+            fn = n.get("fn") if isinstance(n.get("fn"), dict) else {}
+            if not (isinstance(fn.get("obj"), dict) and fn["obj"].get("k") == "name" and fn["obj"].get("id") == param):
+                continue
+            ok.add(id(fn["obj"]))
+            cargs = n.get("args") or []
+            line = n.get("line") or c.line
+            if call_name(n) == "AddDefaultPolicy":
+                name, builder = _DEFAULT_POLICY, cargs[0] if cargs else None
+            else:
+                name, builder = (const_str(cargs[0]) if cargs else None), cargs[1] if len(cargs) > 1 else None
+            pol = _Policy(name, c.file, line, conf)
+            _read_policy(pol, builder, cd)
+            pols.append(pol)
+        if _escapes(a.get("body"), param, ok):
+            opaque.append(("the CORS options object is used outside AddPolicy / AddDefaultPolicy (passed to a "
+                           "helper), so some policies are built where this code cannot see", c.line))
+    return pols, opaque
+
+
+def _cors_attr_names(attrs: list) -> list[str | None] | None:
+    """Policy names of the [EnableCors] attributes in a list: [name] ("" = default, None = not a literal);
+    None when the list has none; [] when [DisableCors] is there."""
+    en = [a for a in attrs if attr_key(a.name) == "enablecors"]
+    if any(attr_key(a.name) == "disablecors" for a in attrs) and not en:
+        return []
+    if not en:
+        return None
+    return [(const_str(a.args[0]) if a.args else _DEFAULT_POLICY) for a in en]
+
+
+def _page_cors_names(raw: str) -> list[str | None]:
+    """Policy names of an `@attribute [EnableCors("n")]` directive text ([] for none or a DisableCors)."""
+    if re.search(r"DisableCors", raw):
+        return []
+    m = re.search(r"EnableCors(?:Attribute)?\s*(?:\(([^)]*)\))?", raw)
+    if not m:
+        return []
+    inner = (m.group(1) or "").strip()
+    if not inner:
+        return [_DEFAULT_POLICY]
+    q = re.fullmatch(r'"([^"]*)"', inner)
+    return [q.group(1) if q else None]
+
+
+def _route_cors_names(ctx: Ctx, ref: CoreRouteRef) -> list[tuple[str | None, str, int]]:
+    """[(policy name, how, line)] a route is bound to: [EnableCors] on the action, else on its class chain
+    (the nearest type carrying one), a page's `@attribute` directive, and RequireCors on its endpoint,
+    group or convention calls. A [DisableCors] on the action (or class) switches the attribute off."""
+    out: list[tuple[str | None, str, int]] = []
+    from_attr: list[str | None] | None = None
+    if ref.method is not None:
+        from_attr = _cors_attr_names(ref.method.attributes)
+    if from_attr is None and ref.type is not None and ref.style in ("controller", "razorpage"):
+        for t in _chain_types(ctx.model, ref.type):
+            from_attr = _cors_attr_names(t.attributes)
+            if from_attr is not None:
+                break
+    for nm in from_attr or []:
+        out.append((nm, "[EnableCors]", ref.route.line))
+    for raw in ref.route.meta.get("page_attributes") or []:
+        for nm in _page_cors_names(str(raw)):
+            out.append((nm, "@attribute [EnableCors]", ref.route.line))
+    return out
+
+
+def _require_cors_calls(ref: CoreRouteRef) -> list[dict]:
+    calls = list(ref.endpoint_calls) + list(ref.convention_calls)
+    for g in ref.groups:
+        calls += g.calls
+    return [c for c in calls if isinstance(c, dict) and call_name(c) == "RequireCors"]
+
+
+def _cors(ctx: Ctx) -> None:
+    seen: set = set()
+    policies: dict[str | None, list[_Policy]] = {}
+    opaque = False                  # a CORS options set that could not be read in full
+    reported_undefined: set = set()
+
+    def add007(pol: _Policy, v) -> None:
+        sev, title, conf, desc, line = v
+        if pol.guard:
+            conf = "REVIEW"
+            desc += " The call sits under an environment condition that could not be parsed."
+        key = ("DNL-CFG-007", pol.file, line, title)
+        if key not in seen:
+            seen.add(key)
+            ctx.add("DNL-CFG-007", sev, title, desc, pol.file, line, confidence=conf)
+
+    def review(file: str, line: int, desc: str, title: str = "CORS policy could not be read") -> None:
+        key = ("DNL-CFG-007", file, line, title)
+        if key not in seen:
+            seen.add(key)
+            ctx.add("DNL-CFG-007", "medium", title, desc, file, line, confidence="REVIEW")
+
+    named_uses: list[tuple[str | None, str, int]] = []      # (name, file, line) of UseCors / RequireCors names
+
+    def use(c_node: dict, file: str, line: int, guard: str | None) -> None:
+        """A UseCors / RequireCors call: a name to resolve later, or an inline policy to read now."""
+        args = c_node.get("args") or []
+        if args and isinstance(args[0], dict) and args[0].get("k") == "lambda":
+            pol = _Policy(None, file, c_node.get("line") or line, guard)
+            _read_policy(pol, args[0], False)
+            v = _policy_verdict(pol)
+            if v is not None and id(c_node) not in seen:
+                seen.add(id(c_node))
+                add007(pol, v)
+        elif args:
+            named_uses.append((const_str(args[0]), file, c_node.get("line") or line))
+
+    for pipe in ctx.pipes:
+        for c, conf in _certain_and_uncertain(ctx, pipe, "AddCors", "Configure"):
+            if c.name == "Configure" and not any("CorsOptions" in str(t) for t in
+                                                  (c.node.get("fn") or {}).get("targs") or []):
+                continue
+            pols, opq = _cors_option_policies(c, conf)
+            for why, line in opq:
+                opaque = True
+                review(c.file, line, f"CORS options at {c.file}:{c.line} could not be read: {why}. Confirm no "
+                                     "policy allows any origin.")
+            for pol in pols:
+                policies.setdefault(pol.name, []).append(pol)
+                v = _policy_verdict(pol)
+                if v is not None:
+                    add007(pol, v)
+        for c, conf in _certain_and_uncertain(ctx, pipe, "UseCors"):
+            use(c.node, c.file, c.line, conf)
+
+    wild = {n for n, ps in policies.items() if any(p.bad for p in ps)}
+    unnamed = None in policies
+
+    def undefined(name: str | None) -> bool:
+        """True when nothing defines the policy and nothing could be it (an unreadable options set, or a
+        policy whose own name is not a literal)."""
+        if opaque or unnamed or name == _DEFAULT_POLICY:
+            return False
+        return name not in policies if name is not None else not policies
+
+    def report_undefined(name, file, line, where):
+        text = repr(name) if name is not None else "a policy whose name is not a literal"
+        review(file, line, f"{where} uses {text}, but no AddPolicy / AddDefaultPolicy defines it in code, so its "
+                           "origins cannot be read. Confirm it does not allow any origin.",
+               "CORS policy is used but not defined")
+        reported_undefined.add(name)
+
+    for ref in ctx.refs:        # RequireCors on endpoints and groups: names to resolve, inline policies to read
+        for node in _require_cors_calls(ref):
+            if id(node) not in seen:
+                use(node, ref.route.file, node.get("line") or ref.route.line, None)
+                seen.add(id(node))
+    # (an inline policy is reported by `use`; a shared group call is visited once)
+
+    for name, file, line in named_uses:
+        if undefined(name):
+            report_undefined(name, file, line, "UseCors / RequireCors")
+
+    # Route-bound: CFG-015 on a sensitive or mutating handler that opts into CORS.
+    for ref in ctx.refs:
+        names = _route_cors_names(ctx, ref)
+        for node in _require_cors_calls(ref):
+            args = node.get("args") or []
+            if args and isinstance(args[0], dict) and args[0].get("k") == "lambda":
+                continue            # an inline policy is read, and reported by CFG-007 when it is wild
+            names.append((const_str(args[0]) if args else _DEFAULT_POLICY, "RequireCors",
+                          node.get("line") or ref.route.line))
+        r = ref.route
+        if not names or not (_MUTATING & {v.upper() for v in r.methods} or _sensitive(ref)):
+            continue
+        for name, how, _line in names:
+            if name in wild or name in reported_undefined:
+                continue            # CFG-007 already reports the policy
+            why = ("; the named policy is not defined in code" if undefined(name) else
+                   "; its policy name is not a literal" if name is None else "")
+            key = ("DNL-CFG-015", r.file, r.line, name, how)
+            if key in seen:
+                continue
+            seen.add(key)
+            ctx.add("DNL-CFG-015", "low", f"CORS enabled on sensitive handler {r.handler_name}",
+                    f"{r.handler_name} ({', '.join(r.methods)} {r.path}) opts into cross-origin access via {how}"
+                    f"{' ' + repr(name) if name else ''}{why}. A browser on an allowed origin can call it with the "
+                    "user's cookies when the policy allows credentials; confirm the allowed origins are exactly "
+                    "the front ends that need it.",
+                    r.file, r.line, route=ref.route, confidence="REVIEW")
+
+
 # (name, fn(ctx)) in run order; each fn appends to ctx.out.
-_GROUPS: list = [("errors", _errors), ("transport", _transport)]
+_GROUPS: list = [("errors", _errors), ("transport", _transport), ("cors", _cors)]
 
 
 def check(model: ProjectModel, refs: list[CoreRouteRef]) -> list[Finding]:

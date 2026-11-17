@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 
 from checks.dnl import auth_core
-from checks.dnl.auth_core import ANONYMOUS, PROTECTED, UNKNOWN
+from checks.dnl.auth_core import ANONYMOUS, PROTECTED, UNKNOWN, _sensitive
 from checks.dnl.findings import dnl_finding
 from checks.dnl.pipeline import pipeline_for
 from checks.dnl.project import ProjectModel
@@ -18,34 +18,12 @@ from checks.dnl.routes_core import CoreRouteRef
 from core.models import Finding
 
 _MUTATING = {"POST", "PUT", "DELETE", "PATCH"}
-# Same patterns as the legacy rules (rules_auth).
-_SENSITIVE_CONTROLLER = re.compile(r"(?i)admin|manage|role|permission|setting|config")
-_SENSITIVE_ACTION = re.compile(r"(?i)^(delete|remove|purge|approve|grant|revoke|reset)")
-_HANDLER_PREFIX = re.compile(r"(?i)^on(get|post|put|delete|patch|head|options)")
 _UNPROTECTED = ("No [Authorize], RequireAuthorization (endpoint, group or Map call), global filter, "
                 "Razor Pages convention or fallback policy covers this route.")
 
 
 def _mutating_verbs(route) -> str:
     return ", ".join(sorted(_MUTATING & {v.upper() for v in route.methods}))
-
-
-def _sensitive(ref: CoreRouteRef) -> bool:
-    """Controller / page / action name looks privileged (admin, manage, delete..., see rules_auth)."""
-    r = ref.route
-    if ref.type is None:
-        return False
-    tname = ref.type.name.split(".")[-1]
-    action = ref.method.name if ref.method else ""
-    if ref.style == "razorpage":
-        # A page's name is its path (/Admin/Users); a handler's is what follows OnPost.
-        name = r.path
-        action = _HANDLER_PREFIX.sub("", action)
-        if action.lower().endswith("async"):
-            action = action[: -len("async")]
-    else:
-        name = tname[: -len("controller")] if tname.lower().endswith("controller") else tname
-    return bool(_SENSITIVE_CONTROLLER.search(name) or _SENSITIVE_ACTION.search(action))
 
 
 def _route_findings(ref: CoreRouteRef, info: auth_core.CoreAuth) -> list[Finding]:

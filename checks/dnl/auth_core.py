@@ -1464,3 +1464,29 @@ def resolve(model: ProjectModel, ref: CoreRouteRef, pipe: Pipeline) -> CoreAuth:
 def policies(model: ProjectModel, pipe: Pipeline) -> dict[str, PolicyInfo]:
     """Authorization policies registered in Production (AddPolicy), by name."""
     return dict(_settings(model, pipe).policies)
+
+
+# -- sensitive handlers (shared by rules_auth_core and the CORS configuration rule) ------------------
+
+# Same patterns as the legacy rules (rules_auth).
+_SENSITIVE_CONTROLLER = re.compile(r"(?i)admin|manage|role|permission|setting|config")
+_SENSITIVE_ACTION = re.compile(r"(?i)^(delete|remove|purge|approve|grant|revoke|reset)")
+_HANDLER_PREFIX = re.compile(r"(?i)^on(get|post|put|delete|patch|head|options)")
+
+
+def _sensitive(ref: CoreRouteRef) -> bool:
+    """Controller / page / action name looks privileged (admin, manage, delete..., see rules_auth)."""
+    r = ref.route
+    if ref.type is None:
+        return False
+    tname = ref.type.name.split(".")[-1]
+    action = ref.method.name if ref.method else ""
+    if ref.style == "razorpage":
+        # A page's name is its path (/Admin/Users); a handler's is what follows OnPost.
+        name = r.path
+        action = _HANDLER_PREFIX.sub("", action)
+        if action.lower().endswith("async"):
+            action = action[: -len("async")]
+    else:
+        name = tname[: -len("controller")] if tname.lower().endswith("controller") else tname
+    return bool(_SENSITIVE_CONTROLLER.search(name) or _SENSITIVE_ACTION.search(action))
