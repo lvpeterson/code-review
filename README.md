@@ -205,8 +205,9 @@ Currently implemented (route extraction + baseline checks):
 - **java**: spring
 - **javascript**: express, nextjs, hono
 - **go**: gin, net_http
-- **dotnet**: controllers, razorpages, minimalapi, config (ASP.NET Core on modern .NET, via the
-  shared Roslyn helper; three-state authorization per route)
+- **dotnet**: controllers, razorpages, minimalapi, config (ASP.NET Core on modern .NET, on the
+  shared C# engine; three-state authorization per route; needs the Roslyn helper,
+  `--allow-degraded` applies)
 - **dotnet_legacy**: mvc, webapi, webforms, wcf, config, deps (.NET Framework MVC 5,
   Web API 2, WebForms, WCF services and Web.config, C# and VB, via the Roslyn
   helper in `tools/roslyn-ir`; cross-file taint analysis for injection / XSS /
@@ -282,7 +283,9 @@ family can emit, and which have none (the gaps -- "none" in the gaps column
 means full coverage). Membership is derived from the source: a rule belongs
 to the families whose analyzer packages emit it (an id literal under
 `languages/<lang>/`, or in a shared `checks/` module reached from that
-package -- only the languages that call the specific check function count),
+package -- only the languages that call the specific check function count;
+for `dotnet`, the `DNL-` ids in `checks/dnl` modules reachable by imports from
+`languages/dotnet`, never those only `dotnet_legacy` reaches),
 and the shared secret scanner counts for python (Lambda), infra and crypto.
 `sca` is the `--sca` osv-scanner path in `main.py`. An API 2023 category
 counts only if the tag can actually be emitted for that family (an "always"
@@ -299,7 +302,7 @@ javascript/hono, go/gin, dotnet). dotnet_legacy has its own table in
 | javascript | 7 | A01 A02 A05 | A03 A04 A06 A07 A08 A09 A10 | API1 API5 API7 API8 | API2 API3 API4 API6 API9 API10 |
 | go | 6 | A01 A05 | A02 A03 A04 A06 A07 A08 A09 A10 | API1 API5 API7 API8 | API2 API3 API4 API6 API9 API10 |
 | ruby | 2 | A01 | A02 A03 A04 A05 A06 A07 A08 A09 A10 | none | API1 API2 API3 API4 API5 API6 API7 API8 API9 API10 |
-| dotnet | 2 | A01 | A02 A03 A04 A05 A06 A07 A08 A09 A10 | API1 API5 | API2 API3 API4 API6 API7 API8 API9 API10 |
+| dotnet | 5 | A01 | A02 A03 A04 A05 A06 A07 A08 A09 A10 | API5 | API1 API2 API3 API4 API6 API7 API8 API9 API10 |
 | sql | 34 | A01 A04 A05 A06 A07 A10 | A02 A03 A08 A09 | none | API1 API2 API3 API4 API5 API6 API7 API8 API9 API10 |
 | infra | 155 | A01 A02 A03 A04 A05 A06 A07 A08 A09 A10 | none | API5 API8 | API1 API2 API3 API4 API6 API7 API9 API10 |
 | crypto | 47 | A01 A03 A04 A07 A08 A09 | A02 A05 A06 A10 | API10 | API1 API2 API3 API4 API5 API6 API7 API8 API9 |

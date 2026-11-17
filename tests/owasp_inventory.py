@@ -21,6 +21,11 @@ crypto, plus "sca" for the --sca osv-scanner path in main.py):
      transitively (checks/secrets.py -> shell/terraform/... -> infra).
   4. main.py is the "sca" family. EXCLUDED_EDGES lists imports that exist
      only to correlate data, not to emit the importee's rules.
+  5. DNL- ids are not in the scan above (dotnet_legacy owns them), except
+     those in checks/dnl modules reachable by imports, transitively within
+     checks/dnl, from languages/dotnet/*.py: they count for dotnet
+     (dnl_ids_for_dotnet). Modules reached only from languages/dotnet_legacy
+     do not count.
 """
 from __future__ import annotations
 
@@ -122,6 +127,50 @@ def rule_ids() -> set[str]:
     return {i for i in _scan()[0] if not i.startswith("DNL-")}
 
 
+def _dnl_imports(path: Path) -> set[str]:
+    """Module stems of checks/dnl that `path` imports (absolute or relative)."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    in_dnl = "dnl" in path.relative_to(ROOT).parts
+    out: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.level and in_dnl:
+                if node.module:
+                    out.add(node.module.split(".")[0])
+                else:
+                    out.update(a.name for a in node.names)
+            elif node.module == "checks.dnl":
+                out.update(a.name for a in node.names)
+            elif node.module and node.module.startswith("checks.dnl."):
+                out.add(node.module.split(".")[2])
+        elif isinstance(node, ast.Import):
+            out.update(a.name.split(".")[2] for a in node.names
+                       if a.name.startswith("checks.dnl.") and a.name.count(".") >= 2)
+    return out
+
+
+def dnl_ids_for_dotnet() -> set[str]:
+    """DNL- id literals in checks/dnl modules reachable by imports from
+    languages/dotnet/*.py (the dotnet package; dotnet_legacy is not a root)."""
+    dnl_dir = ROOT / "checks" / "dnl"
+    available = {p.stem: p for p in dnl_dir.glob("*.py")}
+    todo: list[str] = []
+    for src in (ROOT / "languages" / "dotnet").glob("*.py"):
+        todo.extend(m for m in _dnl_imports(src) if m in available)
+    seen: set[str] = set()
+    ids: set[str] = set()
+    while todo:
+        mod = todo.pop()
+        if mod in seen:
+            continue
+        seen.add(mod)
+        text = available[mod].read_text(encoding="utf-8")
+        ids.update(m.group(1) for m in _LITERAL.finditer(text)
+                   if m.group(1).startswith("DNL-") and ID_SHAPE.match(m.group(1)))
+        todo.extend(m for m in _dnl_imports(available[mod]) if m in available and m != mod)
+    return ids
+
+
 def _lang_of(rel: str) -> str | None:
     parts = rel.split("/")
     return parts[1] if parts[0] == "languages" and len(parts) > 2 else None
@@ -146,6 +195,8 @@ def _module_families(module: str, seen: frozenset[str] = frozenset()) -> set[str
 
 def families_of(rid: str) -> set[str]:
     """Language families that can emit `rid`."""
+    if rid.startswith("DNL-"):
+        return {"dotnet"} if rid in dnl_ids_for_dotnet() else set()
     _, imports, names = _scan()
     fams: set[str] = set()
     for rel, func in _scan()[0][rid]:
@@ -187,7 +238,7 @@ def coverage_rows(rules: dict) -> list[str]:
     from core.owasp_web import TITLES
 
     by_family: dict[str, list[str]] = {f: [] for f in FAMILIES}
-    for rid in sorted(rule_ids()):
+    for rid in sorted(rule_ids() | dnl_ids_for_dotnet()):
         for fam in families_of(rid):
             by_family[fam].append(rid)
     rows = []
