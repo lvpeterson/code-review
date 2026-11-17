@@ -108,6 +108,8 @@ _INCOMING_RE = re.compile(T.INCOMING_REQUEST_TEXT)
 _EXT_SYM_ONLY_RE = re.compile(T.EXTERNAL_SYM_ONLY_RE)
 _SAN_RES = [(s, re.compile(s.member)) for s in T.SANITIZERS]
 # A variable that holds an exception, by name (`ex`, `err`, `ioEx`, `sqlException`), for log-call argument order.
+# ... and one that holds an event id or a level (`eventId`, `evt`, `logLevel`), never the template.
+_LEVEL_NAME_RE = re.compile(r"(?i)^(event|eventid|evt|eid|level|loglevel|lvl|\w+eventid|\w+loglevel)$")
 _EXC_NAME_RE = re.compile(r"^(e|ex|exc|err|error|exception|[a-z]\w*(Ex|Exception))$")
 _GUARD = {g.shape: g for g in T.GUARDS}
 _REQUEST_PROP_RE = re.compile(r"(?i)^((this|me)\.)?((httpcontext\.current|context|page)\.)?request$")
@@ -404,12 +406,23 @@ class _Analysis:
             return self._is_core_project() == sink.core_only
         return True
 
+    def _recv_str(self, recv: Any) -> str:
+        """Receiver text for the `recv_text` regexes; a call receiver reads `Response.GetTypedHeaders()`."""
+        text = self._text(recv)
+        if not text and isinstance(recv, dict) and recv.get("k") == "call":
+            fn = recv.get("fn") or {}
+            if fn.get("k") == "member":
+                text = f"{self._text(fn)}()"
+            elif fn.get("k") == "name":
+                text = f"{fn.get('id') or ''}()"
+        return text or ""
+
     def _recv_gate_ok(self, sink: T.Sink, recv: Any) -> bool:
         """`recv_gate`: the receiver must look like the sink's own object (declared Core type or receiver text),
         for rows whose resolved sym names a generic type (`IDictionary.Add` on a response header dictionary)."""
         if recv is None:
             return False
-        if sink.recv_text and re.search(sink.recv_text, self._text(recv) or ""):
+        if sink.recv_text and re.search(sink.recv_text, self._recv_str(recv)):
             return True
         return _simple(self.type_of(recv)) in {_simple(x) for x in sink.types if x.startswith("Microsoft.")}
 
@@ -428,7 +441,7 @@ class _Analysis:
             names, _ = self._recv_names(recv)
             if names & {_simple(x) for x in sink.types}:
                 return True
-            if sink.recv_text and re.search(sink.recv_text, self._text(recv) or ""):
+            if sink.recv_text and re.search(sink.recv_text, self._recv_str(recv)):
                 return True
         if sink.derives and (recv is None or (self._text(recv) or "").lower() in ("this", "me", "base")):
             return self.model.derives_from(self.t, set(sink.derives))
@@ -453,7 +466,8 @@ class _Analysis:
         tn = _simple(self.type_of(a))
         if tn in ("eventid", "loglevel") or tn.endswith("exception"):
             return True
-        return k == "name" and not tn and bool(_EXC_NAME_RE.match(a.get("id") or ""))
+        return k == "name" and not tn and bool(_EXC_NAME_RE.match(a.get("id") or "")
+                                               or _LEVEL_NAME_RE.match(a.get("id") or ""))
 
     def _log_message_index(self, args: list, skip_first: bool) -> int | None:
         """Index of the message-template argument: the first one that is not a level / event id / exception.
@@ -497,7 +511,7 @@ class _Analysis:
                 if i is not None and i < len(vals):
                     self._record(sink, vals[i], call.get("line", 0))
                 for k, v in zip((call.get("named") or {}).keys(), nvals):
-                    if k.lower() in ("message", "state"):
+                    if k.lower() in ("message", "state", "messageformat"):
                         self._record(sink, v, call.get("line", 0))
                 continue
             # `Type.Member(recv, ..)`: only a receiver that names the sink's own type shifts the index
@@ -532,7 +546,7 @@ class _Analysis:
         return hit_type
 
     def _check_assign_sinks(self, member_name: str, sym: str | None, recv: Any, type_full: str | None,
-                            value: Taint | None, line: int) -> None:
+                            value: Taint | None, line: int, siblings: dict | None = None) -> None:
         for sink in T.SINKS:
             if not sink.assign or sink.member.lower() != member_name.lower() or not self._sink_applies(sink):
                 continue
@@ -545,6 +559,9 @@ class _Analysis:
                 ok = self._sink_matches(sink, member_name, None, recv, False)
             if ok and sink.recv_gate:
                 ok = self._recv_gate_ok(sink, recv)
+            if ok and sink.ct_member and siblings is not None:
+                # Inside an object initializer the content type is known: none set means text/plain.
+                ok = T.html_content_type(siblings.get(sink.ct_member.lower()))
             if ok:
                 self._record(sink, value, line)
 
@@ -687,6 +704,11 @@ class _Analysis:
 
     def _ev_cast(self, e: dict) -> Taint | None:
         v = self.ev(e.get("e"))
+        for sink in T.SINKS:
+            # `(MarkupString)x` builds the same raw-HTML value as `new MarkupString(x)`
+            if sink.member == ".cast" and self._sink_applies(sink) and _simple(e.get("type")) in {
+                    _simple(x) for x in sink.types}:
+                self._record(sink, v, e.get("line", 0))
         if _simple(e.get("type")) in T.SAFE_CAST_TYPES:
             return cleanse(v, ["*"])
         return v
@@ -697,12 +719,13 @@ class _Analysis:
         nvals = [self.ev(a) for a in (e.get("named") or {}).values()]
         init_vals = []
         tf = e.get("type_full")
+        sibs = {(ent.get("name") or "").lower(): ent.get("value") for ent in e.get("init") or [] if ent.get("name")}
         for ent in e.get("init") or []:
             v = self.ev(ent.get("value"))
             self._init_cache[id(ent)] = v
             init_vals.append(v)
             if ent.get("name"):
-                self._check_assign_sinks(ent["name"], None, None, tf or e.get("type"), v, e.get("line", 0))
+                self._check_assign_sinks(ent["name"], None, None, tf or e.get("type"), v, e.get("line", 0), sibs)
         if self._check_new_sinks(e, args, vals, nvals):
             return None
         if self.summaries is not None:
@@ -912,6 +935,12 @@ class _Analysis:
         for s, mre in _SAN_RES:
             if not mre.match(name):
                 continue
+            if s.recv_exclude and re.search(s.recv_exclude, self._text(recv) or ""):
+                # An encoder that does not escape: the result is the input, not a clean value.
+                out = rv
+                for v in vals:
+                    out = merge(out, v)
+                return out
             if sym:
                 stype, _ = _split_sym(sym)
                 if s.types and stype not in s.types:

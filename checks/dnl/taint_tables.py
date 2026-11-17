@@ -120,6 +120,7 @@ class Sink:
     recv_gate: bool = False          # `recv_text` / receiver type must match even when `sym` resolved
     legacy_only: bool = False        # System.Web row: not applied in a project owned by "dotnet" (Core)
     core_only: bool = False          # Core row whose receiver text also fits System.Web: Core projects only
+    ct_member: str | None = None     # assign row: the sibling member holding the content type (`ContentType`)
 
 
 _DB = "System.Data."
@@ -164,18 +165,23 @@ _COOKIES_TEXT = r"(?i)(^|\.)response\.cookies$"
 _ILOGGER = ("Microsoft.Extensions.Logging.LoggerExtensions", "Microsoft.Extensions.Logging.ILogger")
 _LOG_TEXT = r"(?i)(^|\.)_?(logger|log)$"
 _MEDIA_TYPE_NAMES = r"(?i)^(system\.net\.mime\.)?mediatypenames\."
+_C = {"core_only": True}
+
+
+# Content types a browser renders as a document that can run script: html, xml (xhtml) and svg.
+_RENDERABLE = re.compile(r"(?i)html|xml|svg")
 
 
 def html_content_type(arg) -> bool:
-    """Whether a `Content(.., contentType)` argument can make the browser render HTML: a constant containing
-    `html`, or anything that is not a constant (conservative). No argument means text/plain, so `None` is
+    """Whether a `Content(.., contentType)` argument can make the browser render a script-capable document: a
+    constant containing `html`, `xml` or `svg`, or anything that is not a constant (conservative). No argument means text/plain, so `None` is
     False. A `MediaTypeNames.X.Y` constant that does not say html is known and is not HTML."""
     if arg is None:
         return False
     if isinstance(arg, dict):
         if arg.get("k") == "lit":
             v = arg.get("v")
-            return isinstance(v, str) and "html" in v.lower()
+            return isinstance(v, str) and _RENDERABLE.search(v) is not None
         if arg.get("k") in ("name", "member"):
             node, parts = arg, []
             while isinstance(node, dict) and node.get("k") == "member":
@@ -184,7 +190,7 @@ def html_content_type(arg) -> bool:
             if isinstance(node, dict) and node.get("k") == "name":
                 parts.append(node.get("id") or "")
             if re.match(_MEDIA_TYPE_NAMES, ".".join(reversed(parts))):
-                return "html" in ".".join(parts).lower()
+                return _RENDERABLE.search(".".join(parts)) is not None
     return True
 _WEBCLIENT = ("System.Net.WebClient",)
 _HTTPCLIENT = ("System.Net.Http.HttpClient",)
@@ -206,7 +212,9 @@ SINKS: tuple[Sink, ...] = tuple(
     _each("sql", "SqlCommand", _CMD, ".ctor", args=(0,))
     + _each("sql", "SqlCommand", _CMD, "CommandText", assign=True)
     + _each("sql", "SqlDataAdapter", _ADAPTER, ".ctor", args=(0,))
-    + _each("sql", "Database", _EF_DB, "SqlQuery|ExecuteSqlCommand|ExecuteSqlCommandAsync", recv_text=_EF_TEXT)
+    + _each("sql", "Database", _EF_DB, "ExecuteSqlCommand|ExecuteSqlCommandAsync", recv_text=_EF_TEXT)
+    # EF Core 7+ has a parameterized `Database.SqlQuery<T>(FormattableString)`: EF6's string form is legacy only
+    + _each("sql", "Database", _EF_DB, "SqlQuery", recv_text=_EF_TEXT, legacy_only=True)
     + _each("sql", "DbSet", ("System.Data.Entity.DbSet", "System.Data.Entity.IDbSet",
                               "System.Data.Entity.Infrastructure.DbSqlQuery"), "SqlQuery")
     # linq (dynamic LINQ takes the expression as a string)
@@ -286,6 +294,9 @@ SINKS: tuple[Sink, ...] = tuple(
     # -- ASP.NET Core ---------------------------------------------------------------------------
     # sql: the raw forms only; FromSqlInterpolated / FromSql / ExecuteSqlInterpolated / ExecuteSql / SqlQuery
     # parameterize their interpolation holes and are not sinks. `static_args` covers `Type.FromSqlRaw(src, sql)`.
+    # These rows stay ungated: EF Core and the SQL providers are NuGet types the helper never resolves, and a
+    # legacy project can use them too. Every other row below is Core-only (`_C`): it must add nothing to a
+    # System.Web project's findings.
     + _each("sql", "EfCore.FromSqlRaw", _EFC_Q, "FromSqlRaw", args=(0,), static_args=(1,), unresolved_ok=True)
     + _each("sql", "EfCore.Database", _EFC_DB, "ExecuteSqlRaw|ExecuteSqlRawAsync|SqlQueryRaw", args=(0,),
             static_args=(1,), unresolved_ok=True)
@@ -294,39 +305,56 @@ SINKS: tuple[Sink, ...] = tuple(
     # redirect: LocalRedirect* never leaves the site and is not a sink
     + _each("redirect", "ControllerBase", _CORE_BASE,
             "Redirect|RedirectPermanent|RedirectPreserveMethod|RedirectPermanentPreserveMethod", args=(0,),
-            derives=_CORE_DERIVES)
-    + _each("redirect", "Results", _RESULTS, "Redirect", args=(0,))
-    + _each("redirect", "HttpResponse", _CORE_RESP, "Redirect", args=(0,), recv_text=_CORE_RESP_TEXT,
-            core_only=True)
-    + _each("redirect", "RedirectResult", ("Microsoft.AspNetCore.Mvc.RedirectResult",), ".ctor", args=(0,))
+            derives=_CORE_DERIVES, **_C)
+    + _each("redirect", "Results", _RESULTS, "Redirect", args=(0,), **_C)
+    + _each("redirect", "HttpResponse", _CORE_RESP, "Redirect", args=(0,), recv_text=_CORE_RESP_TEXT, **_C)
+    + _each("redirect", "RedirectResult", ("Microsoft.AspNetCore.Mvc.RedirectResult",), ".ctor", args=(0,), **_C)
+    # `Response.Headers.Location = url` and `Response.GetTypedHeaders().Location = uri` start a redirect too
+    + _each("redirect", "Headers", _HEADERS, "Location", assign=True, recv_text=_HEADERS_TEXT, recv_gate=True, **_C)
+    + _each("redirect", "ResponseHeaders", ("Microsoft.AspNetCore.Http.Headers.ResponseHeaders",), "Location",
+            assign=True, recv_text=r"(?i)gettypedheaders|responseheaders", **_C)
     # path (a `string` path argument; `_arg_ok` skips streams and byte arrays whose type is known)
-    + _each("path", "ControllerBase", _CORE_BASE, "PhysicalFile|File", args=(0,), derives=_CORE_DERIVES)
-    + _each("path", "Results", ("Microsoft.AspNetCore.Http.Results",), "File|PhysicalFile", args=(0,))
-    + _each("path", "Results", ("Microsoft.AspNetCore.Http.TypedResults",), "PhysicalFile", args=(0,))
+    + _each("path", "ControllerBase", _CORE_BASE, "PhysicalFile|File|VirtualFile", args=(0,),
+            derives=_CORE_DERIVES, **_C)
+    + _each("path", "Results", ("Microsoft.AspNetCore.Http.Results",), "File|PhysicalFile|VirtualFile",
+            args=(0,), **_C)
+    + _each("path", "Results", ("Microsoft.AspNetCore.Http.TypedResults",), "PhysicalFile|VirtualFile",
+            args=(0,), **_C)
+    + _each("path", "FileResult", ("Microsoft.AspNetCore.Mvc.PhysicalFileResult",
+                                   "Microsoft.AspNetCore.Mvc.VirtualFileResult"), ".ctor", args=(0,), **_C)
+    + _each("path", "SendFileAsync", ("Microsoft.AspNetCore.Http.SendFileResponseExtensions",
+                                      "Microsoft.AspNetCore.Http.HttpResponse"), "SendFileAsync", args=(0,),
+            recv_text=_CORE_RESP_TEXT, **_C)
     # header / cookie: the value argument; `recv_gate` keeps a generic `IDictionary.Add` on some other
     # dictionary from counting as a response header write
-    + _each("header", "Headers", _HEADERS, "Item", assign=True, recv_text=_HEADERS_TEXT, recv_gate=True,
-            core_only=True)
+    + _each("header", "Headers", _HEADERS, "Item", assign=True, recv_text=_HEADERS_TEXT, recv_gate=True, **_C)
     + _each("header", "Headers", _HEADERS, "Append|Add|TryAdd", args=(1,), recv_text=_HEADERS_TEXT, recv_gate=True,
-            core_only=True)
-    + _each("header", "Cookies", _COOKIES, "Append", args=(1,), recv_text=_COOKIES_TEXT, core_only=True)
-    # ssrf: HttpRequestMessage(HttpMethod, uri); the HttpClient rows above take the call itself
-    + _each("ssrf", "HttpRequestMessage", ("System.Net.Http.HttpRequestMessage",), ".ctor", args=(1,))
+            **_C)
+    + _each("header", "Cookies", _COOKIES, "Append", args=(1,), recv_text=_COOKIES_TEXT, **_C)
+    # ssrf: HttpRequestMessage(HttpMethod, uri) and its RequestUri; the legacy HttpClient rows take the call itself
+    + _each("ssrf", "HttpRequestMessage", ("System.Net.Http.HttpRequestMessage",), ".ctor", args=(1,), **_C)
+    + _each("ssrf", "HttpRequestMessage", ("System.Net.Http.HttpRequestMessage",), "RequestUri", assign=True, **_C)
+    + _each("ssrf", "HttpClient", _HTTPCLIENT + ("System.Net.Http.Json.HttpClientJsonExtensions",),
+            "PatchAsync|Send|GetFromJsonAsync|PostAsJsonAsync|PutAsJsonAsync|PatchAsJsonAsync|DeleteFromJsonAsync",
+            args=(0,), **_C)
     # xss
     + _each("xss", "IHtmlHelper", ("Microsoft.AspNetCore.Mvc.Rendering.IHtmlHelper",), "Raw", args=(0,),
-            recv_text=r"(?i)(^|\.)(html|htmlhelper)$")
-    + _each("xss", "HtmlString", ("Microsoft.AspNetCore.Html.HtmlString",), ".ctor", args=(0,))
-    + _each("xss", "MarkupString", ("Microsoft.AspNetCore.Components.MarkupString",), ".ctor", args=(0,))
-    # Content(content, contentType): text/plain without a content type, so only an HTML or unknown one counts
-    + _each("xss", "ControllerBase", _CORE_BASE, "Content", args=(0,), derives=_CORE_DERIVES, ct_arg=1)
-    + _each("xss", "Results", _RESULTS, "Content", args=(0,), ct_arg=1)
+            recv_text=r"(?i)(^|\.)(html|htmlhelper)$", **_C)
+    + _each("xss", "HtmlString", ("Microsoft.AspNetCore.Html.HtmlString",), ".ctor", args=(0,), **_C)
+    + _each("xss", "MarkupString", ("Microsoft.AspNetCore.Components.MarkupString",), ".ctor|.cast", args=(0,), **_C)
+    # Content(content, contentType): text/plain without a content type, so only a renderable or unknown one counts
+    + _each("xss", "ControllerBase", _CORE_BASE, "Content", args=(0,), derives=_CORE_DERIVES, ct_arg=1, **_C)
+    + _each("xss", "Results", _RESULTS, "Content|Text", args=(0,), ct_arg=1, **_C)
+    # `new ContentResult { Content = s, ContentType = ".." }`: the condition reads the initializer's ContentType
+    + _each("xss", "ContentResult", ("Microsoft.AspNetCore.Mvc.ContentResult",), "Content", assign=True,
+            ct_member="ContentType", **_C)
     # WriteAsync sets no content type and browsers may sniff: always a sink
     + _each("xss", "HttpResponse", ("Microsoft.AspNetCore.Http.HttpResponseWritingExtensions",
                                     "Microsoft.AspNetCore.Http.HttpResponse"), "WriteAsync", args=(0,),
-            recv_text=_CORE_RESP_TEXT, core_only=True)
+            recv_text=_CORE_RESP_TEXT, **_C)
     # log: the message template only (taint.py `_log_message_index`), never the placeholder arguments
     + _each("log", "ILogger", _ILOGGER, "Log|LogTrace|LogDebug|LogInformation|LogWarning|LogError|LogCritical|"
-                                          "BeginScope", args=(0,), msg_arg=True, recv_text=_LOG_TEXT)
+                                          "BeginScope", args=(0,), msg_arg=True, recv_text=_LOG_TEXT, **_C)
 )
 
 
@@ -341,6 +369,7 @@ class Sanitizer:
     crlf: bool = False               # `Replace` call that removes CR / LF (tracked per value)
     bare_ok: bool = False            # a receiver-less call by this name matches when `sym` is absent (VB `Val`)
     recv_text: str | None = None     # receiver-text regex accepted when `sym` is absent (`HtmlEncoder.Default`)
+    recv_exclude: str | None = None  # receiver-text regex that disables the row (`UnsafeRelaxedJsonEscaping`)
 
 
 _NUM = ("System.Int16", "System.Int32", "System.Int64", "System.Decimal", "System.Double", "System.Boolean",
@@ -365,7 +394,8 @@ SANITIZERS: tuple[Sanitizer, ...] = (
               ("System.Text.Encodings.Web.HtmlEncoder", "System.Text.Encodings.Web.JavaScriptEncoder",
                "System.Text.Encodings.Web.UrlEncoder", "System.Text.Encodings.Web.TextEncoder"),
               r"(?i)^Encode$",
-              recv_text=r"(?i)(^|\.)_?(html|javascript|js|url|text)?encoder(\.default)?$"),
+              recv_text=r"(?i)(^|\.)_?(html|javascript|js|url|text)?encoder(\.default)?$",
+              recv_exclude=r"(?i)unsaferelaxed"),
     Sanitizer("Path.GetFileName", frozenset({"path"}), ("System.IO.Path",), r"(?i)^GetFileName$"),
     Sanitizer("ldap-escape", frozenset({"ldap"}), (), r"(?i)^[A-Za-z0-9_]*ldap.*(escape|encode)"),
     # Removing CR/LF: handled specially (needs both removed; see taint.py), kinds come from the markers.

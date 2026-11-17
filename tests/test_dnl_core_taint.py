@@ -361,3 +361,331 @@ def test_sink_extras(app):
 
 def test_sink_extras_degraded(degraded_app):
     _check_sink_extras(degraded_app[1])
+
+
+# -- fix round 1: EF Core SqlQuery, JSON clients, Text/ContentResult, headers, casts, log names -----------
+
+def _check_more_sinks(findings):
+    def has(rule, handler):
+        return bool(_route_hits(findings, rule, f"SinkMoreController.{handler}"))
+    # EF Core's parameterized Database.SqlQuery<T>(FormattableString) is not the EF6 string form.
+    assert not has("DNL-INJ-001", "SqlQuerySafe")
+    for h in ("JsonFetch", "JsonPost", "PatchIt", "FetchInit"):
+        assert has("DNL-SSRF-001", h), h
+    for h in ("TextHtml", "ContentResultHtml", "ContentXml", "ContentSvg", "MarkupCast", "UnsafeEnc"):
+        assert has("DNL-XSS-001", h), h
+    for h in ("TextPlain", "ContentResultPlain", "ContentResultJson"):
+        assert not has("DNL-XSS-001", h), h
+    for h in ("LogLevelVar", "LogEventVar", "ScopeNamed"):
+        assert has("DNL-LOG-001", h), h
+    for h in ("LocationHdr", "TypedLoc"):
+        assert has("DNL-REDIR-001", h), h
+    for h in ("SendFile", "Virt", "FileResultCtor"):
+        assert has("DNL-PATH-001", h), h
+
+
+def test_more_sinks(app):
+    _check_more_sinks(app[1])
+
+
+def test_more_sinks_degraded(degraded_app):
+    _check_more_sinks(degraded_app[1])
+
+
+def test_content_type_condition_renderable():
+    from checks.dnl import taint_tables as T
+    for v in ("application/xml", "text/xml", "image/svg+xml", "application/xhtml+xml"):
+        assert T.html_content_type({"k": "lit", "v": v}), v
+    assert not T.html_content_type({"k": "lit", "v": "text/plain"})
+    media = {"k": "member", "name": "Xml", "obj": {"k": "member", "name": "Text",
+                                                   "obj": {"k": "name", "id": "MediaTypeNames"}}}
+    assert T.html_content_type(media)
+
+
+# Taint findings (rule|file|line) of the legacy fixture app, with and without the helper, captured at the
+# commit before the Core sink rows (f9348e4): the Core rows must not change a legacy finding.
+_LEGACY_KEYS = {
+    "DNL-DESER-001|TaintCs/DeserXml/FormatterController.cs|16",
+    "DNL-DESER-001|TaintCs/DeserXml/FormatterController.cs|37",
+    "DNL-DESER-001|TaintCs/DeserXml/FormatterController.cs|43",
+    "DNL-INJ-001|TaintCs/Chain.cs|55",
+    "DNL-INJ-001|TaintCs/CycleSrc.cs|10",
+    "DNL-INJ-001|TaintCs/Dup1.cs|9",
+    "DNL-INJ-001|TaintCs/Ext.cs|14",
+    "DNL-INJ-001|TaintCs/Ext.cs|19",
+    "DNL-INJ-001|TaintCs/Ext.cs|24",
+    "DNL-INJ-001|TaintCs/Ext.cs|35",
+    "DNL-INJ-001|TaintCs/Flow.cs|12",
+    "DNL-INJ-001|TaintCs/Flow.cs|20",
+    "DNL-INJ-001|TaintCs/Flow.cs|27",
+    "DNL-INJ-001|TaintCs/Flow.cs|34",
+    "DNL-INJ-001|TaintCs/Flow.cs|39",
+    "DNL-INJ-001|TaintCs/Gaps.cs|23",
+    "DNL-INJ-001|TaintCs/Gaps.cs|25",
+    "DNL-INJ-001|TaintCs/Gaps.cs|30",
+    "DNL-INJ-001|TaintCs/Gaps.cs|42",
+    "DNL-INJ-001|TaintCs/Gaps.cs|143",
+    "DNL-INJ-001|TaintCs/Gaps.cs|150",
+    "DNL-INJ-001|TaintCs/Lonely.cs|10",
+    "DNL-INJ-001|TaintCs/Misc.cs|10",
+    "DNL-INJ-001|TaintCs/Misc/OutboundExtras.cs|50",
+    "DNL-INJ-001|TaintCs/OrderRepository.cs|10",
+    "DNL-INJ-001|TaintCs/Orders.cs|11",
+    "DNL-INJ-001|TaintCs/Out.cs|14",
+    "DNL-INJ-001|TaintCs/Props.cs|12",
+    "DNL-INJ-001|TaintCs/Props.cs|20",
+    "DNL-INJ-001|TaintCs/Props.cs|26",
+    "DNL-INJ-001|TaintCs/Props.cs|34",
+    "DNL-INJ-001|TaintCs/Rec.cs|14",
+    "DNL-INJ-001|TaintCs/SelfRec.cs|10",
+    "DNL-INJ-001|TaintCs/SetSink.cs|10",
+    "DNL-INJ-001|TaintCs/Shared.cs|9",
+    "DNL-INJ-001|TaintCs/SqlImplA.cs|9",
+    "DNL-INJ-001|TaintCs/SqlImplB.cs|9",
+    "DNL-INJ-001|TaintCs/Tables.cs|27",
+    "DNL-INJ-001|TaintCs/Tables.cs|33",
+    "DNL-INJ-001|TaintCs/Tables.cs|39",
+    "DNL-INJ-001|TaintCs/Tables.cs|45",
+    "DNL-INJ-001|TaintCs/Tables.cs|51",
+    "DNL-INJ-001|TaintCs/Tables.cs|57",
+    "DNL-INJ-001|TaintCs/UsesAccum.cs|11",
+    "DNL-INJ-001|TaintCs/UsesExt.cs|17",
+    "DNL-INJ-001|TaintCs/UsesExt.cs|43",
+    "DNL-INJ-001|TaintCs/UsesExt.cs|57",
+    "DNL-INJ-001|TaintCs/UsesSetters.cs|28",
+    "DNL-INJ-001|TaintCs/UsesSetters.cs|41",
+    "DNL-INJ-001|TaintCs/Variadic.cs|9",
+    "DNL-INJ-001|TaintVb/Gaps.vb|8",
+    "DNL-INJ-001|TaintVb/Pages/Search.aspx.vb|12",
+    "DNL-INJ-001|TaintVb/Search.vb|9",
+    "DNL-INJ-001|TaintVb/Search.vb|15",
+    "DNL-INJ-001|TaintVb/Search.vb|21",
+    "DNL-INJ-001|TaintVb/Search.vb|27",
+    "DNL-INJ-001|TaintVb/Search.vb|31",
+    "DNL-INJ-002|TaintCs/CodeSinksController.cs|25",
+    "DNL-INJ-003|TaintCs/CodeSinksController.cs|39",
+    "DNL-INJ-003|TaintCs/Tables.cs|84",
+    "DNL-INJ-004|TaintCs/CodeSinksController.cs|58",
+    "DNL-INJ-005|TaintCs/CodeSinksController.cs|67",
+    "DNL-INJ-005|TaintCs/Crlf.cs|7",
+    "DNL-INJ-005|TaintCs/Crlf.cs|18",
+    "DNL-INJ-005|TaintCs/Crlf.cs|23",
+    "DNL-INJ-006|TaintCs/Linq.cs|9",
+    "DNL-INJ-006|TaintCs/Linq.cs|15",
+    "DNL-LOG-001|TaintCs/CodeSinksController.cs|114",
+    "DNL-LOG-001|TaintCs/Misc/LogLeakExtras.cs|15",
+    "DNL-LOG-001|TaintCs/Misc/LogLeakExtras.cs|21",
+    "DNL-LOG-001|TaintCs/Misc/LogLeakExtras.cs|28",
+    "DNL-LOG-001|TaintCs/Misc/LogLeakExtras.cs|34",
+    "DNL-LOG-001|TaintCs/Misc/LogLeakExtras.cs|40",
+    "DNL-LOG-001|TaintCs/Misc/LogLeakExtras.cs|53",
+    "DNL-LOG-001|TaintCs/Misc/LogLeakExtras.cs|59",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|22",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|28",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|34",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|41",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|47",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|53",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|60",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|78",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|115",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|162",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|209",
+    "DNL-LOG-001|TaintCs/Misc/LoginShapes.cs|37",
+    "DNL-LOG-001|TaintCs/Tables.cs|63",
+    "DNL-LOG-001|TaintCs/Tables.cs|74",
+    "DNL-LOG-001|TaintVb/Misc/MiscVb.vb|21",
+    "DNL-LOG-001|TaintVb/Misc/MiscVb.vb|27",
+    "DNL-LOG-001|TaintVb/Misc/MiscVb.vb|32",
+    "DNL-PATH-001|TaintCs/CodeSinksController.cs|81",
+    "DNL-REDIR-001|TaintCs/CodeSinksController.cs|88",
+    "DNL-REDIR-001|TaintCs/Guards.cs|14",
+    "DNL-REDIR-001|TaintCs/Guards.cs|25",
+    "DNL-REDIR-001|TaintCs/Nav.cs|17",
+    "DNL-SSRF-001|TaintCs/ApiSsrfController.cs|12",
+    "DNL-SSRF-001|TaintCs/CodeSinksController.cs|102",
+    "DNL-SSRF-001|TaintCs/Misc/OutboundCalls.cs|60",
+    "DNL-SSRF-001|TaintCs/Misc/OutboundCalls.cs|65",
+    "DNL-SSRF-001|TaintCs/Misc/OutboundCalls.cs|95",
+    "DNL-XSS-001|TaintCs/CodeSinksController.cs|74",
+    "DNL-XSS-001|TaintCs/Misc/LoggingCases.cs|87",
+    "DNL-XSS-001|TaintCs/Tables.cs|14",
+    "DNL-XSS-001|TaintCs/Tables.cs|16",
+    "DNL-XSS-001|TaintCs/Tables.cs|18",
+    "DNL-XSS-001|TaintCs/Tables.cs|20",
+    "DNL-XXE-001|Legacy40/Parse.cs|11",
+    "DNL-XXE-001|Legacy40/Parse.cs|31",
+    "DNL-XXE-001|Legacy40/Parse.cs|41",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|98",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|127",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|163",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|180",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|193",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|220",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|236",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|242",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|254",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|260",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|284",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|291",
+    "DNL-XXE-001|TaintCs/DeserXml/Round4.cs|37",
+    "DNL-XXE-001|TaintCs/DeserXml/Round4.cs|83",
+    "DNL-XXE-001|TaintCs/DeserXml/Round4.cs|90",
+    "DNL-XXE-001|TaintCs/DeserXml/XmlController.cs|16",
+    "DNL-XXE-001|TaintCs/DeserXml/XmlController.cs|44",
+    "DNL-XXE-001|TaintCs/DeserXml/XmlController.cs|52",
+    "DNL-XXE-001|TaintCs/DeserXml/XmlController.cs|96",
+    "DNL-XXE-001|TaintCs/DeserXml/XmlController.cs|124",
+    "DNL-XXE-001|TaintCs/DeserXml/XmlController.cs|132",
+    "DNL-XXE-001|TaintCs/DeserXml/XmlController.cs|155",
+}
+_LEGACY_KEYS_DEGRADED = {
+    "DNL-DESER-001|TaintCs/DeserXml/FormatterController.cs|16",
+    "DNL-DESER-001|TaintCs/DeserXml/FormatterController.cs|37",
+    "DNL-DESER-001|TaintCs/DeserXml/FormatterController.cs|43",
+    "DNL-INJ-001|TaintCs/Chain.cs|55",
+    "DNL-INJ-001|TaintCs/CycleSrc.cs|10",
+    "DNL-INJ-001|TaintCs/Dup1.cs|9",
+    "DNL-INJ-001|TaintCs/Ext.cs|14",
+    "DNL-INJ-001|TaintCs/Ext.cs|19",
+    "DNL-INJ-001|TaintCs/Ext.cs|24",
+    "DNL-INJ-001|TaintCs/Ext.cs|35",
+    "DNL-INJ-001|TaintCs/Flow.cs|12",
+    "DNL-INJ-001|TaintCs/Flow.cs|20",
+    "DNL-INJ-001|TaintCs/Flow.cs|27",
+    "DNL-INJ-001|TaintCs/Flow.cs|34",
+    "DNL-INJ-001|TaintCs/Flow.cs|39",
+    "DNL-INJ-001|TaintCs/Gaps.cs|23",
+    "DNL-INJ-001|TaintCs/Gaps.cs|25",
+    "DNL-INJ-001|TaintCs/Gaps.cs|30",
+    "DNL-INJ-001|TaintCs/Gaps.cs|42",
+    "DNL-INJ-001|TaintCs/Gaps.cs|143",
+    "DNL-INJ-001|TaintCs/Gaps.cs|150",
+    "DNL-INJ-001|TaintCs/Lonely.cs|10",
+    "DNL-INJ-001|TaintCs/Misc.cs|10",
+    "DNL-INJ-001|TaintCs/Misc/OutboundExtras.cs|50",
+    "DNL-INJ-001|TaintCs/OrderRepository.cs|10",
+    "DNL-INJ-001|TaintCs/Orders.cs|11",
+    "DNL-INJ-001|TaintCs/Out.cs|14",
+    "DNL-INJ-001|TaintCs/Props.cs|12",
+    "DNL-INJ-001|TaintCs/Props.cs|20",
+    "DNL-INJ-001|TaintCs/Props.cs|26",
+    "DNL-INJ-001|TaintCs/Props.cs|34",
+    "DNL-INJ-001|TaintCs/Rec.cs|14",
+    "DNL-INJ-001|TaintCs/SelfRec.cs|10",
+    "DNL-INJ-001|TaintCs/SetSink.cs|10",
+    "DNL-INJ-001|TaintCs/Shared.cs|9",
+    "DNL-INJ-001|TaintCs/SqlImplA.cs|9",
+    "DNL-INJ-001|TaintCs/SqlImplB.cs|9",
+    "DNL-INJ-001|TaintCs/Tables.cs|27",
+    "DNL-INJ-001|TaintCs/Tables.cs|33",
+    "DNL-INJ-001|TaintCs/Tables.cs|39",
+    "DNL-INJ-001|TaintCs/Tables.cs|45",
+    "DNL-INJ-001|TaintCs/Tables.cs|51",
+    "DNL-INJ-001|TaintCs/Tables.cs|57",
+    "DNL-INJ-001|TaintCs/UsesAccum.cs|11",
+    "DNL-INJ-001|TaintCs/UsesExt.cs|17",
+    "DNL-INJ-001|TaintCs/UsesExt.cs|43",
+    "DNL-INJ-001|TaintCs/UsesExt.cs|57",
+    "DNL-INJ-001|TaintCs/UsesSetters.cs|28",
+    "DNL-INJ-001|TaintCs/UsesSetters.cs|41",
+    "DNL-INJ-001|TaintCs/Variadic.cs|9",
+    "DNL-INJ-002|TaintCs/CodeSinksController.cs|25",
+    "DNL-INJ-003|TaintCs/CodeSinksController.cs|39",
+    "DNL-INJ-003|TaintCs/Tables.cs|84",
+    "DNL-INJ-004|TaintCs/CodeSinksController.cs|58",
+    "DNL-INJ-005|TaintCs/CodeSinksController.cs|67",
+    "DNL-INJ-005|TaintCs/Crlf.cs|7",
+    "DNL-INJ-005|TaintCs/Crlf.cs|18",
+    "DNL-INJ-005|TaintCs/Crlf.cs|23",
+    "DNL-INJ-006|TaintCs/Gaps.cs|83",
+    "DNL-INJ-006|TaintCs/Gaps.cs|95",
+    "DNL-INJ-006|TaintCs/Linq.cs|9",
+    "DNL-INJ-006|TaintCs/Linq.cs|15",
+    "DNL-LOG-001|TaintCs/CodeSinksController.cs|114",
+    "DNL-LOG-001|TaintCs/Misc/LogLeakExtras.cs|15",
+    "DNL-LOG-001|TaintCs/Misc/LogLeakExtras.cs|21",
+    "DNL-LOG-001|TaintCs/Misc/LogLeakExtras.cs|28",
+    "DNL-LOG-001|TaintCs/Misc/LogLeakExtras.cs|34",
+    "DNL-LOG-001|TaintCs/Misc/LogLeakExtras.cs|40",
+    "DNL-LOG-001|TaintCs/Misc/LogLeakExtras.cs|53",
+    "DNL-LOG-001|TaintCs/Misc/LogLeakExtras.cs|59",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|22",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|28",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|34",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|41",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|47",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|53",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|60",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|78",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|115",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|162",
+    "DNL-LOG-001|TaintCs/Misc/LoggingCases.cs|209",
+    "DNL-LOG-001|TaintCs/Misc/LoginShapes.cs|37",
+    "DNL-LOG-001|TaintCs/Tables.cs|63",
+    "DNL-LOG-001|TaintCs/Tables.cs|74",
+    "DNL-PATH-001|TaintCs/CodeSinksController.cs|81",
+    "DNL-REDIR-001|TaintCs/CodeSinksController.cs|88",
+    "DNL-REDIR-001|TaintCs/Guards.cs|14",
+    "DNL-REDIR-001|TaintCs/Guards.cs|25",
+    "DNL-REDIR-001|TaintCs/Nav.cs|17",
+    "DNL-SSRF-001|TaintCs/ApiSsrfController.cs|12",
+    "DNL-SSRF-001|TaintCs/CodeSinksController.cs|102",
+    "DNL-SSRF-001|TaintCs/Misc/OutboundCalls.cs|60",
+    "DNL-SSRF-001|TaintCs/Misc/OutboundCalls.cs|65",
+    "DNL-SSRF-001|TaintCs/Misc/OutboundCalls.cs|95",
+    "DNL-XSS-001|TaintCs/CodeSinksController.cs|74",
+    "DNL-XSS-001|TaintCs/Misc/LoggingCases.cs|87",
+    "DNL-XSS-001|TaintCs/Tables.cs|14",
+    "DNL-XSS-001|TaintCs/Tables.cs|16",
+    "DNL-XSS-001|TaintCs/Tables.cs|18",
+    "DNL-XSS-001|TaintCs/Tables.cs|20",
+    "DNL-XXE-001|Legacy40/Parse.cs|11",
+    "DNL-XXE-001|Legacy40/Parse.cs|31",
+    "DNL-XXE-001|Legacy40/Parse.cs|41",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|98",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|127",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|163",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|180",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|193",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|220",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|236",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|242",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|254",
+    "DNL-XXE-001|TaintCs/DeserXml/Escapes.cs|260",
+    "DNL-XXE-001|TaintCs/DeserXml/Round4.cs|37",
+    "DNL-XXE-001|TaintCs/DeserXml/Round4.cs|83",
+    "DNL-XXE-001|TaintCs/DeserXml/Round4.cs|90",
+    "DNL-XXE-001|TaintCs/DeserXml/XmlController.cs|16",
+    "DNL-XXE-001|TaintCs/DeserXml/XmlController.cs|44",
+    "DNL-XXE-001|TaintCs/DeserXml/XmlController.cs|52",
+    "DNL-XXE-001|TaintCs/DeserXml/XmlController.cs|96",
+    "DNL-XXE-001|TaintCs/DeserXml/XmlController.cs|124",
+    "DNL-XXE-001|TaintCs/DeserXml/XmlController.cs|132",
+    "DNL-XXE-001|TaintCs/DeserXml/XmlController.cs|155",
+}
+
+
+def _legacy_run(name, allow_degraded):
+    from checks.dnl import routes
+    fx = Path(__file__).parent / "fixtures" / "dotnet_legacy"
+    project._CACHE.clear()
+    model = project.prepare(fx / name, allow_degraded)
+    refs = routes.discover_mvc_webapi(model) + routes.discover_webforms(model)
+    return {f"{f.check_id}|{f.file.replace(chr(92), '/')}|{f.line}" for f in rules_taint.check(model, refs)}
+
+
+def test_legacy_findings_unchanged_with_helper(roslyn_helper):
+    assert _legacy_run("taint_app", False) == _LEGACY_KEYS
+    for name in ("mvc5_app", "webapi_global"):
+        assert _legacy_run(name, False) == set(), name
+    project._CACHE.clear()
+
+
+def test_legacy_findings_unchanged_degraded(monkeypatch):
+    monkeypatch.setattr("checks.dnl.helper.find_helper", lambda *a, **k: None)
+    monkeypatch.setattr("checks.dnl.helper.sdk_available", lambda *a, **k: False)
+    assert _legacy_run("taint_app", True) == _LEGACY_KEYS_DEGRADED
+    for name in ("mvc5_app", "webapi_global"):
+        assert _legacy_run(name, True) == set(), name
+    project._CACHE.clear()
