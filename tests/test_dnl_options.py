@@ -196,3 +196,53 @@ def test_verdict_bad_predicate_keeps_the_bad_value():
     opts = assignments(lam(["o"], body))
     o, uncertain = verdict(opts, "A", bad=lambda x: const(x.value) is not False)
     assert uncertain is True and o.value["v"] is True       # the conditional good value never clears it
+
+
+# -- early exits make the following statements conditional ---------------------------------------------
+
+def _ret():
+    return {"k": "return", "value": None, "line": 1}
+
+
+def _if(then):
+    return {"k": "if", "cond": name("x"), "then": then, "else": []}
+
+
+def test_guarded_return_makes_following_assignments_conditional():
+    body = [assign("o", "A", lit(1)), _if([_ret()]), assign("o", "B", lit(2))]
+    assert _cond_flags(body) == [("A", False), ("B", True)]
+
+
+def test_guarded_throw_and_break_make_following_conditional():
+    for jump in ({"k": "throw", "value": None, "line": 1}, {"k": "other", "text": "break;", "line": 1},
+                 {"k": "other", "text": "continue;", "line": 1}, {"k": "other", "text": "goto end;", "line": 1}):
+        assert _cond_flags([_if([jump]), assign("o", "B", lit(2))]) == [("B", True)], jump
+
+
+def test_guarded_return_inside_try_or_loop_counts():
+    body = [{"k": "try", "body": [_if([_ret()])], "catches": [], "finally": [], "line": 1}, assign("o", "B", lit(2))]
+    assert _cond_flags(body) == [("B", True)]
+    body = [{"k": "loop", "body": [_if([_ret()])], "line": 1}, assign("o", "B", lit(2))]
+    assert _cond_flags(body) == [("B", True)]
+
+
+def test_unconditional_trailing_return_changes_nothing():
+    assert _cond_flags([assign("o", "A", lit(1)), _ret()]) == [("A", False)]
+
+
+def test_return_in_nested_lambda_does_not_count():
+    inner = lam(["x"], [_if([_ret()])])
+    body = [{"k": "expr", "e": call(name("list"), "Select", [inner]), "line": 1}, assign("o", "B", lit(2))]
+    assert _cond_flags(body) == [("B", False)]
+
+
+def test_switch_sections_lower_to_conditional_ifs():
+    body = [_if([assign("o", "A", lit(1))]), _if([assign("o", "A", lit(2))])]
+    assert _cond_flags(body) == [("A", True), ("A", True)]
+
+
+def test_verdict_uncertain_but_no_bad_value_keeps_last():
+    body = [assign("o", "A", lit(1)), _if([assign("o", "A", lit(2))])]
+    opts = assignments(lam(["o"], body))
+    o, uncertain = verdict(opts, "A", bad=lambda x: const(x.value) == 99)
+    assert uncertain is True and o.value["v"] == 2

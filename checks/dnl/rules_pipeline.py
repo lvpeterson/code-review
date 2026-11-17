@@ -156,12 +156,17 @@ def _handler_args(c: PipeCall) -> list:
     return [a for a in args if isinstance(a, dict) and a.get("k") in ("lambda", "new")]
 
 
-def _installs_handler(c: PipeCall) -> bool:
-    """UseExceptionHandler, AddProblemDetails, or `Configure<ProblemDetailsOptions>` setting the customizer."""
+def _installs_handler(c: PipeCall) -> tuple[bool, bool]:
+    """(installs, conditional): UseExceptionHandler, AddProblemDetails, or `Configure<ProblemDetailsOptions>`
+    setting the customizer. A customizer set only under a condition inside the lambda (an if, or after a
+    guarded return) is still scanned for leaks but is `conditional`: it may never be installed."""
     if c.name in ("UseExceptionHandler", "AddProblemDetails"):
-        return True
-    return (c.name == "Configure" and c.kind == "services"
-            and opt(options_of(c.node), "CustomizeProblemDetails") is not None)
+        o, uncertain = verdict(options_of(c.node), "CustomizeProblemDetails")
+        return True, bool(o is not None and uncertain)
+    if c.name == "Configure" and c.kind == "services":
+        o, uncertain = verdict(options_of(c.node), "CustomizeProblemDetails")
+        return o is not None, uncertain
+    return False, False
 
 
 def _developer_page(ctx: Ctx, pipe: Pipeline, add) -> None:
@@ -247,7 +252,8 @@ def _missing_handler(ctx: Ctx, pipe: Pipeline, add) -> None:
 def _handler_leaks(ctx: Ctx, pipe: Pipeline, add) -> None:
     calls = _certain_and_uncertain(ctx, pipe, "UseExceptionHandler", "AddProblemDetails", "Configure")
     for c, conf in calls:
-        if not _installs_handler(c):
+        installs, maybe = _installs_handler(c)
+        if not installs:
             continue
         for line in _leak_sinks(_handler_args(c)):
             desc = ("The exception handler writes exception detail (Message, StackTrace or ToString) into the "
@@ -255,6 +261,9 @@ def _handler_leaks(ctx: Ctx, pipe: Pipeline, add) -> None:
                     "id, and log the detail.")
             if conf:
                 desc += " The handler sits under an environment condition that could not be parsed."
+            if maybe:
+                conf = "REVIEW"
+                desc += " The customizer is set under a condition inside the options lambda, so it may not be installed."
             add("DNL-ERR-002", "medium", "Exception handler returns exception detail", desc, c.file, line, conf)
 
 

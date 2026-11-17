@@ -527,3 +527,45 @@ def test_conditional_good_value_does_not_clear_bad_detailed_errors(tmp_path, mod
 def test_unconditional_bad_detailed_errors_stays_firm(tmp_path, mode):
     services = "builder.Services.AddServerSideBlazor(o => { o.DetailedErrors = true; });"
     assert ("DNL-CFG-008", "medium", None) in ids(_scan(tmp_path, mode, "app.UseExceptionHandler(\"/e\");", services))
+
+
+# -- early exits inside lambda bodies; conditional problem-details customization ---------------------
+
+def test_guarded_return_before_https_listener_is_review(tmp_path, mode):
+    services = ("builder.WebHost.ConfigureKestrel(o => { o.ListenAnyIP(8080); "
+                "if (builder.Environment.IsDevelopment()) return; o.ListenAnyIP(8443, l => l.UseHttps()); });")
+    assert ("DNL-CFG-013", "low", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseRouting();", services=services))
+
+
+def test_guarded_return_before_http_listener_is_review(tmp_path, mode):
+    services = "builder.WebHost.ConfigureKestrel(o => { if (Flags.Skip()) return; o.ListenAnyIP(8080); });"
+    assert ("DNL-CFG-013", "low", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseRouting();", services=services))
+
+
+def test_guarded_return_before_false_does_not_clear_detailed_errors(tmp_path, mode):
+    # Bad value set unconditionally, the fix sits after a guarded return: REVIEW (the fix may not run).
+    services = ("builder.Services.AddServerSideBlazor(o => { o.DetailedErrors = true; "
+                "if (Flags.Skip()) return; o.DetailedErrors = false; });")
+    assert ("DNL-CFG-008", "medium", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseExceptionHandler(\"/e\");", services))
+
+
+LEAKY_CUSTOMIZE = "c.ProblemDetails.Detail = c.Exception.Message;"
+
+
+def test_conditional_customize_problem_details_leak_is_review(tmp_path, mode):
+    services = ("builder.Services.AddProblemDetails(o => { if (Flags.Detail()) { o.CustomizeProblemDetails = c => "
+                "{ " + LEAKY_CUSTOMIZE + " }; } });")
+    assert ("DNL-ERR-002", "medium", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseExceptionHandler();", services))
+
+
+def test_unconditional_customize_problem_details_leak_stays_firm(tmp_path, mode):
+    services = ("builder.Services.AddProblemDetails(o => { o.CustomizeProblemDetails = c => "
+                "{ " + LEAKY_CUSTOMIZE + " }; });")
+    assert ("DNL-ERR-002", "medium", None) in ids(_scan(tmp_path, mode, "app.UseExceptionHandler();", services))
+
+
+def test_conditional_customize_does_not_suppress_missing_handler(tmp_path, mode):
+    # CFG-009 looks only at UseExceptionHandler / status-code pages, never at problem-details options.
+    services = ("builder.Services.AddProblemDetails(o => { if (Flags.Detail()) { o.CustomizeProblemDetails = c => "
+                "{ c.ProblemDetails.Detail = \"x\"; }; } });")
+    assert ("DNL-CFG-009", "low", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseRouting();", services=services))

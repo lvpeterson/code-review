@@ -126,6 +126,39 @@ def child_conditional(node: dict, key: str, cond: bool) -> bool:
     return cond or k in _BRANCH_KINDS or (k == "try" and key == "catches")
 
 
+_JUMP_TEXT = re.compile(r"^\s*(break|continue|goto|exit|return)\b", re.I)
+
+
+def _is_jump(n: dict) -> bool:
+    """return / throw, or a break / continue / goto the IR keeps as `other` text."""
+    k = n.get("k")
+    return k in ("return", "throw") or (k == "other" and bool(_JUMP_TEXT.match(n.get("text") or "")))
+
+
+def _guarded_jump(node, under: bool = False) -> bool:
+    """True when a jump sits beneath an if / loop / try / ternary inside the node (a nested lambda's own
+    returns do not leave the enclosing body). A bare jump with nothing above it is not guarded."""
+    if isinstance(node, list):
+        return any(_guarded_jump(x, under) for x in node)
+    if not isinstance(node, dict) or node.get("k") == "lambda":
+        return False
+    if under and _is_jump(node):
+        return True
+    below = under or node.get("k") in _BRANCH_KINDS or node.get("k") == "try"
+    return any(_guarded_jump(v, below) for v in node.values() if isinstance(v, (dict, list)))
+
+
+def sibling_states(items: list, cond: bool) -> list[bool]:
+    """Per statement of a list: conditional once an earlier sibling can leave the body early (a guarded
+    return / throw / break / continue / goto), because the statements after it may then not run."""
+    out, later = [], cond
+    for x in items:
+        out.append(later)
+        if not later and _guarded_jump(x):
+            later = True
+    return out
+
+
 def walk_conditional(node, cond: bool = False):
     """Pre-order like ir.walk, yielding (node, conditional): conditional is True below an if / else,
     loop, ternary or catch handler. A lambda keeps the state of where it is written."""
@@ -135,14 +168,14 @@ def walk_conditional(node, cond: bool = False):
             if isinstance(v, (dict, list)):
                 yield from walk_conditional(v, child_conditional(node, key, cond))
     elif isinstance(node, list):
-        for v in node:
-            yield from walk_conditional(v, cond)
+        for v, c in zip(node, sibling_states(node, cond)):
+            yield from walk_conditional(v, c)
 
 
 def _scan(node, params: frozenset, prefix: str, out: list[Opt], cond: bool = False) -> None:
     if isinstance(node, list):
-        for x in node:
-            _scan(x, params, "", out, cond)
+        for x, c in zip(node, sibling_states(node, cond)):
+            _scan(x, params, "", out, c)
         return
     if not isinstance(node, dict):
         return
