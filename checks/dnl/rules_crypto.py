@@ -97,7 +97,11 @@ _KEY_WORDS = {"token", "key", "id", "name", "header", "claim", "scope", "cookie"
               "grant", "type"}
 # Qualifiers that commonly prefix a key / header / claim name (`access_token`, `__RequestVerificationToken`).
 _FIELD_WORDS = {"access", "refresh", "request", "response", "session", "client", "user", "api", "auth",
-                "csrf", "xsrf", "antiforgery", "forgery", "content", "authorization", "identity", "api"}
+                "csrf", "xsrf", "antiforgery", "forgery", "content", "authorization", "identity"}
+# Short connector words allowed inside a key name (no length rule: `prod_key`, `root_key` are not names).
+_CONNECTORS = {"id", "the", "of", "for", "to", "by", "on", "in", "x", "my", "app", "api", "auth", "user", "web"}
+# A word like these means the literal may be a real secret, never a key name.
+_SECRETISH_WORD = re.compile(r"^(?:pass|pwd|secret|live|prod|master|admin|root|priv)|^sk$")
 _SECRET_NAMED = re.compile(r"(?i)pass(word|wd)?|pwd|secret|credential")
 
 
@@ -116,10 +120,11 @@ def _names_a_key(text: str, var: str) -> bool:
     if len(text) > 40 or _SECRET_NAMED.search(var or ""):
         return False
     words = [w.lower() for w in _WORD_SPLIT.findall(text)]
-    # Every word must be a key / field word or a short common word, and at least one a key word:
+    # Every word must be a key / field word or a known connector word, and at least one a key word:
     # `ProductionKey_Abcdefghijklmnop` or `Bearer_tokenvalueabcdef` carry a key word AND real-looking content.
     return (any(w in _KEY_WORDS for w in words)
-            and all(w in _KEY_WORDS or w in _FIELD_WORDS or len(w) <= 4 for w in words))
+            and not any(_SECRETISH_WORD.match(w) for w in words)
+            and all(w in _KEY_WORDS or w in _FIELD_WORDS or w in _CONNECTORS for w in words))
 
 
 def _in_crypto_ns(*syms: str | None) -> bool:

@@ -24,6 +24,13 @@ public static class WeakLooking
     public const string ApiKey = "ProductionKey_Abcdefghijklmnop";
     public const string AuthToken = "Bearer_tokenvalueabcdef";
 
+    public const string ApiKeyA = "sk_live_key";
+    public const string ApiKeyB = "live_token";
+    public const string ApiKeyC = "prod_key";
+    public const string ApiKeyD = "pass_key";
+    public const string ApiKeyE = "root_key";
+    public const string ApiKeyF = "Xq_key_Lmnp";
+
     public static NetworkCredential Build()
     {
         return new NetworkCredential("u", "correct horse battery");

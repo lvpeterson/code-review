@@ -436,15 +436,15 @@ def _sdk_facts(path: Path, tree, root: Path) -> _Facts:
     # unconditional value anywhere the last conditional group of the nearest file decides (as before),
     # and a note names the file. Reported frameworks (end of support): the effective ones plus every
     # value of the files from the one that supplied them down to the project file.
-    plain_at = [i for i, (_n, g) in enumerate(tfm_files) if any(not c for _v, c in g)]
+    plain_at = [i for i, (_n, g) in enumerate(tfm_files) if any(not c and v for v, c in g)]
     if plain_at:
         k = plain_at[-1]
-        last_plain = [vals for vals, c in tfm_files[k][1] if not c][-1]
+        last_plain = [vals for vals, c in tfm_files[k][1] if not c and vals][-1]
         effective = list(last_plain)
         start = k
-    elif tfm_files:
-        k = len(tfm_files) - 1
-        effective = list(tfm_files[k][1][-1][0])
+    elif any(v for _n, g in tfm_files for v, _c in g):
+        k = max(i for i, (_n, g) in enumerate(tfm_files) if any(v for v, _c in g))
+        effective = list([v for v, _c in tfm_files[k][1] if v][-1])
         start = 0
         if effective:
             facts.cond_only = tfm_files[k][0]
@@ -582,8 +582,9 @@ def _load_project(path: Path, notes: list[str], root: Path | None = None) -> Pro
             proj.profile = profile_for(facts.effective)
         else:
             proj.profile = "netcore"
-            notes.append(f"{path.name}: no TargetFramework found (project file or Directory.*.props); "
-                         "assuming modern .NET")
+            why = ("TargetFramework could not be resolved" if facts.unresolved else
+                   "no TargetFramework found (project file or Directory.*.props)")
+            notes.append(f"{path.name}: {why}; assuming modern .NET")
         if proj.profile == "netcore":
             proj.global_usings = facts.usings
         else:

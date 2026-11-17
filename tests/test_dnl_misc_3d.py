@@ -49,7 +49,7 @@ def test_n4_key_name_literals_skipped_weak_looking_ones_demoted(findings):
     assert not {7, 8, 9, 10} & set(got)
     assert got[11] == ("high", None)             # real-looking secret unchanged
     # name-shaped literals on a secret-like variable, or too long, or without a key word: never dropped
-    for line in (16, 17, 18, 19, 20, 21, 22, 24, 25, 29):
+    for line in (16, 17, 18, 19, 20, 21, 22, 24, 25, 27, 28, 29, 30, 31, 32, 36):
         assert got[line] == ("low", "REVIEW"), line
 
 

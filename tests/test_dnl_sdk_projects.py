@@ -394,3 +394,14 @@ def test_only_conditional_tfms_keep_old_owner_and_add_a_note(tmp_path):
     app = _by_name(load_projects(tmp_path, notes), "App")
     assert app.owner == "dotnet_legacy"
     assert any("App.csproj" in n and "Condition" in n for n in notes)
+
+
+def test_unresolved_unconditional_tfm_does_not_hide_a_farther_one(tmp_path):
+    (tmp_path / "Directory.Build.props").write_text(
+        "<Project><PropertyGroup><TargetFramework>net48</TargetFramework></PropertyGroup></Project>")
+    _sdk_csproj(tmp_path / "App", "<PropertyGroup><TargetFramework>$(Nope)</TargetFramework></PropertyGroup>")
+    notes: list[str] = []
+    app = _by_name(load_projects(tmp_path, notes), "App")
+    assert app.owner == "dotnet_legacy" and app.target_frameworks == ["net48"]
+    assert any("App.csproj" in n and "$(Nope)" in n for n in notes)
+    assert not any("no TargetFramework found" in n for n in notes)
