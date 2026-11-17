@@ -372,7 +372,7 @@ either mode.
 | 2025 | A04 | Cryptographic Failures | DNL-CRY-001, DNL-CRY-002, DNL-CRY-003, DNL-CRY-004, DNL-CRY-005, DNL-CRY-007, DNL-CRY-008, DNL-SESS-005 |
 | 2025 | A05 | Injection | DNL-INJ-001, DNL-INJ-002, DNL-INJ-003, DNL-INJ-004, DNL-INJ-005, DNL-INJ-006, DNL-XSS-001, DNL-XSS-002, DNL-XSS-003, DNL-XSS-004 |
 | 2025 | A06 | Insecure Design | DNL-AUTHZ-006, DNL-AUTHZ-007, DNL-DES-001, DNL-RES-001, DNL-RES-002, DNL-RES-003, DNL-WCF-004 |
-| 2025 | A07 | Authentication Failures | DNL-SEC-001, DNL-SEC-002, DNL-SEC-003, DNL-SESS-001, DNL-SESS-002, DNL-SESS-003, DNL-SESS-004, DNL-SESS-006, DNL-SESS-007, DNL-SESS-008 |
+| 2025 | A07 | Authentication Failures | DNL-SEC-001, DNL-SEC-002, DNL-SEC-003, DNL-SESS-001, DNL-SESS-002, DNL-SESS-003, DNL-SESS-004, DNL-SESS-006, DNL-SESS-007, DNL-SESS-008, DNL-SESS-009 |
 | 2025 | A08 | Software or Data Integrity Failures | DNL-CONSUME-001, DNL-CONSUME-002, DNL-CRY-006, DNL-DESER-001, DNL-DESER-002, DNL-DESER-003, DNL-INT-001, DNL-INT-002, DNL-INT-003, DNL-INT-004 |
 | 2025 | A09 | Security Logging and Alerting Failures | DNL-LOG-001, DNL-LOG-002, DNL-LOG-003, DNL-LOG-004 |
 | 2025 | A10 | Mishandling of Exceptional Conditions | DNL-ERR-001, DNL-ERR-002, DNL-ERR-003 |
@@ -382,12 +382,12 @@ either mode.
 | 2021 | A04 | Insecure Design | DNL-AUTHZ-006, DNL-AUTHZ-007, DNL-DES-001, DNL-ERR-001, DNL-ERR-003, DNL-RES-001, DNL-RES-002, DNL-RES-003, DNL-WCF-004 |
 | 2021 | A05 | Security Misconfiguration | DNL-CFG-001, DNL-CFG-002, DNL-CFG-003, DNL-CFG-004, DNL-CFG-005, DNL-CFG-006, DNL-CFG-007, DNL-CFG-008, DNL-CFG-009, DNL-CFG-010, DNL-CFG-011, DNL-CFG-013, DNL-CFG-014, DNL-CFG-015, DNL-ERR-002, DNL-INV-001, DNL-INV-002, DNL-WCF-001, DNL-WCF-002, DNL-WCF-003, DNL-XXE-001, DNL-XXE-002 |
 | 2021 | A06 | Vulnerable and Outdated Components | DNL-SCA-001, DNL-SCA-002, DNL-SCA-003, DNL-SCA-004 |
-| 2021 | A07 | Identification and Authentication Failures | DNL-SEC-001, DNL-SEC-002, DNL-SEC-003, DNL-SESS-001, DNL-SESS-002, DNL-SESS-003, DNL-SESS-004, DNL-SESS-006, DNL-SESS-007, DNL-SESS-008 |
+| 2021 | A07 | Identification and Authentication Failures | DNL-SEC-001, DNL-SEC-002, DNL-SEC-003, DNL-SESS-001, DNL-SESS-002, DNL-SESS-003, DNL-SESS-004, DNL-SESS-006, DNL-SESS-007, DNL-SESS-008, DNL-SESS-009 |
 | 2021 | A08 | Software and Data Integrity Failures | DNL-CONSUME-001, DNL-CONSUME-002, DNL-CRY-006, DNL-DESER-001, DNL-DESER-002, DNL-DESER-003, DNL-INT-001, DNL-INT-002, DNL-INT-003, DNL-INT-004, DNL-SCA-005 |
 | 2021 | A09 | Security Logging and Monitoring Failures | DNL-LOG-001, DNL-LOG-002, DNL-LOG-003, DNL-LOG-004 |
 | 2021 | A10 | Server-Side Request Forgery | DNL-SSRF-001 |
 | api2023 | API1 | Broken Object Level Authorization | DNL-AUTHZ-005 |
-| api2023 | API2 | Broken Authentication | DNL-SEC-001, DNL-SEC-002, DNL-SEC-003, DNL-SESS-001, DNL-SESS-002, DNL-SESS-003, DNL-SESS-004, DNL-SESS-005, DNL-SESS-006, DNL-SESS-007, DNL-SESS-008 |
+| api2023 | API2 | Broken Authentication | DNL-SEC-001, DNL-SEC-002, DNL-SEC-003, DNL-SESS-001, DNL-SESS-002, DNL-SESS-003, DNL-SESS-004, DNL-SESS-005, DNL-SESS-006, DNL-SESS-007, DNL-SESS-008, DNL-SESS-009 |
 | api2023 | API3 | Broken Object Property Level Authorization | DNL-AUTHZ-006, DNL-AUTHZ-007 |
 | api2023 | API4 | Unrestricted Resource Consumption | DNL-RES-001, DNL-RES-002, DNL-RES-003, DNL-WCF-004 |
 | api2023 | API5 | Broken Function Level Authorization | DNL-AUTHZ-001, DNL-AUTHZ-002, DNL-AUTHZ-003, DNL-AUTHZ-004, DNL-AUTHZ-008 |
@@ -432,6 +432,7 @@ DNL-INV-001, which always carries it.
 | DNL-SESS-003 | low | Forms timeout over 60 minutes | A07:2025 | A07:2021 | API2:2023 |
 | DNL-SESS-004 | medium | Cookieless forms auth or session state | A07:2025 | A07:2021 | API2:2023 |
 | DNL-SESS-005 | medium/high | Membership `passwordFormat` Encrypted (medium) / Clear (high) | A04:2025 | A02:2021 | API2:2023 |
+| DNL-SESS-009 | low | ASP.NET Core only (`languages/dotnet`): cookie `SameSite = None` (`Cookie.SameSite`, `MinimumSameSitePolicy`) in `AddCookie`, `ConfigureApplicationCookie`, `AddSession`, `AddAntiforgery` or cookie-policy options that run in Production | A07:2025 | A07:2021 | API2:2023 |
 | DNL-INT-001 | high | `enableViewStateMac="false"` | A08:2025 | A08:2021 | -- |
 | DNL-INT-002 | medium | Hard-coded `machineKey` | A08:2025 | A08:2021 | -- |
 | DNL-SEC-001 | high | Password in a connection string (a whole-value placeholder such as `$(Pw)`, `{DbPassword}` or `#{Pw}` is ignored; braced ADO.NET values like `{a;b}` are real) | A07:2025 | A07:2021 | API2:2023 |

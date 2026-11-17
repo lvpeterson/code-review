@@ -71,6 +71,7 @@ _add(["DNL-CFG-010", "DNL-CFG-011", "DNL-CFG-013", "DNL-CFG-014", "DNL-CFG-015"]
 _add(["DNL-XSS-002"], "A05", "A03", None)
 _add([f"DNL-SESS-00{n}" for n in range(1, 5)], "A07", "A07", "API2")
 _add(["DNL-SESS-005"], "A04", "A02", "API2")
+_add(["DNL-SESS-009"], "A07", "A07", "API2")
 _add(["DNL-INT-001", "DNL-INT-002"], "A08", "A08", None)
 _add(["DNL-SEC-001", "DNL-SEC-002"], "A07", "A07", "API2")
 _add(["DNL-INV-001"], "A02", "A05", "API9", "always")

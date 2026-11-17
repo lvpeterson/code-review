@@ -7,6 +7,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from checks.dnl import rules_pipeline_auth
 from checks.dnl.auth_core import _sensitive
 from checks.dnl.cfgctx import Ctx, build_ctx
 from checks.dnl.ir import attr_key, call_chain, call_name, const_str, literal_str, receiver_text, walk
@@ -896,7 +897,8 @@ def _cors(ctx: Ctx) -> None:
 
 
 # (name, fn(ctx)) in run order; each fn appends to ctx.out.
-_GROUPS: list = [("errors", _errors), ("transport", _transport), ("cors", _cors)]
+_GROUPS: list = [("errors", _errors), ("transport", _transport), ("cors", _cors),
+                 ("cookies", rules_pipeline_auth.check_cookies)]
 
 
 def check(model: ProjectModel, refs: list[CoreRouteRef]) -> list[Finding]:
