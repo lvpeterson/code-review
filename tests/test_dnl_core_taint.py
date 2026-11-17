@@ -376,7 +376,8 @@ def _check_more_sinks(findings):
         assert has("DNL-XSS-001", h), h
     for h in ("TextPlain", "ContentResultPlain", "ContentResultJson"):
         assert not has("DNL-XSS-001", h), h
-    for h in ("LogLevelVar", "LogEventVar", "ScopeNamed"):
+    # An untyped variable named like a level / event id is the message when nothing follows it.
+    for h in ("LogLevelVar", "LogEventVar", "ScopeNamed", "LevelOnly", "EvtOnly"):
         assert has("DNL-LOG-001", h), h
     for h in ("LocationHdr", "TypedLoc"):
         assert has("DNL-REDIR-001", h), h

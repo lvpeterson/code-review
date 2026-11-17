@@ -449,9 +449,25 @@ class _Analysis:
 
     # -- log message argument / content-type condition (Core sinks) -------------------------------
 
-    def _not_log_message(self, a: Any) -> bool:
+    def _can_be_template(self, a: Any) -> bool:
+        """A later positional argument that could be the message template: a string literal, an interpolated
+        string, a concatenation, or a string-typed / untyped value."""
+        if not isinstance(a, dict):
+            return False
+        k = a.get("k")
+        if k == "lit":
+            return literal_str(a) is not None
+        if k in ("interp", "bin"):
+            return True
+        if k == "new":
+            return False
+        tn = _simple(self.type_of(a))
+        return not tn or tn == "string"
+
+    def _not_log_message(self, a: Any, later_template: bool = True) -> bool:
         """An argument that is certainly not the message template: LogLevel, EventId, an exception, null or a
-        number. An unknown-typed variable counts as an exception only when it is named like one."""
+        number. An unknown-typed variable counts as an exception / level / event id only when it is named like
+        one AND a later argument can be the template; alone, it is the message."""
         if not isinstance(a, dict):
             return True
         k = a.get("k")
@@ -466,8 +482,8 @@ class _Analysis:
         tn = _simple(self.type_of(a))
         if tn in ("eventid", "loglevel") or tn.endswith("exception"):
             return True
-        return k == "name" and not tn and bool(_EXC_NAME_RE.match(a.get("id") or "")
-                                               or _LEVEL_NAME_RE.match(a.get("id") or ""))
+        return (k == "name" and not tn and later_template
+                and bool(_EXC_NAME_RE.match(a.get("id") or "") or _LEVEL_NAME_RE.match(a.get("id") or "")))
 
     def _log_message_index(self, args: list, skip_first: bool) -> int | None:
         """Index of the message-template argument: the first one that is not a level / event id / exception.
@@ -475,7 +491,8 @@ class _Analysis:
         for i, a in enumerate(args):
             if i == 0 and skip_first:
                 continue
-            if not self._not_log_message(a):
+            later = any(self._can_be_template(b) for b in args[i + 1:])
+            if not self._not_log_message(a, later):
                 return i
         return None
 

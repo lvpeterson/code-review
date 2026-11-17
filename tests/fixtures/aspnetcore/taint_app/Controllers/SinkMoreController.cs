@@ -117,6 +117,22 @@ public class SinkMoreController : ControllerBase
         return Ok();
     }
 
+    [HttpGet("level-only")]
+    public IActionResult LevelOnly()
+    {
+        var level = Request.Query["level"].ToString();
+        log.LogInformation(level);
+        return Ok();
+    }
+
+    [HttpGet("evt-only")]
+    public IActionResult EvtOnly()
+    {
+        var evt = Request.Query["evt"].ToString();
+        log.LogWarning(evt);
+        return Ok();
+    }
+
     [HttpGet("scope")]
     public IActionResult ScopeNamed(string user)
     {
