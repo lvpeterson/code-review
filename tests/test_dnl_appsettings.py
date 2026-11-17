@@ -1,6 +1,8 @@
 """appsettings*.json / launchSettings.json reader: flattening, lines, tolerant JSON, env overrides."""
 from pathlib import Path
 
+import pytest
+
 from cfgutil import make_app, prepare_model
 
 from checks.dnl.appsettings import load_settings
@@ -28,7 +30,7 @@ def test_flatten_nested_objects_and_arrays_with_lines(tmp_path):
 
 
 def test_comments_trailing_commas_bom_duplicates(tmp_path):
-    text = '﻿{\n  // line comment\n  "A": 1, /* block\n  comment */\n  "B": {"C": "x",},\n  "a": 2,\n}\n'
+    text = '\ufeff{\n  // line comment\n  "A": 1, /* block\n  comment */\n  "B": {"C": "x",},\n  "a": 2,\n}\n'
     _, s = _settings(tmp_path, {"appsettings.json": text})
     assert not any(f.error for f in s.files)
     eff = s.effective("Production")
@@ -93,3 +95,26 @@ def test_build_ctx_fills_settings_once(tmp_path):
     ctx = build_ctx(model, refs)
     assert ctx.settings is not None and ctx.settings.effective("Production")["a"].value == 1
     assert build_ctx(model, refs).settings is ctx.settings
+
+
+def test_effective_is_scoped_per_directory(tmp_path):
+    files = {"A/appsettings.json": '{"Jwt": {"Key": "weak"}}',
+             "B/appsettings.json": '{"Jwt": {"Key": "other"}}',
+             "B/appsettings.Production.json": '{"Jwt": {"Key": "strong"}}'}
+    _, s = _settings(tmp_path, files)
+    assert s.scopes() == ["A", "B"]
+    assert s.effective("Production", "A")["jwt:key"].value == "weak"     # not masked by B's Production file
+    assert s.effective("Production", "B")["jwt:key"].value == "strong"
+    assert s.effective("Development", "B")["jwt:key"].value == "other"   # two bases stay distinct
+    assert [e.value for e in s.entries(None, "A")] == ["weak"]
+    with pytest.raises(ValueError):
+        s.effective("Production")
+
+
+def test_unscoped_effective_single_directory_and_launch_scope(tmp_path):
+    ls = '{"profiles": {"P": {"environmentVariables": {"A__B": "1"}}}}'
+    _, s = _settings(tmp_path, {"appsettings.json": '{"A": 1}', "Properties/launchSettings.json": ls})
+    assert s.scopes() == [""]                      # launchSettings does not add a scope
+    assert s.effective("Production")["a"].value == 1
+    assert s.effective("Production", "")["a"].value == 1
+    assert [e.key for e in s.entries("launch", "")] == ["A:B"]

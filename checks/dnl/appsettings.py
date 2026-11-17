@@ -9,6 +9,7 @@ that cannot be read is never skipped quietly: it carries an `error` and becomes 
 from __future__ import annotations
 
 import json
+import posixpath
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,16 +45,35 @@ class SettingsFile:
 class Settings:
     files: list[SettingsFile] = field(default_factory=list)
 
-    def entries(self, env: str | None = None) -> list[Entry]:
-        """Raw entries of the files for one environment (None = the base files)."""
-        want = env.lower() if env is not None else None
-        return [e for f in self.files if (f.env.lower() if f.env is not None else None) == want
-                for e in f.entries]
+    @staticmethod
+    def _dir(f: SettingsFile) -> str:
+        """The app directory a file belongs to: launchSettings.json sits in <app>/Properties."""
+        d = posixpath.dirname(f.path)
+        return posixpath.dirname(d) if f.env == "launch" else d
 
-    def effective(self, env: str) -> dict[str, Entry]:
-        """Lower-cased key -> the winning entry: base files, overridden by appsettings.<env>.json."""
+    def scopes(self) -> list[str]:
+        """Distinct directories holding appsettings files (one per app), sorted; "" is the root."""
+        return sorted({self._dir(f) for f in self.files if f.env != "launch"})
+
+    def _pick(self, env: str | None, scope: str | None) -> list[SettingsFile]:
+        want = env.lower() if env is not None else None
+        return [f for f in self.files if (f.env.lower() if f.env is not None else None) == want
+                and (scope is None or self._dir(f) == scope)]
+
+    def entries(self, env: str | None = None, scope: str | None = None) -> list[Entry]:
+        """Raw entries of the files for one environment (None = the base files), optionally of one app dir."""
+        return [e for f in self._pick(env, scope) for e in f.entries]
+
+    def effective(self, env: str, scope: str | None = None) -> dict[str, Entry]:
+        """Lower-cased key -> the winning entry: base file, overridden by appsettings.<env>.json, of ONE
+        app directory (.NET reads each app's own content root). Unscoped is allowed only when a single
+        directory holds settings files; merging several apps would hide one app's value behind another's."""
+        if scope is None:
+            dirs = self.scopes()
+            if len(dirs) > 1:
+                raise ValueError(f"settings files in {len(dirs)} directories ({', '.join(dirs)}); pass scope=")
         out: dict[str, Entry] = {}
-        for e in self.entries(None) + self.entries(env):
+        for e in self.entries(None, scope) + self.entries(env, scope):
             out[e.key.lower()] = e
         return out
 
@@ -81,7 +101,7 @@ class _Parser:
             if c == "\n":
                 self.line += 1
                 self.i += 1
-            elif c in " \t\r﻿":
+            elif c in " \t\r\ufeff":
                 self.i += 1
             elif t.startswith("//", self.i):
                 while self.i < len(t) and t[self.i] != "\n":
