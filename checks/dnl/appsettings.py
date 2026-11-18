@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import posixpath
 import re
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -277,7 +278,12 @@ def load_settings(model: ProjectModel) -> Settings:
         name = path.name
         m = _APPSETTINGS.match(name)
         launch = name.lower() == "launchsettings.json" and rel.parent.name.lower() == "properties"
-        if not (m or launch) or not model.owns(path):
+        if not (m or launch):
+            continue
+        # Ownership is decided by the file's directory when it is a symlink: resolving the link itself would
+        # follow it out of the repo and the file would look unowned (silently skipped, no note).
+        probe = path.parent / "_" if path.is_symlink() else path
+        if not model.owns(probe):
             continue
         env = "launch" if launch else m.group("env")
         # A symlink (a device or a file outside the repo) or a huge file is never read: it could hang the scan.
@@ -285,8 +291,12 @@ def load_settings(model: ProjectModel) -> Settings:
         try:
             if path.is_symlink():
                 skip = "is a symbolic link"
-            elif path.stat().st_size > _MAX_BYTES:
-                skip = f"is larger than {_MAX_BYTES // (1024 * 1024)} MB"
+            else:
+                st = path.stat()
+                if not stat.S_ISREG(st.st_mode):
+                    skip = "is not a regular file"
+                elif st.st_size > _MAX_BYTES:
+                    skip = f"is larger than {_MAX_BYTES // (1024 * 1024)} MB"
         except OSError as ex:
             skip = f"could not be inspected ({ex})"
         if skip:

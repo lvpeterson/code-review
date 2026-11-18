@@ -140,3 +140,15 @@ def test_symlinked_settings_file_is_skipped_with_a_note(tmp_path):
     s = load_settings(model)
     assert [f.path for f in s.files] == ["appsettings.Production.json"]
     assert any("appsettings.json" in n and "symbolic link" in n for n in model.notes)
+
+
+def test_fifo_settings_file_is_skipped_with_a_note(tmp_path):
+    import os
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("named pipes are not available here")
+    root = make_app(tmp_path, {"appsettings.Production.json": '{"B": 1}'})
+    os.mkfifo(root / "appsettings.json")
+    model, _ = prepare_model(root, degraded=True)
+    s = load_settings(model)
+    assert [f.path for f in s.files] == ["appsettings.Production.json"]
+    assert any("appsettings.json" in n and "not a regular file" in n for n in model.notes)
