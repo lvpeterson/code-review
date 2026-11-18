@@ -205,6 +205,20 @@ def _is_null(e) -> bool:
     return isinstance(e, dict) and e.get("k") == "lit" and e.get("v") is None
 
 
+_REGISTER_CALLS = frozenset({
+    "Add", "AddSingleton", "AddScoped", "AddTransient", "TryAdd", "TryAddSingleton", "TryAddScoped",
+    "TryAddTransient", "TryAddEnumerable", "Replace", "AddKeyedSingleton", "AddKeyedScoped", "AddKeyedTransient",
+    "TryAddKeyedSingleton", "TryAddKeyedScoped", "TryAddKeyedTransient", "RemoveAll", "Decorate"})
+# Service types whose replacement or extension can change enforcement for every route.
+_AUTHZ_SERVICE_TYPES = (
+    "IPolicyEvaluator", "IAuthorizationMiddlewareResultHandler", "IAuthorizationService",
+    "IAuthorizationHandlerProvider", "IAuthorizationEvaluator", "IApplicationModelProvider",
+    "IPageApplicationModelProvider", "IApplicationModelConvention", "IControllerModelConvention",
+    "IActionModelConvention", "IParameterModelConvention", "IPageApplicationModelConvention",
+    "IPageConvention", "IPageRouteModelConvention", "IFilterProvider",
+    "IActionDescriptorProvider", "IActionDescriptorChangeProvider")
+
+
 def _is_true(e) -> bool:
     return isinstance(e, dict) and e.get("k") == "lit" and e.get("v") is True
 
@@ -465,19 +479,70 @@ class _Pol:
         return "; ".join(self.never)
 
 
+def _shape(e):
+    """An expression with its line numbers removed, for comparing two expressions by content."""
+    if isinstance(e, dict):
+        return {k: _shape(v) for k, v in e.items() if k not in ("line", "end_line")}
+    if isinstance(e, list):
+        return [_shape(x) for x in e]
+    return e
+
+
+def _const_bool(e) -> bool | None:
+    """The constant value of a boolean expression, or None when it is not constant. Folds literals, `!`,
+    `&&` / `||` (a constant operand that decides the result is enough: `true || x` is true, `false && x`
+    false), `default(bool)`, comparisons of two literals of one type, and the tautology `x || !x`."""
+    if not isinstance(e, dict):
+        return None
+    k = e.get("k")
+    if k == "lit":
+        return e["v"] if isinstance(e.get("v"), bool) and e.get("t", "bool") == "bool" else None
+    if k == "unknown":
+        return False if re.fullmatch(r"\s*default\s*\(\s*(?:bool|System\.Boolean|Boolean)\s*\)\s*", e.get("text") or "") else None
+    if k == "unary" and e.get("op") == "!":
+        v = _const_bool(e.get("e"))
+        return None if v is None else not v
+    if k != "bin":
+        return None
+    op, l, r = e.get("op"), e.get("l"), e.get("r")
+    if op in ("&&", "and", "andalso", "||", "or", "orelse"):
+        lv, rv = _const_bool(l), _const_bool(r)
+        if op in ("||", "or", "orelse"):
+            if lv is True or rv is True:
+                return True
+            if lv is False and rv is False:
+                return False
+            for a, b in ((l, r), (r, l)):
+                if isinstance(b, dict) and b.get("k") == "unary" and b.get("op") == "!" and _shape(b.get("e")) == _shape(a):
+                    return True
+            return None
+        if lv is False or rv is False:
+            return False
+        return True if lv is True and rv is True else None
+    if op in ("==", "!=") and isinstance(l, dict) and isinstance(r, dict) and l.get("k") == "lit" == r.get("k"):
+        if l.get("t") == r.get("t") and l.get("t") in ("number", "string", "bool"):
+            eq = l.get("v") == r.get("v")
+            return eq if op == "==" else not eq
+    return None
+
+
+def _true_expr(e) -> bool:
+    return _is_true(e) or _const_bool(e) is True
+
+
 def _always_true_lambda(e) -> bool:
     if not (isinstance(e, dict) and e.get("k") == "lambda"):
         return False
     body = e.get("body")
     if isinstance(body, list):
         rets = [n for n in walk(body) if n.get("k") == "return"]
-        return bool(rets) and all(_is_true(r.get("value")) or _from_result_true(r.get("value")) for r in rets)
-    return _is_true(body) or _from_result_true(body)
+        return bool(rets) and all(_true_expr(r.get("value")) or _from_result_true(r.get("value")) for r in rets)
+    return _true_expr(body) or _from_result_true(body)
 
 
 def _from_result_true(e) -> bool:
     return (isinstance(e, dict) and e.get("k") == "call" and call_name(e) == "FromResult"
-            and len(e.get("args") or []) == 1 and _is_true(e["args"][0]))
+            and len(e.get("args") or []) == 1 and _true_expr(e["args"][0]))
 
 
 def _policy_extension(model: ProjectModel, name: str) -> MethodIR | None:
@@ -836,6 +901,18 @@ def _build_settings(model: ProjectModel, pipe: Pipeline) -> _Settings:
                                                  if isinstance(v, str))):
             if S.provider is None:
                 S.provider = _Fact({}, base is True, file, line)
+
+        # A replaced authorization service or an application-model hook can change what every route enforces
+        # (or add an anonymous opt-out the engine never sees): any registration of one blocks PROTECTED.
+        if c.name in _REGISTER_CALLS:
+            nested = list(walk([node.get("args"), node.get("named")]))
+            reg_text = " ".join(targs) + " " + " ".join(
+                [str(v) for n in nested for v in n.values() if isinstance(v, str)]
+                + [str(t) for n in nested if isinstance(n.get("fn"), dict) for t in n["fn"].get("targs") or []])
+            hit = next((t for t in _AUTHZ_SERVICE_TYPES if re.search(rf"(?<![\w]){t}(?![\w])", reg_text)), None)
+            if hit:
+                S.blockers.append((f"{hit} is registered at {file}:{line}; a custom implementation can change "
+                                   "what authorization enforces", None))
 
         # AuthorizationBuilder chain: AddPolicy("n", ...), SetFallbackPolicy(p), ...
         if builder_ctx and c.name in _POLICY_DEFS | {"SetDefaultPolicy", "SetFallbackPolicy"}:
