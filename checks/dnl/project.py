@@ -53,6 +53,10 @@ class Project:
     # A multi-targeted SDK project (effective TargetFrameworks hold a net4x and a modern moniker):
     # `profile` / `owner` stay the primary (netcore) values, `profiles` / `owners` hold both.
     multi: bool = False
+    # The unconditional TargetFrameworks (what decides profile/owner) and the project's own
+    # unconditional DefineConstants: the preprocessor symbols of each build derive from them.
+    effective_tfms: list[str] = field(default_factory=list)
+    define_constants: list[str] = field(default_factory=list)
     global_usings: list[str] = field(default_factory=list)
     # SDK globbing inputs: `<Compile Remove>` patterns and EnableDefaultCompileItems.
     compile_remove: list[str] = field(default_factory=list)
@@ -72,6 +76,20 @@ class Project:
     def owners(self) -> set[str]:
         """Every package that analyzes this project's code (both for a multi-targeted project)."""
         return {"dotnet", "dotnet_legacy"} if self.multi else {self.owner}
+
+    def defines(self, profile: str) -> list[str]:
+        """C# preprocessor symbols for the build of this project under profile: the symbols of its
+        highest target framework of that profile, TRACE, and the project's DefineConstants."""
+        return sorted(symbols_for_tfm(self._tfm_for(profile)) | {"TRACE"} | set(self.define_constants))
+
+    def _tfm_for(self, profile: str) -> str:
+        cands = [t for t in self.effective_tfms if profile_for([t]) == profile and _parse_tfm(t) is not None]
+        if cands:
+            return max(cands, key=lambda t: _parse_tfm(t)[1])
+        if profile == "net48":
+            m = re.match(r"v(\d)\.(\d)(?:\.(\d))?$", self.target_framework or "")
+            return "net" + "".join(g for g in m.groups() if g) if m else "net48"
+        return "net8.0"
 
     @property
     def is_sdk(self) -> bool:
@@ -119,6 +137,8 @@ class ProjectModel:
 
         def mine(rel: str) -> bool:
             proj = self.project_of(rel)
+            if owner == "dotnet" and proj is not None and proj.multi and proj.language == "vb":
+                return False    # VB on modern .NET is not analyzed: only the legacy view holds it
             # A file no project lists stays with the legacy package (the old behaviour).
             return owner in (proj.owners if proj is not None else {"dotnet_legacy"})
 
@@ -126,7 +146,8 @@ class ProjectModel:
             # The legacy view of a multi-targeted project reads the net48 build's IR.
             return self.alt_files.get(rel, f) if owner == "dotnet_legacy" else f
 
-        v = ProjectModel(self.root, [p for p in self.projects if owner in p.owners],
+        v = ProjectModel(self.root, [p for p in self.projects if owner in p.owners
+                          and not (owner == "dotnet" and p.multi and p.language == "vb")],
                          {rel: file_ir(rel, f) for rel, f in self.files.items() if mine(rel)},
                          self.degraded, self.notes, vb_files=[r for r in self.vb_files if mine(r)],
                          parent=self, owner=owner)
@@ -156,6 +177,8 @@ class ProjectModel:
             here = path.resolve()
             hits = [(p, d) for p, d in dirs if here.is_relative_to(d)]
             proj = max(hits, key=lambda pd: len(pd[1].parts), default=(None, None))[0]
+        if self.owner == "dotnet" and proj is not None and proj.multi and proj.language == "vb":
+            return False
         return self.owner in (proj.owners if proj is not None else {"dotnet_legacy"})
 
     def iter_files(self, extensions: tuple[str, ...]) -> Iterator[Path]:
@@ -270,6 +293,64 @@ def profile_for(tfms: list[str]) -> str:
         if not m and not _TFM_FRAMEWORK.match(tfm):
             return "netcore"  # an unknown moniker on an SDK project is modern .NET
     return "net48"
+
+
+_FW_VERSIONS = [(2, 0), (3, 0), (3, 5), (4, 0), (4, 0, 3), (4, 5), (4, 5, 1), (4, 5, 2), (4, 6), (4, 6, 1),
+                (4, 6, 2), (4, 7), (4, 7, 1), (4, 7, 2), (4, 8), (4, 8, 1)]
+_COREAPP_VERSIONS = [(1, 0), (1, 1), (2, 0), (2, 1), (2, 2), (3, 0), (3, 1)]
+_STANDARD_VERSIONS = [(1, 0), (1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (2, 0), (2, 1)]
+
+
+def _parse_tfm(tfm: str) -> tuple[str, tuple[int, ...]] | None:
+    """(family, version) of a moniker: fw (net4x, undotted), coreapp, std, net (net5.0+); None if unknown."""
+    t = tfm.strip().lower().split("-")[0]
+    if m := re.fullmatch(r"net(\d{2,3})", t):
+        return "fw", tuple(int(c) for c in m.group(1))
+    for fam, pat in (("coreapp", r"netcoreapp(\d+)\.(\d+)"), ("std", r"netstandard(\d+)\.(\d+)"),
+                     ("net", r"net(\d+)\.(\d+)")):
+        if m := re.fullmatch(pat, t):
+            return fam, (int(m.group(1)), int(m.group(2)))
+    return None
+
+
+def symbols_for_tfm(tfm: str) -> set[str]:
+    """The preprocessor symbols the SDK defines for one target framework moniker."""
+    parsed = _parse_tfm(tfm)
+    if parsed is None:
+        return set()
+    fam, ver = parsed
+    out: set[str] = set()
+    if fam == "fw":
+        out |= {"NETFRAMEWORK", "NET" + "".join(map(str, ver))}
+        out |= {"NET" + "".join(map(str, v)) + "_OR_GREATER" for v in _FW_VERSIONS if v <= ver}
+    elif fam == "std":
+        out |= {"NETSTANDARD", f"NETSTANDARD{ver[0]}_{ver[1]}"}
+        out |= {f"NETSTANDARD{a}_{b}_OR_GREATER" for a, b in _STANDARD_VERSIONS if (a, b) <= ver}
+    else:
+        out.add("NETCOREAPP")
+        if fam == "coreapp":
+            out.add(f"NETCOREAPP{ver[0]}_{ver[1]}")
+            out |= {f"NETCOREAPP{a}_{b}_OR_GREATER" for a, b in _COREAPP_VERSIONS if (a, b) <= ver}
+        else:
+            out |= {"NET", f"NET{ver[0]}_{ver[1]}", f"NET{ver[0]}_{ver[1]}_OR_GREATER"}
+            out |= {f"NET{m}_0_OR_GREATER" for m in range(5, ver[0] + 1)}
+            out |= {f"NETCOREAPP{a}_{b}_OR_GREATER" for a, b in _COREAPP_VERSIONS}
+    return out
+
+
+_DEFINE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _define_constants(tree) -> list[str]:
+    """DefineConstants of the unconditional PropertyGroups; `$(...)` references and invalid names dropped."""
+    out: list[str] = []
+    for pg in tree.iter():
+        if _local(pg.tag) != "PropertyGroup" or pg.get("Condition"):
+            continue
+        for el in pg:
+            if _local(el.tag) == "DefineConstants" and el.text and not el.get("Condition"):
+                out += [d.strip() for d in re.split(r"[;,]", el.text) if _DEFINE_NAME.match(d.strip())]
+    return sorted(set(out))
 
 
 def is_multi_target(tfms: list[str]) -> bool:
@@ -575,6 +656,7 @@ def _load_project(path: Path, notes: list[str], root: Path | None = None) -> Pro
         if sdk:
             proj.profile = "netcore"
         return proj
+    proj.define_constants = _define_constants(tree)
     exts = (_LANG_EXT[proj.language],)
     missing: dict[str, list[str]] = {}
     for el in tree.iter():
@@ -623,6 +705,7 @@ def _load_project(path: Path, notes: list[str], root: Path | None = None) -> Pro
         if facts.effective:
             proj.profile = profile_for(facts.effective)
             proj.multi = is_multi_target(facts.effective)
+            proj.effective_tfms = list(facts.effective)
         else:
             proj.profile = "netcore"
             why = ("TargetFramework could not be resolved" if facts.unresolved else
@@ -681,7 +764,7 @@ def load_projects(root: Path, notes: list[str] | None = None) -> list[Project]:
                 continue
             seen.add(f.resolve())
             p.compile_files.append(f)
-        if p.language == "vb" and p.profile == "netcore":
+        if p.language == "vb" and p.profile == "netcore" and not p.multi:
             notes.append(f"{p.path.name}: Visual Basic on modern .NET is not analyzed")
     claimed = {f.resolve() for p in projects for f in p.compile_files}
     for lang, ext in _LANG_EXT.items():
@@ -714,7 +797,7 @@ def _request(projects: list[Project]) -> list[dict]:
     sent: set[Path] = set()
     out = []
     for p in projects:
-        if p.language == "vb" and p.owner == "dotnet":
+        if p.language == "vb" and p.owner == "dotnet" and not p.multi:
             continue
         ext = _LANG_EXT[p.language]
         files = []
@@ -729,11 +812,19 @@ def _request(projects: list[Project]) -> list[dict]:
                 req["imports"] = list(p.imports)
             if p.profile == "netcore":
                 req["global_usings"] = list(p.global_usings)
-            out.append(req)
+            if p.language == "cs":
+                req["defines"] = p.defines(p.profile)
+            if not (p.multi and p.language == "vb"):    # VB on modern .NET is not analyzed: net4x build only
+                out.append(req)
             if p.multi:
                 # The same files again under the net48 profile (no implicit usings), for the legacy view.
-                out.append({"name": p.name + ALT_SUFFIX, "language": p.language, "files": list(files),
-                            "references": sorted(p.references), "refs": "net48"})
+                alt = {"name": p.name + ALT_SUFFIX, "language": p.language, "files": list(files),
+                       "references": sorted(p.references), "refs": "net48"}
+                if p.language == "cs":
+                    alt["defines"] = p.defines("net48")
+                else:
+                    alt["imports"] = list(p.imports)
+                out.append(alt)
     return out
 
 
@@ -756,7 +847,7 @@ def _degraded_files(root: Path, projects: list[Project], notes: list[str]) -> tu
     files: dict[str, FileIR] = {}
     vb: list[str] = []
     for req in _request(projects):
-        if req["name"].endswith(ALT_SUFFIX):
+        if req["name"].endswith(ALT_SUFFIX) and req["language"] != "vb":
             continue  # degraded IR has no symbols: one lowering serves both views
         for f in req["files"]:
             path = Path(f)
@@ -816,9 +907,17 @@ def prepare(target: Path, allow_degraded: bool) -> ProjectModel:
                 notes.append(f"{obj.get('path', '?')}: {obj.get('error', 'no IR produced')}")
             elif fir.project.endswith(ALT_SUFFIX):
                 fir.project = fir.project[:-len(ALT_SUFFIX)]
-                alt[fir.path] = fir
+                # VB has no netcore entry (not analyzed on modern .NET): its net48 IR is the primary one.
+                (files if fir.language == "vb" else alt)[fir.path] = fir
             else:
                 files[fir.path] = fir
+        for p in projects:
+            if p.multi and p.language == "cs":
+                for f in p.compile_files:
+                    rel = Path(f).resolve().relative_to(root).as_posix() if Path(f).resolve().is_relative_to(root) else None
+                    if rel in files and rel not in alt:
+                        notes.append(f"{rel}: no net48 IR for this multi-target file; the legacy view reuses "
+                                     "the netcore parse (symbol resolution may differ)")
         model = ProjectModel(root, projects, files, None, notes, alt_files=alt)
     _CACHE[root] = model
     return model

@@ -36,8 +36,11 @@ internal sealed class CSharpLowering
         this.sem = sem;
     }
 
-    public static SyntaxTree Parse(string source, string path) =>
-        CSharpSyntaxTree.ParseText(SourceText.From(source), ParseOptions, path);
+    /// <summary>Parses with the request's preprocessor symbols (none when null), so `#if NETFRAMEWORK`
+    /// style branches follow the project's target framework. The compilation reuses each tree's options.</summary>
+    public static SyntaxTree Parse(string source, string path, IReadOnlyList<string>? defines = null) =>
+        CSharpSyntaxTree.ParseText(SourceText.From(source),
+            defines is { Count: > 0 } ? ParseOptions.WithPreprocessorSymbols(defines) : ParseOptions, path);
 
     public static void WriteFile(IrWriter w, string path, string project, SyntaxTree tree, Semantics? sem)
     {

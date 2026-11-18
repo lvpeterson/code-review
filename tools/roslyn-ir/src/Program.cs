@@ -125,6 +125,12 @@ internal static class Program
                 foreach (var g in gus.EnumerateArray())
                     if (g.GetString() is { Length: > 0 } gns) usings.Add(gns);
 
+            // Optional C# preprocessor symbols (the target framework's, plus DefineConstants).
+            var defines = new List<string>();
+            if (project.TryGetProperty("defines", out var defs) && defs.ValueKind == JsonValueKind.Array)
+                foreach (var d in defs.EnumerateArray())
+                    if (d.GetString() is { Length: > 0 } dn) defines.Add(dn);
+
             // Pass 1: read and parse every file; a failure costs only that file.
             var files = new List<(string Rel, SyntaxTree? Tree, string? Error)>();
             foreach (var f in project.GetProperty("files").EnumerateArray())
@@ -134,7 +140,7 @@ internal static class Program
                 try
                 {
                     string source = SourceDecoder.Decode(File.ReadAllBytes(Path.Combine(root, file)));
-                    files.Add((rel, ParseTree(language, source, rel), null));
+                    files.Add((rel, ParseTree(language, source, rel, defines), null));
                 }
                 catch (Exception ex)
                 {
@@ -187,9 +193,9 @@ internal static class Program
         }
     }
 
-    static SyntaxTree ParseTree(string language, string source, string path) => language switch
+    static SyntaxTree ParseTree(string language, string source, string path, IReadOnlyList<string>? defines = null) => language switch
     {
-        "cs" => CSharpLowering.Parse(source, path),
+        "cs" => CSharpLowering.Parse(source, path, defines),
         "vb" => VbLowering.Parse(source, path),
         _ => throw new NotSupportedException($"unsupported language '{language}' (expected cs or vb)"),
     };

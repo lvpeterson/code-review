@@ -427,8 +427,8 @@ def test_multi_target_profile_set_and_views():
     model = project.ProjectModel(MT, projects, {})
     model.projects = projects
     old, core = model.view("dotnet_legacy"), model.view("dotnet")
-    assert {p.name for p in old.projects} == {"Multi", "Single48"}
-    assert {p.name for p in core.projects} == {"Multi", "Single80"}
+    assert {p.name for p in old.projects} == {"Multi", "Single48", "Dual", "MultiVb"}
+    assert {p.name for p in core.projects} == {"Multi", "Single80", "Dual", "Gated"}
     rel = model.rel(rels["Program.cs"])
     assert old.is_core_file(rel) is False and core.is_core_file(rel) is True
     assert core.core_project(multi) and not old.core_project(multi)
@@ -446,7 +446,8 @@ def test_multi_target_request_has_one_entry_per_profile():
     assert alt["refs"] == "net48" and "global_usings" not in alt
     assert alt["files"] == by["Multi"]["files"]
     assert by["Single48"]["refs"] == "net48" and by["Single80"]["refs"] == "netcore"
-    assert not any(n.endswith(project.ALT_SUFFIX) for n in by if n != "Multi" + project.ALT_SUFFIX)
+    assert {n for n in by if n.endswith(project.ALT_SUFFIX)} == {
+        "Multi" + project.ALT_SUFFIX, "Dual" + project.ALT_SUFFIX, "MultiVb" + project.ALT_SUFFIX}
 
 
 def _mt_keys(results, language):
@@ -493,3 +494,111 @@ def test_multi_target_both_packages_degraded(monkeypatch):
     old, core = project.get_model(MT, "dotnet_legacy"), project.get_model(MT, "dotnet")
     assert old.files["Multi/Program.cs"] is core.files["Multi/Program.cs"]
     assert any("multi-target" in n.lower() for n in old.notes)
+
+
+# -- round 1: VB multi-target, preprocessor symbols, alt-IR fallback note, per-view rule -----------
+
+def test_symbols_for_tfm():
+    s = project.symbols_for_tfm("net48")
+    assert {"NETFRAMEWORK", "NET48", "NET48_OR_GREATER", "NET472_OR_GREATER", "NET20_OR_GREATER"} <= s
+    assert "NET481_OR_GREATER" not in s and "NET" not in s and "NETCOREAPP" not in s
+    s472 = project.symbols_for_tfm("net472")
+    assert "NET472_OR_GREATER" in s472 and "NET48_OR_GREATER" not in s472
+    m = project.symbols_for_tfm("net8.0-windows")
+    assert {"NETCOREAPP", "NET", "NET8_0", "NET8_0_OR_GREATER", "NET5_0_OR_GREATER", "NETCOREAPP3_1_OR_GREATER",
+            "NETCOREAPP1_0_OR_GREATER"} <= m
+    assert "NET9_0_OR_GREATER" not in m and "NETFRAMEWORK" not in m
+    c = project.symbols_for_tfm("netcoreapp3.1")
+    assert "NETCOREAPP3_1" in c and "NETCOREAPP2_1_OR_GREATER" in c and "NET" not in c
+    n = project.symbols_for_tfm("netstandard2.0")
+    assert {"NETSTANDARD", "NETSTANDARD2_0", "NETSTANDARD2_0_OR_GREATER", "NETSTANDARD1_6_OR_GREATER"} <= n
+    assert "NETSTANDARD2_1_OR_GREATER" not in n and "NET" not in n
+
+
+def test_project_defines_per_profile():
+    projects = load_projects(MT)
+    dual, gated = _by_name(projects, "Dual"), _by_name(projects, "Gated")
+    legacy, core = set(dual.defines("net48")), set(dual.defines("netcore"))
+    assert {"NETFRAMEWORK", "NET48", "TRACE", "CUSTOM_FLAG"} <= legacy and "NET8_0_OR_GREATER" not in legacy
+    assert {"NET8_0", "NET8_0_OR_GREATER", "TRACE", "CUSTOM_FLAG"} <= core and "NETFRAMEWORK" not in core
+    # conditional property groups are ignored; `$(...)` references are dropped
+    assert "DEBUG_ONLY" not in legacy | core and "DEBUG" not in legacy | core
+    assert not any("$(" in d for d in legacy | core)
+    assert "NET8_0_OR_GREATER" in gated.defines("netcore")
+    by = {r["name"]: r for r in project._request(projects)}
+    assert "NETFRAMEWORK" in by["Dual" + project.ALT_SUFFIX]["defines"]
+    assert "NET8_0_OR_GREATER" in by["Dual"]["defines"] and "NETFRAMEWORK" not in by["Dual"]["defines"]
+
+
+def test_vb_multi_target_requests_only_net48_entry():
+    projects = load_projects(MT)
+    vb = _by_name(projects, "MultiVb")
+    assert vb.multi and vb.language == "vb"
+    names = [r["name"] for r in project._request(projects)]
+    assert "MultiVb" + project.ALT_SUFFIX in names and "MultiVb" not in names
+
+
+def test_vb_multi_target_no_modern_vb_note():
+    notes: list[str] = []
+    load_projects(MT, notes)
+    assert not any("Visual Basic on modern" in n and "MultiVb" in n for n in notes), notes
+
+
+def _vb_multi_check():
+    results = enumerator.enumerate_target(MT)
+    legacy = [k for k in _mt_keys(results, "dotnet_legacy") if k[1].startswith("MultiVb/")]
+    assert legacy, "legacy package must scan the multi-target VB project"
+    # (project-file findings such as end-of-support are reported per package; VB code is legacy-only)
+    assert not [k for k in _mt_keys(results, "dotnet") if k[1].startswith("MultiVb/") and k[1].endswith(".vb")]
+    core = project.get_model(MT, "dotnet")
+    assert not [f for f in list(core.files) + list(core.vb_files) if f.startswith("MultiVb/")]
+
+
+def test_vb_multi_target_scanned_by_legacy_helper(roslyn_helper):
+    _vb_multi_check()
+
+
+def test_vb_multi_target_scanned_by_legacy_degraded(monkeypatch):
+    monkeypatch.setattr(helper, "preflight", lambda target, allow_degraded: None)
+    _vb_multi_check()
+
+
+def test_preprocessor_branches_split_by_view(roslyn_helper):
+    results = enumerator.enumerate_target(MT)
+    old, core = project.get_model(MT, "dotnet_legacy"), project.get_model(MT, "dotnet")
+    old_types = {t.name.split(".")[-1] for f in old.files.values() if f.path == "Dual/Branch.cs" for t in f.types}
+    core_types = {t.name.split(".")[-1] for f in core.files.values() if f.path == "Dual/Branch.cs" for t in f.types}
+    assert old_types == {"FrameworkBranchController"}, old_types
+    assert core_types == {"CoreBranch"}, core_types
+    assert any(f.startswith("Dual/Branch.cs") for _, f, _ in _mt_keys(results, "dotnet_legacy"))
+    assert any(f.startswith("Dual/Branch.cs") for _, f, _ in _mt_keys(results, "dotnet"))
+
+
+def test_single_target_core_if_net8_or_greater(roslyn_helper):
+    results = enumerator.enumerate_target(MT)
+    assert any(f == "Gated/Program.cs" for _, f, _ in _mt_keys(results, "dotnet"))
+
+
+def test_missing_alt_ir_is_noted(roslyn_helper, monkeypatch):
+    real = helper.parse_projects
+
+    def drop_alt(binary, root, projects, **k):
+        out = real(binary, root, projects, **k)
+        return [o for o in out if not (str(o.get("project", "")).endswith(project.ALT_SUFFIX)
+                                       and o.get("path") == "Multi/Util/Hashing.cs")]
+
+    monkeypatch.setattr(helper, "parse_projects", drop_alt)
+    model = project.prepare(MT, False)
+    assert any("Multi/Util/Hashing.cs" in n and "net48" in n for n in model.notes), model.notes
+
+
+def test_core_gated_rule_differs_per_view(roslyn_helper):
+    results = enumerator.enumerate_target(MT)
+
+    def sec3(lang):
+        return [f for r in results if r.language == lang for f in r.findings
+                if f.check_id == "DNL-SEC-003" and (f.file or "").replace("\\", "/") == "Multi/Util/Creds.cs"]
+
+    legacy, core = sec3("dotnet_legacy"), sec3("dotnet")
+    assert len(legacy) == 1 and len(core) == 1
+    assert legacy[0].severity.lower() == "high" and core[0].severity.lower() == "low"
