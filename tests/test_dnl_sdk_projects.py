@@ -428,7 +428,7 @@ def test_multi_target_profile_set_and_views():
     model.projects = projects
     old, core = model.view("dotnet_legacy"), model.view("dotnet")
     assert {p.name for p in old.projects} == {"Multi", "Single48", "Dual", "MultiVb"}
-    assert {p.name for p in core.projects} == {"Multi", "Single80", "Dual", "Gated"}
+    assert {p.name for p in core.projects} == {"Multi", "Single80", "Dual", "Gated", "MultiVb"}
     rel = model.rel(rels["Program.cs"])
     assert old.is_core_file(rel) is False and core.is_core_file(rel) is True
     assert core.core_project(multi) and not old.core_project(multi)
@@ -602,3 +602,39 @@ def test_core_gated_rule_differs_per_view(roslyn_helper):
     legacy, core = sec3("dotnet_legacy"), sec3("dotnet")
     assert len(legacy) == 1 and len(core) == 1
     assert legacy[0].severity.lower() == "high" and core[0].severity.lower() == "low"
+
+
+# -- round 2 ------------------------------------------------------------------------------------
+
+def test_symbols_platform_suffix_and_classic_version():
+    s = project.symbols_for_tfm("net6.0-windows10.0.19041")
+    assert "WINDOWS" in s and "NET6_0" in s and "ANDROID" not in s
+    for tfm, sym in (("net8.0-android", "ANDROID"), ("net8.0-ios17.0", "IOS"), ("net8.0-maccatalyst", "MACCATALYST"),
+                     ("net8.0-macos", "MACOS"), ("net8.0-tvos", "TVOS"), ("net8.0-browser", "BROWSER")):
+        assert sym in project.symbols_for_tfm(tfm), tfm
+    assert "WINDOWS" not in project.symbols_for_tfm("net8.0")
+    c = project.symbols_for_tfm("v4.7.2")
+    assert {"NETFRAMEWORK", "NET472", "NET472_OR_GREATER", "NET462_OR_GREATER"} <= c
+    assert "NET48_OR_GREATER" not in c
+    assert "NET403_OR_GREATER" not in project.symbols_for_tfm("net48")
+
+
+def test_dropped_moniker_if_branch_is_noted(tmp_path):
+    d = tmp_path / "App"
+    d.mkdir()
+    (d / "App.csproj").write_text('<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup>'
+                                  '<TargetFrameworks>net6.0;net8.0</TargetFrameworks></PropertyGroup></Project>')
+    (d / "Compat.cs").write_text("class C {\n#if NET6_0\n void Old() {}\n#elif NET8_0_OR_GREATER\n void New() {}\n#endif\n}\n")
+    (d / "Plain.cs").write_text("class P {\n#if NET8_0_OR_GREATER\n void New() {}\n#endif\n}\n")
+    notes: list[str] = []
+    load_projects(tmp_path, notes)
+    hit = [n for n in notes if "App/Compat.cs" in n]
+    assert len(hit) == 1 and "NET6_0" in hit[0] and "net8.0" in hit[0], notes
+    assert not any("Plain.cs" in n for n in notes)
+
+
+def test_multi_vb_project_keeps_core_project_file_findings():
+    # DNL-SCA-003 on the net8.0 moniker of the multi-target VB project is Core's: the project stays in
+    # the Core view's projects although its VB sources are excluded.
+    results = enumerator.enumerate_target(MT)
+    assert ("DNL-SCA-003", "MultiVb/MultiVb.vbproj", 3) in set(_mt_keys(results, "dotnet"))

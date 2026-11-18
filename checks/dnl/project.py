@@ -87,8 +87,7 @@ class Project:
         if cands:
             return max(cands, key=lambda t: _parse_tfm(t)[1])
         if profile == "net48":
-            m = re.match(r"v(\d)\.(\d)(?:\.(\d))?$", self.target_framework or "")
-            return "net" + "".join(g for g in m.groups() if g) if m else "net48"
+            return self.target_framework if _parse_tfm(self.target_framework or "") else "net48"
         return "net8.0"
 
     @property
@@ -146,8 +145,7 @@ class ProjectModel:
             # The legacy view of a multi-targeted project reads the net48 build's IR.
             return self.alt_files.get(rel, f) if owner == "dotnet_legacy" else f
 
-        v = ProjectModel(self.root, [p for p in self.projects if owner in p.owners
-                          and not (owner == "dotnet" and p.multi and p.language == "vb")],
+        v = ProjectModel(self.root, [p for p in self.projects if owner in p.owners],
                          {rel: file_ir(rel, f) for rel, f in self.files.items() if mine(rel)},
                          self.degraded, self.notes, vb_files=[r for r in self.vb_files if mine(r)],
                          parent=self, owner=owner)
@@ -295,8 +293,9 @@ def profile_for(tfms: list[str]) -> str:
     return "net48"
 
 
-_FW_VERSIONS = [(2, 0), (3, 0), (3, 5), (4, 0), (4, 0, 3), (4, 5), (4, 5, 1), (4, 5, 2), (4, 6), (4, 6, 1),
+_FW_VERSIONS = [(2, 0), (3, 0), (3, 5), (4, 0), (4, 5), (4, 5, 1), (4, 5, 2), (4, 6), (4, 6, 1),
                 (4, 6, 2), (4, 7), (4, 7, 1), (4, 7, 2), (4, 8), (4, 8, 1)]
+_PLATFORMS = {"windows", "android", "ios", "maccatalyst", "macos", "tvos", "browser"}
 _COREAPP_VERSIONS = [(1, 0), (1, 1), (2, 0), (2, 1), (2, 2), (3, 0), (3, 1)]
 _STANDARD_VERSIONS = [(1, 0), (1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (2, 0), (2, 1)]
 
@@ -304,6 +303,8 @@ _STANDARD_VERSIONS = [(1, 0), (1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (2
 def _parse_tfm(tfm: str) -> tuple[str, tuple[int, ...]] | None:
     """(family, version) of a moniker: fw (net4x, undotted), coreapp, std, net (net5.0+); None if unknown."""
     t = tfm.strip().lower().split("-")[0]
+    if m := re.fullmatch(r"v(\d)\.(\d)(?:\.(\d))?", t):      # classic TargetFrameworkVersion
+        return "fw", tuple(int(g) for g in m.groups() if g)
     if m := re.fullmatch(r"net(\d{2,3})", t):
         return "fw", tuple(int(c) for c in m.group(1))
     for fam, pat in (("coreapp", r"netcoreapp(\d+)\.(\d+)"), ("std", r"netstandard(\d+)\.(\d+)"),
@@ -320,6 +321,9 @@ def symbols_for_tfm(tfm: str) -> set[str]:
         return set()
     fam, ver = parsed
     out: set[str] = set()
+    plat = re.match(r"[a-z]+", tfm.strip().lower().partition("-")[2])
+    if plat and plat.group(0) in _PLATFORMS:
+        out.add(plat.group(0).upper())
     if fam == "fw":
         out |= {"NETFRAMEWORK", "NET" + "".join(map(str, ver))}
         out |= {"NET" + "".join(map(str, v)) + "_OR_GREATER" for v in _FW_VERSIONS if v <= ver}
@@ -339,6 +343,40 @@ def symbols_for_tfm(tfm: str) -> set[str]:
 
 
 _DEFINE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*$")
+
+
+_IF_LINE = re.compile(r"^[ \t]*#[ \t]*(?:if|elif)(?![A-Za-z_])(.*)$", re.M)
+
+
+def _dropped_symbol_notes(p: Project, root: Path, notes: list[str]) -> None:
+    """The helper compiles one moniker per profile (the highest): a `#if` / `#elif` naming a symbol only a
+    dropped moniker of that profile defines is inactive there. One note per such file."""
+    if p.language != "cs" or len(p.effective_tfms) < 2:
+        return
+    for profile in p.profiles:
+        mons = [t for t in p.effective_tfms if profile_for([t]) == profile and _parse_tfm(t) is not None]
+        if len(mons) < 2:
+            continue
+        used = p._tfm_for(profile)
+        live = set(p.defines(profile))
+        dropped = set().union(*(symbols_for_tfm(t) for t in mons if t != used)) - live
+        for f in p.compile_files:
+            if f.suffix.lower() != ".cs":
+                continue
+            try:
+                text = read_source(f)
+            except OSError:
+                continue
+            names = {w for m in _IF_LINE.finditer(text) for w in re.findall(r"[A-Za-z_]\w*", m.group(1))}
+            hit = sorted(names & dropped)
+            if hit:
+                try:
+                    rel = f.resolve().relative_to(root.resolve()).as_posix()
+                except ValueError:
+                    rel = f.as_posix()
+                notes.append(f"{rel}: code under #if {', '.join(hit)} is not analysed; the helper compiled this "
+                             f"project as {used} only (other {profile} monikers: "
+                             f"{', '.join(t for t in mons if t != used)})")
 
 
 def _define_constants(tree) -> list[str]:
@@ -766,6 +804,9 @@ def load_projects(root: Path, notes: list[str] | None = None) -> list[Project]:
             p.compile_files.append(f)
         if p.language == "vb" and p.profile == "netcore" and not p.multi:
             notes.append(f"{p.path.name}: Visual Basic on modern .NET is not analyzed")
+    for p in projects:
+        if p.is_sdk and len(p.effective_tfms) > 1:
+            _dropped_symbol_notes(p, root, notes)
     claimed = {f.resolve() for p in projects for f in p.compile_files}
     for lang, ext in _LANG_EXT.items():
         loose = [f for f in iter_dnl_files(root, (ext,)) if f.resolve() not in claimed]
