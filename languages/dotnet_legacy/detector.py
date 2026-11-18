@@ -71,7 +71,7 @@ def _scan(target: Path) -> tuple[bool, set[str]]:
             legacy = is_legacy_project(text)
             # SDK-style projects on .NET Framework (net472, ...) belong here too; the
             # ones on modern .NET belong to the dotnet package.
-            if legacy or project.sdk_profile(path, target) == "net48":
+            if legacy or "net48" in project.sdk_profiles(path, target):
                 lang = True
                 if legacy and ("<HintPath>" in text or "<TargetFrameworkVersion>" in text):
                     deps = True

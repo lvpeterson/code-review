@@ -405,3 +405,91 @@ def test_unresolved_unconditional_tfm_does_not_hide_a_farther_one(tmp_path):
     assert app.owner == "dotnet_legacy" and app.target_frameworks == ["net48"]
     assert any("App.csproj" in n and "$(Nope)" in n for n in notes)
     assert not any("no TargetFramework found" in n for n in notes)
+
+
+# -- multi-targeted SDK projects (net4x + modern): analysed under both profiles ----------------
+
+MT = Path(__file__).parent / "fixtures" / "aspnetcore" / "multi_target"
+
+
+def test_multi_target_profile_set_and_views():
+    projects = load_projects(MT)
+    multi, s48, s80 = _by_name(projects, "Multi"), _by_name(projects, "Single48"), _by_name(projects, "Single80")
+    assert multi.profiles == {"net48", "netcore"}
+    # profile / owner stay deterministic single values for code that expects one.
+    assert multi.profile == "netcore" and multi.owner == "dotnet"
+    assert multi.owners == {"dotnet", "dotnet_legacy"}
+    assert s48.profiles == {"net48"} and s48.owners == {"dotnet_legacy"}
+    assert s80.profiles == {"netcore"} and s80.owners == {"dotnet"}
+    # a multi-target project's references carry the net48 build's MVC assembly names
+    assert "system.web.mvc" in multi.references
+    rels = {f.name: f for f in multi.compile_files}
+    model = project.ProjectModel(MT, projects, {})
+    model.projects = projects
+    old, core = model.view("dotnet_legacy"), model.view("dotnet")
+    assert {p.name for p in old.projects} == {"Multi", "Single48"}
+    assert {p.name for p in core.projects} == {"Multi", "Single80"}
+    rel = model.rel(rels["Program.cs"])
+    assert old.is_core_file(rel) is False and core.is_core_file(rel) is True
+    assert core.core_project(multi) and not old.core_project(multi)
+    assert old.owns(rels["Program.cs"]) and core.owns(rels["Program.cs"])
+    s48_rel = model.rel(_by_name(projects, "Single48").compile_files[0])
+    assert old.owns(MT / "Single48" / "Controllers" / "OrdersController.cs") and not core.owns(MT / "Single48" / "Controllers" / "OrdersController.cs")
+    assert not old.is_core_file(s48_rel) and not core.is_core_file(s48_rel)
+
+
+def test_multi_target_request_has_one_entry_per_profile():
+    req = project._request(load_projects(MT))
+    by = {r["name"]: r for r in req}
+    assert by["Multi"]["refs"] == "netcore" and "global_usings" in by["Multi"]
+    alt = by["Multi" + project.ALT_SUFFIX]
+    assert alt["refs"] == "net48" and "global_usings" not in alt
+    assert alt["files"] == by["Multi"]["files"]
+    assert by["Single48"]["refs"] == "net48" and by["Single80"]["refs"] == "netcore"
+    assert not any(n.endswith(project.ALT_SUFFIX) for n in by if n != "Multi" + project.ALT_SUFFIX)
+
+
+def _mt_keys(results, language):
+    return [(f.check_id, (f.file or "").replace("\\", "/"), f.line)
+            for r in results if r.language == language for f in r.findings]
+
+
+def _check_multi_target_scan():
+    results = enumerator.enumerate_target(MT)
+    legacy, core = _mt_keys(results, "dotnet_legacy"), _mt_keys(results, "dotnet")
+    # no double-reporting inside a package
+    assert len(legacy) == len(set(legacy)) and len(core) == len(set(core))
+    # the legacy package sees the net48 build's controller, and the single-target legacy project
+    assert any(f.startswith("Multi/Controllers/AccountController.cs") for _, f, _ in legacy), legacy
+    assert any(f.startswith("Single48/") for _, f, _ in legacy), legacy
+    # the Core package sees the minimal API of the net8.0 build, and the single-target Core project
+    assert any(f == "Multi/Program.cs" for _, f, _ in core), core
+    assert any(f.startswith("Single80/") for _, f, _ in core), core
+    # single-target projects stay with their own package only
+    assert not any(f.startswith("Single80/") for _, f, _ in legacy)
+    assert not any(f.startswith("Single48/") for _, f, _ in core)
+    # a rule both packages share reports the shared file once per package
+    shared_l = [k for k in legacy if k[1] == "Multi/Util/Hashing.cs"]
+    shared_c = [k for k in core if k[1] == "Multi/Util/Hashing.cs"]
+    assert shared_l and shared_c and len(shared_l) == len(set(shared_l)) and len(shared_c) == len(set(shared_c))
+    # Core's controllers of the net48-only file are not reported by Core as a Core controller route
+    return legacy, core
+
+
+def test_multi_target_both_packages_helper(roslyn_helper):
+    _check_multi_target_scan()
+    full = project.get_model(MT)
+    old, core = full.view("dotnet_legacy"), full.view("dotnet")
+    assert set(old.files) >= {"Multi/Program.cs", "Single48/Controllers/OrdersController.cs"}
+    assert set(core.files) >= {"Multi/Program.cs", "Single80/Program.cs"}
+    # each view holds the FileIR parsed under its own profile; project name is the real one
+    assert old.files["Multi/Program.cs"] is not core.files["Multi/Program.cs"]
+    assert old.files["Multi/Program.cs"].project == "Multi" == core.files["Multi/Program.cs"].project
+
+
+def test_multi_target_both_packages_degraded(monkeypatch):
+    monkeypatch.setattr(helper, "preflight", lambda target, allow_degraded: None)
+    _check_multi_target_scan()
+    old, core = project.get_model(MT, "dotnet_legacy"), project.get_model(MT, "dotnet")
+    assert old.files["Multi/Program.cs"] is core.files["Multi/Program.cs"]
+    assert any("multi-target" in n.lower() for n in old.notes)

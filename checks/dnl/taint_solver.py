@@ -736,7 +736,7 @@ def _bind_seeds(model) -> dict[str, dict[str, Taint]]:
         seeds = {}
         for t in model.types():
             proj = model.project_of(t.file)
-            if proj is None or proj.owner != "dotnet":
+            if not model.core_project(proj):
                 continue
             post = MethodIR("OnPost" if model.derives_from(t, {"PageModel"}) else "Post")
             got = _bound_origins(model, t, post, proj)

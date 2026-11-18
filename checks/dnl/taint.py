@@ -396,7 +396,7 @@ class _Analysis:
         if e.get("k") != "member":
             return None
         proj = self.model.project_of(self.t.file)
-        if proj is None or proj.owner != "dotnet":
+        if not self.model.core_project(proj):
             return None                     # legacy `HttpRequest` is System.Web's: its rows are unchanged
         name = (e.get("name") or "").lower()
         recv = self._recv(e)
@@ -426,7 +426,7 @@ class _Analysis:
 
     def _is_core_project(self) -> bool:
         proj = self.model.project_of(self.t.file)
-        return proj is not None and proj.owner == "dotnet"
+        return self.model.core_project(proj)
 
     def _sink_applies(self, sink: T.Sink) -> bool:
         """Rows tied to one family: `legacy_only` (System.Web) skips Core projects, `core_only` skips the rest."""

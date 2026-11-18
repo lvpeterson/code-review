@@ -50,6 +50,9 @@ class Project:
     framework_refs: set[str] = field(default_factory=set)
     # Reference profile the helper compiles against ("net48" | "netcore").
     profile: str = "net48"
+    # A multi-targeted SDK project (effective TargetFrameworks hold a net4x and a modern moniker):
+    # `profile` / `owner` stay the primary (netcore) values, `profiles` / `owners` hold both.
+    multi: bool = False
     global_usings: list[str] = field(default_factory=list)
     # SDK globbing inputs: `<Compile Remove>` patterns and EnableDefaultCompileItems.
     compile_remove: list[str] = field(default_factory=list)
@@ -59,6 +62,16 @@ class Project:
     def owner(self) -> str:
         """The package that analyzes this project's code."""
         return "dotnet" if self.profile == "netcore" else "dotnet_legacy"
+
+    @property
+    def profiles(self) -> set[str]:
+        """Every reference profile this project builds for."""
+        return {"net48", "netcore"} if self.multi else {self.profile}
+
+    @property
+    def owners(self) -> set[str]:
+        """Every package that analyzes this project's code (both for a multi-targeted project)."""
+        return {"dotnet", "dotnet_legacy"} if self.multi else {self.owner}
 
     @property
     def is_sdk(self) -> bool:
@@ -85,6 +98,9 @@ class ProjectModel:
     # Set on per-package views: the full model they were cut from.
     parent: ProjectModel | None = None
     owner: str | None = None
+    # Multi-targeted projects only: rel path -> the FileIR parsed under the net48 profile (the legacy
+    # view uses it; the Core view and `files` hold the netcore one).
+    alt_files: dict[str, FileIR] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Lazy indexes; built on first lookup.
@@ -104,10 +120,14 @@ class ProjectModel:
         def mine(rel: str) -> bool:
             proj = self.project_of(rel)
             # A file no project lists stays with the legacy package (the old behaviour).
-            return (proj.owner if proj is not None else "dotnet_legacy") == owner
+            return owner in (proj.owners if proj is not None else {"dotnet_legacy"})
 
-        v = ProjectModel(self.root, [p for p in self.projects if p.owner == owner],
-                         {rel: f for rel, f in self.files.items() if mine(rel)},
+        def file_ir(rel: str, f: FileIR) -> FileIR:
+            # The legacy view of a multi-targeted project reads the net48 build's IR.
+            return self.alt_files.get(rel, f) if owner == "dotnet_legacy" else f
+
+        v = ProjectModel(self.root, [p for p in self.projects if owner in p.owners],
+                         {rel: file_ir(rel, f) for rel, f in self.files.items() if mine(rel)},
                          self.degraded, self.notes, vb_files=[r for r in self.vb_files if mine(r)],
                          parent=self, owner=owner)
         self._views[owner] = v
@@ -136,7 +156,7 @@ class ProjectModel:
             here = path.resolve()
             hits = [(p, d) for p, d in dirs if here.is_relative_to(d)]
             proj = max(hits, key=lambda pd: len(pd[1].parts), default=(None, None))[0]
-        return (proj.owner if proj is not None else "dotnet_legacy") == self.owner
+        return self.owner in (proj.owners if proj is not None else {"dotnet_legacy"})
 
     def iter_files(self, extensions: tuple[str, ...]) -> Iterator[Path]:
         """Files of the scan root with these suffixes that this model's package owns."""
@@ -194,15 +214,23 @@ class ProjectModel:
 
     def is_core_file(self, rel: str) -> bool:
         """True when rel belongs to an ASP.NET Core / modern .NET project (never for legacy code)."""
-        proj = self.project_of(rel)
-        return proj is not None and proj.owner == "dotnet"
+        return self.core_project(self.project_of(rel))
+
+    def core_project(self, proj: Project | None) -> bool:
+        """True when proj is Core code as this model sees it: a multi-targeted project is legacy in the
+        legacy view and Core in the Core view (and on the full model, where its primary profile holds)."""
+        if proj is None:
+            return False
+        if proj.multi:
+            return self.owner != "dotnet_legacy"
+        return proj.owner == "dotnet"
 
     def is_core_test_file(self, rel: str) -> bool:
         """A modern .NET file of a test project: the project's own name or the folder of its project
         file is test-like (`Shop.Tests`, `MyUnitTests`, `tests`). A `Test` folder inside a production
         project does not count."""
         proj = self.project_of(rel)
-        if proj is None or proj.owner != "dotnet":
+        if not self.core_project(proj):
             return False
         return bool(_TEST_NAME.search(proj.name or "") or _TEST_NAME.search(proj.dir.name or ""))
 
@@ -242,6 +270,11 @@ def profile_for(tfms: list[str]) -> str:
         if not m and not _TFM_FRAMEWORK.match(tfm):
             return "netcore"  # an unknown moniker on an SDK project is modern .NET
     return "net48"
+
+
+def is_multi_target(tfms: list[str]) -> bool:
+    """True when the list holds both a .NET Framework and a modern moniker (`net48;net8.0`)."""
+    return len({profile_for([t]) for t in tfms if t.strip()}) > 1
 
 
 def implicit_usings(sdk: str | None) -> list[str]:
@@ -471,6 +504,15 @@ def _sdk_facts(path: Path, tree, root: Path) -> _Facts:
     return facts
 
 
+def sdk_profiles(path: Path, root: Path) -> set[str]:
+    """Every reference profile of an SDK project file (both for `net48;net8.0`)."""
+    tree = _parse_xml(path)
+    facts = _sdk_facts(path, tree, root) if tree is not None else None
+    if facts is None or not facts.effective:
+        return {"netcore"}
+    return {profile_for([t]) for t in facts.effective if t.strip()} or {"netcore"}
+
+
 def sdk_profile(path: Path, root: Path) -> str:
     """Reference profile of an SDK project file (no TargetFramework anywhere = netcore)."""
     tree = _parse_xml(path)
@@ -580,6 +622,7 @@ def _load_project(path: Path, notes: list[str], root: Path | None = None) -> Pro
                          "the project's package is inferred from the last conditional value")
         if facts.effective:
             proj.profile = profile_for(facts.effective)
+            proj.multi = is_multi_target(facts.effective)
         else:
             proj.profile = "netcore"
             why = ("TargetFramework could not be resolved" if facts.unresolved else
@@ -587,7 +630,7 @@ def _load_project(path: Path, notes: list[str], root: Path | None = None) -> Pro
             notes.append(f"{path.name}: {why}; assuming modern .NET")
         if proj.profile == "netcore":
             proj.global_usings = facts.usings
-        else:
+        if proj.profile != "netcore" or proj.multi:
             for pid, ref in _PACKAGE_REFS.items():
                 if pid in proj.packages:
                     proj.references.add(ref)
@@ -659,6 +702,11 @@ def load_projects(root: Path, notes: list[str] | None = None) -> list[Project]:
 _CACHE: dict[Path, ProjectModel] = {}
 
 
+# Name suffix of the helper request entry that compiles a multi-targeted project's files under the net48
+# profile; the IR coming back is routed to ProjectModel.alt_files and the suffix dropped again.
+ALT_SUFFIX = "@net48"
+
+
 def _request(projects: list[Project]) -> list[dict]:
     """Helper request: every project's files of its own language (legacy, SDK and
     loose), each with its reference profile; each file sent once (first project wins
@@ -682,6 +730,10 @@ def _request(projects: list[Project]) -> list[dict]:
             if p.profile == "netcore":
                 req["global_usings"] = list(p.global_usings)
             out.append(req)
+            if p.multi:
+                # The same files again under the net48 profile (no implicit usings), for the legacy view.
+                out.append({"name": p.name + ALT_SUFFIX, "language": p.language, "files": list(files),
+                            "references": sorted(p.references), "refs": "net48"})
     return out
 
 
@@ -704,6 +756,8 @@ def _degraded_files(root: Path, projects: list[Project], notes: list[str]) -> tu
     files: dict[str, FileIR] = {}
     vb: list[str] = []
     for req in _request(projects):
+        if req["name"].endswith(ALT_SUFFIX):
+            continue  # degraded IR has no symbols: one lowering serves both views
         for f in req["files"]:
             path = Path(f)
             rel = path.resolve().relative_to(root).as_posix() if path.resolve().is_relative_to(root) else path.as_posix()
@@ -724,6 +778,23 @@ def _degraded_files(root: Path, projects: list[Project], notes: list[str]) -> tu
     return files, vb
 
 
+def _share_alt_files(model: ProjectModel) -> None:
+    """Degraded mode: the tree-sitter IR carries no symbols, so the netcore IR serves the net48 view of
+    a multi-targeted project too (the source is identical; only symbol resolution would differ)."""
+    for p in model.projects:
+        if not p.multi:
+            continue
+        shared = False
+        for f in p.compile_files:
+            fir = model.files.get(model.rel(f))
+            if fir is not None:
+                model.alt_files[fir.path] = fir
+                shared = True
+        if shared:
+            model.notes.append(f"{p.path.name if p.path else p.name}: multi-target project (net4x + modern): "
+                               "the legacy and Core views share one tree-sitter parse in degraded mode")
+
+
 def prepare(target: Path, allow_degraded: bool) -> ProjectModel:
     """Preflight the helper, parse every project once and cache the model.
     Without a helper (allow_degraded) C# is lowered by tree-sitter and VB files
@@ -735,15 +806,20 @@ def prepare(target: Path, allow_degraded: bool) -> ProjectModel:
     if binary is None:
         files, vb = _degraded_files(root, projects, notes)
         model = ProjectModel(root, projects, files, helper.DEGRADED_REASON, notes, vb_files=vb)
+        _share_alt_files(model)
     else:
         files: dict[str, FileIR] = {}
+        alt: dict[str, FileIR] = {}
         for obj in helper.parse_projects(binary, root, _request(projects)):
             fir = load_file_ir(obj)
             if fir is None:
                 notes.append(f"{obj.get('path', '?')}: {obj.get('error', 'no IR produced')}")
+            elif fir.project.endswith(ALT_SUFFIX):
+                fir.project = fir.project[:-len(ALT_SUFFIX)]
+                alt[fir.path] = fir
             else:
                 files[fir.path] = fir
-        model = ProjectModel(root, projects, files, None, notes)
+        model = ProjectModel(root, projects, files, None, notes, alt_files=alt)
     _CACHE[root] = model
     return model
 

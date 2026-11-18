@@ -122,7 +122,7 @@ def _identity_entities(model: ProjectModel, t: TypeIR) -> set[str]:
     are entities although the context itself declares no DbSet for them. The IR keeps base names
     without type arguments, so the declaration is read from the source."""
     proj = model.project_of(t.file)
-    if proj is None or proj.owner != "dotnet":
+    if not model.core_project(proj):
         return set()
     try:
         lines = (model.root / t.file).read_text(encoding="utf-8", errors="replace").splitlines()
