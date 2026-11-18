@@ -46,6 +46,7 @@ class App:
         (root / "App.csproj").write_text(CSPROJ)
         (root / "Program.cs").write_text(program)
         for name, text in (files or {}).items():
+            (root / name).parent.mkdir(parents=True, exist_ok=True)
             (root / name).write_text(text)
         project._CACHE.clear()
         project.prepare(root, degraded)
@@ -312,8 +313,8 @@ public class AdminController : ControllerBase
     [HttpPost("b"), AllowAnonymous] public IActionResult ResetDatabase() => Ok();
     [HttpPost("c"), AllowAnonymous] public IActionResult TokenPurge() => Ok();
 }
-[ApiController, Route("api/ops")]
-public class OpsController : ControllerBase
+[ApiController, Route("api/help")]
+public class HelpController : ControllerBase
 {
     [HttpPost("reset-database"), AllowAnonymous] public IActionResult Run1() => Ok();
     [HttpPost("token-purge"), AllowAnonymous] public IActionResult Run2() => Ok();
@@ -325,7 +326,7 @@ public class OpsController : ControllerBase
     fs = _findings(tmp_path, mode, _program(extra=ctl))
     flagged = {f.route.handler_name for f in fs if f.check_id == "DNL-AUTHZ-002"}
     assert flagged == {"AdminController.ResetUserPassword", "AdminController.ResetDatabase", "AdminController.TokenPurge",
-                       "OpsController.Run1", "OpsController.Run2"}
+                       "HelpController.Run1", "HelpController.Run2"}
 
 
 TAGS = ("using Microsoft.AspNetCore.Mvc.ApplicationModels;\n"
@@ -466,6 +467,79 @@ public class AccountController : ControllerBase
     fs = _findings(tmp_path, mode, _program(extra=ctl))
     flagged = {f.route.handler_name for f in fs if f.check_id == "DNL-AUTHZ-002"}
     assert flagged == {"AccountController.ExportCustomers", "AccountController.Dump"}
+
+
+HDR4 = ("using Microsoft.AspNetCore.Mvc.ApplicationModels;\nusing Microsoft.AspNetCore.Mvc.Filters;\n"
+        "using Microsoft.AspNetCore.Mvc;\nusing Microsoft.AspNetCore.Authorization;\nusing System.Collections.Generic;\n")
+
+
+def _conv4(members, body):
+    return {"SneakyConvention.cs": HDR4 + f"public class SneakyConvention : IApplicationModelConvention\n{{\n{members}\n"
+            f"    public void Apply(ApplicationModel application)\n    {{\n{body}\n    }}\n}}\n"}
+
+
+EXT_ANY = ("public static class Ext { public static bool Any(this IEnumerable<ControllerModel> s, "
+           "Func<ControllerModel, bool> p) { foreach (var c in s) { c.Filters.Add(new AllowAnonymousFilter()); } return true; } }\n")
+HOLDER = ("public class Holder { public void Open(ApplicationModel m) { foreach (var c in m.Controllers) "
+          "{ c.Filters.Add(new AllowAnonymousFilter()); } } }\n")
+
+
+@pytest.mark.parametrize("members, body, extra", [
+    # R4-1: work hidden in a property accessor reached through a static field
+    ("    private static ApplicationModel? _app;\n"
+     "    private bool Trigger { get { foreach (var c in _app!.Controllers) { c.Filters.Add(new AllowAnonymousFilter()); } return true; } }",
+     "_app = application;\n        if (Trigger) { }", {}),
+    ("    private bool Trigger => Run();\n    private bool Run() { return true; }", "if (Trigger) { }", {}),
+    # R4-1: a non-literal field initialiser, a static field of a solution type
+    ("    private readonly Holder _h = new Holder();", "_h.Open(application);", {"Holder.cs": HDR4 + HOLDER}),
+    ("    private static Holder? _held;", "_held = new Holder();", {"Holder.cs": HDR4 + HOLDER}),
+    # R4-1: a framework-derived value stored in a field
+    ("    private ControllerModel? _first;", "_first = application.Controllers[0];", {}),
+    # R4-2: a solution extension shadowing a safe name
+    ("", "application.Controllers.Any(c => true);", {"Ext.cs": HDR4 + EXT_ANY}),
+    ("", "application.Controllers.Where(c => true).ToList();", {"Ext.cs": HDR4 + (
+        "public static class Ext2 { public static List<ControllerModel> ToList(this IEnumerable<ControllerModel> s) "
+        "{ foreach (var c in s) { c.Filters.Add(new AllowAnonymousFilter()); } return null!; } }\n")}),
+])
+def test_r4_only_a_plain_convention_shape_passes(tmp_path, mode, members, body, extra):
+    files = _conv4(members, body)
+    files.update(extra)
+    a = _with_convention(tmp_path, mode, "new SneakyConvention()", files)
+    assert a.state == UNKNOWN and any("Conventions.Add" in r for r in a.reasons), (members, body)
+
+
+def test_r4_plain_shapes_stay_benign(tmp_path, mode):
+    members = ("    private const string Prefix = \"v1\";\n    private static readonly int Limit = 3;\n"
+               "    public string Label { get; set; } = \"x\";")
+    body = ("foreach (var c in application.Controllers) { foreach (var s in c.Selectors) { "
+            "s.AttributeRouteModel = new AttributeRouteModel(new RouteAttribute(Prefix + \"/\" + Limit)); } }")
+    assert _with_convention(tmp_path, mode, "new SneakyConvention()", _conv4(members, body)).state == PROTECTED
+
+
+def test_r4_admin_path_segments_rule_out_the_exemption(tmp_path, mode):
+    tail = ('app.MapPost("/admin/reset-password", () => Results.Ok()).AllowAnonymous();\n'
+            'app.MapPost("/internal/login", () => Results.Ok()).AllowAnonymous();\n'
+            'app.MapPost("/account/reset-password", () => Results.Ok()).AllowAnonymous();\n')
+    fs = _findings(tmp_path, mode, _program(tail=tail))
+    flagged = {f.route.path for f in fs if f.check_id == "DNL-AUTHZ-002"}
+    assert flagged == {"/admin/reset-password", "/internal/login"}
+
+
+def test_r4_razor_handler_exemption_follows_the_page_path(tmp_path, mode):
+    page = "@page\n@model ResetPasswordModel\n"
+    model = ("using Microsoft.AspNetCore.Mvc;\nusing Microsoft.AspNetCore.Mvc.RazorPages;\n"
+             "namespace Demo.Pages.{ns};\npublic class ResetPasswordModel : PageModel\n{{\n"
+             "    public IActionResult OnPostResetPassword() => Page();\n}}\n")
+    files = {}
+    for ns in ("Account", "Admin"):
+        files[f"Pages/{ns}/ResetPassword.cshtml"] = page
+        files[f"Pages/{ns}/ResetPassword.cshtml.cs"] = model.format(ns=ns)
+    svc = ('builder.Services.AddRazorPages(o => { o.Conventions.AllowAnonymousToPage("/Account/ResetPassword"); '
+           'o.Conventions.AllowAnonymousToPage("/Admin/ResetPassword"); });\n')
+    app = App(tmp_path, mode, _program(svc, tail="app.MapRazorPages();"), files)
+    fs = rules_auth_core.check(app.model, app.refs)
+    flagged = {f.route.path for f in fs if f.check_id == "DNL-AUTHZ-002"}
+    assert flagged == {"/Admin/ResetPassword"}, flagged
 
 
 def test_d9_minimal_hosting_adds_authorization_middleware_itself(tmp_path, mode):

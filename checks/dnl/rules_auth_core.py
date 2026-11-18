@@ -39,6 +39,7 @@ login signin sign in log out register signup up logout signout token tokens refr
 password email account user users external two factor 2 fa verify code phone resend confirmation send link provider
 async post get on handle with google facebook twitter microsoft oidc oauth sso recovery recover authenticate
 """.split())
+_PRIVILEGED_SEGMENTS = frozenset("admin manage management internal ops".split())
 _FLOW_TOKENS = frozenset("login signin register signup logout signout".split())
 _UNPROTECTED = ("No [Authorize], RequireAuthorization (endpoint, group or Map call), global filter, "
                 "Razor Pages convention or fallback policy covers this route.")
@@ -71,6 +72,8 @@ def _anonymous_by_design(ref: CoreRouteRef) -> bool:
     # The action's own name must be a credential-flow name; the route only ever rules it out. Where the
     # action has no name of its own (a minimal-API lambda, an OnPost handler of a page) the route is its identity.
     action = ref.method.name if ref.method else ""
+    if action.startswith("<"):
+        action = ""         # a lambda has no name of its own
     if ref.style == "razorpage":
         action = _HANDLER_PREFIX.sub("", action)
         if action.lower() in ("", "async"):
@@ -80,6 +83,9 @@ def _anonymous_by_design(ref: CoreRouteRef) -> bool:
     if not action:
         return False
     if any(_DANGEROUS_TOKENS & set(_tokens(n)) for n in (action, leaf) if n):
+        return False
+    # A privileged-looking segment anywhere in the route rules the exemption out (`/admin/reset-password`).
+    if any(_PRIVILEGED_SEGMENTS & set(_tokens(x)) for x in segs):
         return False
     t = _tokens(action)
     if ({"user", "users"} & set(t)) and not (_FLOW_TOKENS & set(t)):

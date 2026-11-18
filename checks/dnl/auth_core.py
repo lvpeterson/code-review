@@ -1009,6 +1009,20 @@ def _convention_type_benign(model: ProjectModel, tn: str, new: dict | None, dept
             if not model.find_types(bn) or not _convention_type_benign(model, bn, None, depth + 1):
                 return False
         own = {m.name for m in t.methods}
+        solution_methods = {x.name for u in model.types() for x in u.methods}
+        # Only a plain shape passes: no accessor bodies, no non-literal initialisers, no field holding an object
+        # (the IR does not say which fields are static, so any non-primitive field blocks). Methods are scanned
+        # below; accessors and initialisers would not be.
+        if any(p.get is not None or p.set is not None for p in t.properties):
+            return False
+        if any(isinstance(p.init, dict) and p.init.get("k") != "lit" for p in t.properties):
+            return False
+        if any(f.init is not None and not f.is_const and not (isinstance(f.init, dict) and f.init.get("k") == "lit")
+               for f in t.fields):
+            return False
+        if any(_simple(f.type) not in _PRIMITIVES for f in t.fields):
+            return False
+        members = {f.name for f in t.fields} | {p.name for p in t.properties}
         # Members a convention may read: literal-initialised string / primitive fields (const or not).
         literals = {f.name for f in t.fields
                     if (f.is_const or (isinstance(f.init, dict) and f.init.get("k") == "lit"))
@@ -1037,6 +1051,13 @@ def _convention_type_benign(model: ProjectModel, tn: str, new: dict | None, dept
                 if k == "new" and _simple(n.get("type")).replace("[]", "") not in _CONVENTION_NEW_OK \
                         and not _simple(n.get("type")).endswith("Exception") and n.get("type"):
                     return False
+                if k == "assign":
+                    tgt = n.get("target")
+                    if isinstance(tgt, dict) and (
+                            (tgt.get("k") == "name" and tgt.get("id") in members)
+                            or (tgt.get("k") == "member" and _root(tgt) in ("this", "base", t.name))) \
+                            and not (isinstance(n.get("value"), dict) and n["value"].get("k") == "lit"):
+                        return False        # state kept on the convention itself
                 if k == "assign" or k == "local":
                     v = n.get("value") if k == "assign" else n.get("init")
                     if isinstance(v, dict) and v.get("k") == "lambda":
@@ -1050,7 +1071,12 @@ def _convention_type_benign(model: ProjectModel, tn: str, new: dict | None, dept
                 recv = receiver_text(fn.get("obj")) if fn.get("k") == "member" else ""
                 root = _root(fn.get("obj")) if fn.get("k") == "member" else None
                 is_own = callee in own and (fn.get("k") == "name" or recv in ("this", "base", t.name))
+                sym = n.get("sym") or fn.get("sym") or ""
                 if not is_own:
+                    # A call that is, or is named like, a method declared in the solution (extensions and static
+                    # helpers included) is that method: it is not read here, so it blocks.
+                    if callee in solution_methods or (sym and not sym.startswith(("System.", "Microsoft."))):
+                        return False
                     ok = callee in _CONVENTION_SAFE_CALLS or (
                         callee in _CONVENTION_MUTATORS and recv.split(".")[-1] in _MUTABLE_ROUTE_PARTS)
                     # Only on the model or a value derived from it (or a BCL static / literal): never on a
