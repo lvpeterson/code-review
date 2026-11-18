@@ -522,7 +522,12 @@ def _const_bool(e) -> bool | None:
         return True if lv is True and rv is True else None
     if op in ("==", "!=") and isinstance(l, dict) and isinstance(r, dict) and l.get("k") == "lit" == r.get("k"):
         if l.get("t") == r.get("t") and l.get("t") in ("number", "string", "bool"):
-            eq = l.get("v") == r.get("v")
+            lv_, rv_ = l.get("v"), r.get("v")
+            # VB `Option Compare Text` compares strings case-insensitively and the IR does not record the
+            # option: two strings that differ only in case are not constant.
+            if l.get("t") == "string" and lv_ != rv_ and str(lv_).lower() == str(rv_).lower():
+                return None
+            eq = lv_ == rv_
             return eq if op == "==" else not eq
     return None
 

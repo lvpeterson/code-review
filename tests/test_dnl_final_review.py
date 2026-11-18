@@ -63,8 +63,8 @@ def test_local_function_cors_and_cycle(tmp_path, mode):
             "  b.Services.AddCors(o => o.AddPolicy(\"a\", p => p.AllowAnyOrigin().AllowCredentials()));\n"
             "  if (b.Services == null) ConfigureServices(b);\n}\n")
     f = scan(tmp_path, {"Program.cs": prog}, mode)
+    # The recursive call terminates (the scan returns) with the finding intact.
     assert any(x.check_id == "DNL-CFG-007" for x in f), [x.check_id for x in f]
-    assert len([x for x in f if x.check_id == "DNL-CFG-007"]) >= 1      # the recursive call terminated with the finding intact
 
 
 # -- item 3: custom authorization services block PROTECTED -----------------------------------------
@@ -266,6 +266,12 @@ def test_vb_and_c_operator_spellings_fold():
     assert _const_bool(b("OrElse", x, {"k": "unary", "op": "Not", "e": x})) is True
     assert _const_bool(b("AndAlso", x, T)) is None
     assert _const_bool(b("||", call, {"k": "unary", "op": "!", "e": call})) is None
+    st = lambda v: {"k": "lit", "v": v, "t": "string"}
+    # VB `Option Compare Text`: strings differing only in case are not constant; distinct strings still fold.
+    assert _const_bool(b("=", st("a"), st("A"))) is None
+    assert _const_bool({"k": "unary", "op": "Not", "e": b("=", st("a"), st("A"))}) is None
+    assert _const_bool(b("==", st("a"), st("a"))) is True
+    assert _const_bool(b("!=", st("a"), st("b"))) is True
 
 
 def test_guarded_custom_authz_service_stays_protected_in_production(tmp_path, auth_mode):
@@ -289,5 +295,8 @@ def test_map_lambda_with_aliased_builder_adds_note(tmp_path, auth_mode):
             'app.Map("/x", api => { var b = api; b.UseDeveloperExceptionPage(); });\napp.MapGet("/", () => 1);\napp.Run();\n')
     a = App(tmp_path, auth_mode, prog, {})
     pl = pipeline_for(a.model, a.model.projects[0] if hasattr(a.model, "projects") else None)
+    found = [n for n in pl.notes if "other than its parameter" in n]
     if auth_mode:       # degraded: no symbols, so the alias cannot be resolved and the pipeline says so
-        assert any("other than its parameter" in n for n in pl.notes), pl.notes
+        assert found, pl.notes
+    else:               # helper: the symbol makes the Map a branch, so its body is walked and no note is needed
+        assert not found, pl.notes
