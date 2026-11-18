@@ -46,7 +46,7 @@ PROTECTED, ANONYMOUS, UNPROTECTED, UNKNOWN = "protected", "anonymous", "unprotec
 _NON_AUTHZ_EXTENSIONS = frozenset("""
 AddJwtBearer AddOpenIdConnect AddMicrosoftIdentityWebApi AddMicrosoftIdentityWebApp AddGoogle AddFacebook
 AddMicrosoftAccount AddNegotiate AddCertificate AddDbContext AddDbContextPool AddDbContextFactory
-AddEntityFrameworkStores AddDefaultIdentity AddIdentity AddIdentityCore AddDefaultTokenProviders AddDefaultUI
+AddEntityFrameworkStores AddDefaultIdentity AddIdentity AddIdentityCore AddIdentityApiEndpoints AddDefaultTokenProviders AddDefaultUI
 AddSwaggerGen UseSwagger UseSwaggerUI AddAutoMapper AddMediatR AddValidatorsFromAssembly
 AddFluentValidationAutoValidation AddSerilog UseSerilog UseSerilogRequestLogging AddApplicationInsightsTelemetry
 AddStackExchangeRedisCache AddHangfire AddHangfireServer AddMassTransit AddOpenTelemetry AddNewtonsoftJson
@@ -123,6 +123,24 @@ _KNOWN_DENY_REQS = frozenset("""
 DenyAnonymousAuthorizationRequirement RolesAuthorizationRequirement ClaimsAuthorizationRequirement
 NameAuthorizationRequirement AssertionRequirement
 """.split())
+# A whole-value placeholder (shared with rules_config): `{...}` only counts as a single `{identifier}`.
+PLACEHOLDER = re.compile(r"(?i)^(\$\(.*\)|\{[a-z_]\w*\}|#\{.*\}|__.*__|\*+|x+|)$")
+# Secret-key naming shared with rules_config (which re-exports aliases): a connection-string password,
+# a key that names a secret, and the words that mark a key as a setting about one (PasswordResetUrl).
+CONN_PW = re.compile(r"(?i)\b(password|pwd)\s*=\s*(\{[^}]*\}?|'[^']*'?|[^;\"]+)")
+SECRET_KEY = re.compile(r"(?i)password|pwd|secret|apikey|api_key|token|privatekey|clientsecret")
+_SETTING_WORDS = {"url", "regex", "length", "format", "minimum", "required", "attempts", "window", "policy"}
+_WORD_SPLIT = re.compile(r"[_\-. ]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def is_setting_key(key: str) -> bool:
+    """True when a word of the key (split on camelCase, `_`, `-`, `.`) names a setting:
+    `Password_Format`, `PasswordResetUrl` -- but not `InformationApiKey` ("Information"
+    merely contains "format")."""
+    return any(w.lower() in _SETTING_WORDS or w.lower().startswith("expir")
+               for w in _WORD_SPLIT.split(key) if w)
+
+
 _CTX = _Ctx()
 _UNK = ("unknown",)
 _SUPPRESS = "SuppressCheckForUnhandledSecurityMetadata"
@@ -1822,3 +1840,29 @@ def resolve(model: ProjectModel, ref: CoreRouteRef, pipe: Pipeline) -> CoreAuth:
 def policies(model: ProjectModel, pipe: Pipeline) -> dict[str, PolicyInfo]:
     """Authorization policies registered in Production (AddPolicy), by name."""
     return dict(_settings(model, pipe).policies)
+
+
+# -- sensitive handlers (shared by rules_auth_core and the CORS configuration rule) ------------------
+
+# Same patterns as the legacy rules (rules_auth).
+_SENSITIVE_CONTROLLER = re.compile(r"(?i)admin|manage|role|permission|setting|config")
+_SENSITIVE_ACTION = re.compile(r"(?i)^(delete|remove|purge|approve|grant|revoke|reset)")
+_HANDLER_PREFIX = re.compile(r"(?i)^on(get|post|put|delete|patch|head|options)")
+
+
+def _sensitive(ref: CoreRouteRef) -> bool:
+    """Controller / page / action name looks privileged (admin, manage, delete..., see rules_auth)."""
+    r = ref.route
+    if ref.type is None:
+        return False
+    tname = ref.type.name.split(".")[-1]
+    action = ref.method.name if ref.method else ""
+    if ref.style == "razorpage":
+        # A page's name is its path (/Admin/Users); a handler's is what follows OnPost.
+        name = r.path
+        action = _HANDLER_PREFIX.sub("", action)
+        if action.lower().endswith("async"):
+            action = action[: -len("async")]
+    else:
+        name = tname[: -len("controller")] if tname.lower().endswith("controller") else tname
+    return bool(_SENSITIVE_CONTROLLER.search(name) or _SENSITIVE_ACTION.search(action))

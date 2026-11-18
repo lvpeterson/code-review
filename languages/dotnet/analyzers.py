@@ -13,8 +13,8 @@ import sys
 from pathlib import Path
 
 from checks.dnl import (project, routes_core, rules_auth_core, rules_crypto, rules_deser_xml, rules_errors,
-                        rules_integrity, rules_misc, rules_object, rules_sca_core, rules_session, rules_taint,
-                        rules_xss)
+                        rules_integrity, rules_misc, rules_object, rules_pipeline, rules_sca_core, rules_session,
+                        rules_taint, rules_xss)
 from checks.dnl.project import ProjectModel
 from core.base import BaseFrameworkAnalyzer
 from core.models import Finding, Route, ScanResult
@@ -67,6 +67,7 @@ def _code_results(model: ProjectModel) -> dict[str, tuple[list[Route], list[Find
             return []
 
     findings += guarded("rules_auth_core", lambda: rules_auth_core.check(model, refs))
+    findings += guarded("rules_pipeline", lambda: rules_pipeline.check(model, refs))
     findings += guarded("rules_taint", lambda: rules_taint.check(model, refs))
     findings += guarded("rules_xss", lambda: rules_xss.check(model, refs))
     findings += guarded("rules_object", lambda: rules_object.check(model, refs))
