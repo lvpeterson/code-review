@@ -976,3 +976,57 @@ def test_builder_handed_to_a_followed_helper_is_read(tmp_path, mode):
 def test_builder_stored_and_configured_in_place_is_firm(tmp_path, mode):
     services = 'var dp = builder.Services.AddDataProtection();\ndp.PersistKeysToFileSystem(new DirectoryInfo("/keys"));'
     assert ("DNL-CRY-009", "low", None) in ids(_dp(tmp_path, mode, services))
+
+
+# -- INV-004 fix round: deprecation ties, path prefix, unread versioning ----------------------------------
+
+def _depr(controller_expr="o.Conventions.Controller<OrdersController>()", guard=False):
+    call = f"builder.Services.AddApiVersioning(o => {controller_expr}.HasDeprecatedApiVersion(1, 0));\n"
+    return MVC + (f"if (builder.Environment.IsDevelopment())\n{{\n    {call}}}\n" if guard else call)
+
+
+V1_V2 = [_ctl("api/v1/orders"), _ctl("api/v1/items", "ItemsController"), _ctl("api/v2/orders", "OrdersV2Controller")]
+
+
+def test_convention_deprecation_covers_only_its_controller(tmp_path, mode):
+    hits = _of(_inv(tmp_path, mode, V1_V2, services=_depr()), "DNL-INV-004")
+    assert [(f.route.path, f.confidence) for f in hits] == [("/api/v1/items", "REVIEW")]
+    assert "HasDeprecatedApiVersion" in hits[0].description and "Program.cs" in hits[0].description
+
+
+def test_convention_deprecation_of_every_v1_controller_suppresses(tmp_path, mode):
+    services = _depr() + _depr("o.Conventions.Controller<ItemsController>()")
+    assert not _of(_inv(tmp_path, mode, V1_V2, services=services), "DNL-INV-004")
+
+
+def test_deprecation_under_development_guard_does_not_suppress(tmp_path, mode):
+    found = _inv(tmp_path, mode, V1_V2[:1] + V1_V2[2:], services=_depr(guard=True))
+    hits = _of(found, "DNL-INV-004")
+    assert [(f.route.path, f.confidence) for f in hits] == [("/api/v1/orders", "REVIEW")]
+    assert "could not be tied" in hits[0].description
+
+
+def test_untied_deprecation_receiver_does_not_suppress(tmp_path, mode):
+    found = _inv(tmp_path, mode, V1_V2[:1] + V1_V2[2:], services=_depr("o.Conventions"))
+    hits = _of(found, "DNL-INV-004")
+    assert [f.route.path for f in hits] == ["/api/v1/orders"] and "could not be tied" in hits[0].description
+
+
+def test_attribute_deprecation_covers_only_its_controller(tmp_path, mode):
+    old = _ctl("api/v1/orders", attrs='[ApiVersion("1.0", Deprecated = true)]\n')
+    found = _inv(tmp_path, mode, [old, _ctl("api/v1/items", "ItemsController"), _ctl("api/v2/orders", "OrdersV2Controller")])
+    assert [f.route.path for f in _of(found, "DNL-INV-004")] == ["/api/v1/items"]
+
+
+def test_version_must_prefix_the_path(tmp_path, mode):
+    found = _inv(tmp_path, mode, [_ctl("api/orders/v1"), _ctl("api/orders/v2", "OrdersV2Controller")])
+    assert not _of(found, "DNL-INV-004")
+    found = _inv(tmp_path / "b", mode, [_ctl("v1/orders"), _ctl("v2/orders", "OrdersV2Controller")])
+    assert [f.route.path for f in _of(found, "DNL-INV-004")] == ["/v1/orders"]
+
+
+def test_minimal_api_version_set_is_reported_as_unread(tmp_path, mode):
+    body = "var set = app.NewApiVersionSet().HasApiVersion(new ApiVersion(1, 0)).Build();\napp.MapGet(\"/x\", () => 1);"
+    hits = _of(_scan(tmp_path, mode, body), "DNL-INV-004")
+    assert [(f.severity, f.confidence, f.route) for f in hits] == [("low", "REVIEW", None)]
+    assert "not read" in hits[0].description or "could not be compared" in hits[0].description

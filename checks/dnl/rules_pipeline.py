@@ -951,30 +951,67 @@ def _version_text(key: tuple) -> str:
 
 
 def _path_version(path: str) -> tuple | None:
-    """The first `v<N>[.<M>]` segment among the first four path segments (`/api/v1/orders` -> (1, 0))."""
-    for seg in path.strip("/").split("/")[:4]:
-        m = _PATH_VERSION_RE.match(seg)
-        if m:
-            return (int(m.group(1)), int(m.group(2) or 0))
-    return None
+    """The `v<N>[.<M>]` prefix of a route path: the first segment, or the one after a leading `api` segment
+    (`/api/v1/orders`, `/v1/orders` -> (1, 0)); `/api/orders/v1` is not a version prefix."""
+    segs = path.strip("/").split("/")
+    if segs and segs[0].lower() == "api":
+        segs = segs[1:]
+    m = _PATH_VERSION_RE.match(segs[0]) if segs else None
+    return (int(m.group(1)), int(m.group(2) or 0)) if m else None
 
 
-def _deprecated_versions(ctx: Ctx) -> tuple[set, bool]:
-    """(versions named by HasDeprecatedApiVersion anywhere in the solution, some call had an unreadable
-    argument). Conventions are matched by version only: they may sit on a version set or a controller."""
-    out: set = set()
-    unreadable = False
-    for t in ctx.model.types():
-        for m in t.methods:
-            for n in walk(m.body):
+@dataclass
+class _Deprecation:
+    file: str
+    line: int
+    key: tuple | None            # None: the version argument is not a literal
+    types: list[str]             # controller type names from Controller<T>() / Controller(typeof(T)) in the chain
+    certain: bool                # the call runs in Production for certain
+
+
+def _deprecation_calls(ctx: Ctx) -> list[_Deprecation]:
+    """Every HasDeprecatedApiVersion call reachable from a pipeline (conventions inside AddApiVersioning
+    lambdas, version sets, followed helpers), with the controller types its chain names and whether it
+    certainly runs in Production. A call seen from two sites is certain if either site is."""
+    found: dict[int, _Deprecation] = {}
+    for pipe in ctx.pipes:
+        for c in pipe.calls:
+            sure = c.runs_in("Production") is True
+            for n in walk(c.node):
                 if n.get("k") != "call" or call_name(n) != "HasDeprecatedApiVersion":
                     continue
-                key = _args_version(n.get("args") or [])
-                if key is None:
-                    unreadable = True
-                else:
-                    out.add(key)
-    return out, unreadable
+                types: list[str] = []
+                for link in call_chain(n)[1]:
+                    if call_name(link) != "Controller":
+                        continue
+                    types += [str(t) for t in (link.get("fn") or {}).get("targs") or []]
+                    for arg in link.get("args") or []:
+                        m = re.fullmatch(r"\s*typeof\s*\(\s*([\w.]+)\s*\)\s*",
+                                         arg.get("text") or "" if isinstance(arg, dict) else "")
+                        if m:
+                            types.append(m.group(1))
+                prev = found.get(id(n))
+                if prev is None:
+                    found[id(n)] = _Deprecation(c.file, n.get("line") or c.line, _args_version(n.get("args") or []),
+                                                types, sure)
+                elif sure:
+                    prev.certain = True
+    return list(found.values())
+
+
+def _tied(d: _Deprecation, ref: CoreRouteRef) -> bool:
+    """True when the call's chain names this route's controller type (simple name, or the qualified name
+    when the call qualifies it)."""
+    if ref.type is None:
+        return False
+    for t in d.types:
+        t = t.split("<")[0]
+        if "." in t:
+            if ref.type.full_name.lower().endswith(t.lower()):
+                return True
+        elif t.lower() == ref.type.name.split(".")[-1].lower():
+            return True
+    return False
 
 
 def _route_api_attrs(ctx: Ctx, ref: CoreRouteRef) -> list:
@@ -990,11 +1027,14 @@ def _route_api_attrs(ctx: Ctx, ref: CoreRouteRef) -> list:
 
 
 def _api_versions(ctx: Ctx) -> None:
+    # Known limit: versions declared through minimal-API HasApiVersion, an ApiVersionSet or [MapToApiVersion]
+    # are not read here; _unread_versioning reports that as one REVIEW per pipeline.
     # {version: [(ref, deprecated)]} in route order; attributes that could not be read, once each.
     by_version: dict[tuple, list] = {}
     unreadable: list[tuple] = []         # (ref, attr)
     seen_attrs: set = set()
-    deprecated, dep_unreadable = _deprecated_versions(ctx)
+    dep_calls = _deprecation_calls(ctx)
+    dep_unreadable = any(d.key is None for d in dep_calls)
     for ref in ctx.refs:
         meta = ref.route.meta
         if meta.get("kind") == "openapi" or str(meta.get("env") or "").lower() == "development":
@@ -1013,7 +1053,8 @@ def _api_versions(ctx: Ctx) -> None:
         if pv is not None and pv not in mine:
             mine[pv] = False
         for key, dep in mine.items():
-            by_version.setdefault(key, []).append((ref, dep or key in deprecated))
+            by_version.setdefault(key, []).append(
+                (ref, dep or any(d.key == key and d.certain and _tied(d, ref) for d in dep_calls)))
 
     def finding(ref, title, desc):
         ctx.add("DNL-INV-004", "low", title, desc, ref.route.file, ref.route.line, route=ref.route, confidence="REVIEW")
@@ -1035,15 +1076,51 @@ def _api_versions(ctx: Ctx) -> None:
         if not live:
             continue                      # every route of that version is marked deprecated
         ref = live[0]
+        # A deprecation call only suppresses the routes it is tied to; any other call for this version is
+        # named so the reviewer can check whether it covers this route.
+        loose = [d for d in dep_calls if d.key == key and not (d.certain and _tied(d, ref))]
+        note = ""
+        if loose:
+            where = ", ".join(f"{d.file}:{d.line}" + ("" if d.certain else " (not certain to run in Production)")
+                              for d in loose)
+            note = (f" A HasDeprecatedApiVersion({_version_text(key).replace('.', ', ')}) call that could not be "
+                    f"tied to this route exists ({where}); confirm whether it deprecates this route.")
         finding(ref, f"Older API version {_version_text(key)} is still mapped",
                 f"API version {_version_text(key)} ({len(live)} route(s), first {ref.route.path}) is still served "
                 f"next to {_version_text(newest)}. Old versions keep old bugs and missing controls reachable; "
-                "retire it, mark it deprecated with a sunset date, or confirm clients still need it." + tail)
+                "retire it, mark it deprecated with a sunset date, or confirm clients still need it." + note + tail)
+
+
+_UNREAD_VERSIONING = ("HasApiVersion", "NewApiVersionSet", "WithApiVersionSet", "MapToApiVersion")
+
+
+def _unread_versioning(ctx: Ctx) -> None:
+    """Versions declared through HasApiVersion, an ApiVersionSet or [MapToApiVersion] are not read, so the
+    version comparison above is incomplete: one route-less REVIEW per pipeline says so."""
+    for pipe in ctx.pipes:
+        site = None
+        for c in pipe.calls:
+            for n in walk(c.node):
+                if n.get("k") == "call" and call_name(n) in _UNREAD_VERSIONING:
+                    site = site or (c.file, n.get("line") or c.line, call_name(n))
+        if site is None:
+            for ref in ctx.refs:
+                if ref.project is pipe.project and ref.method is not None and any(
+                        attr_key(a.name) == "maptoapiversion" for a in ref.method.attributes):
+                    site = (ref.route.file, ref.route.line, "[MapToApiVersion]")
+                    break
+        if site is not None:
+            ctx.add("DNL-INV-004", "low", "API versions declared through conventions were not read",
+                    f"{site[2]} at {site[0]}:{site[1]} declares API versions through a version set, a convention or "
+                    "[MapToApiVersion], which this check does not read (only [ApiVersion] attributes and /vN path "
+                    "prefixes are), so older versions that are still mapped could not be compared. Confirm no "
+                    "older API version is still served.", site[0], site[1], confidence="REVIEW")
 
 
 def _inventory(ctx: Ctx) -> None:
     _openapi(ctx)
     _api_versions(ctx)
+    _unread_versioning(ctx)
 
 
 # -- data protection (DNL-CRY-009) -----------------------------------------------------------------------
