@@ -542,6 +542,48 @@ def test_r4_razor_handler_exemption_follows_the_page_path(tmp_path, mode):
     assert flagged == {"/Admin/ResetPassword"}, flagged
 
 
+ADD5 = "foreach (var c in m.Controllers) { c.Filters.Add(new AllowAnonymousFilter()); }"
+
+
+@pytest.mark.parametrize("members, body, extra", [
+    # R5-1: members the IR does not record (indexer, operators, conversions, event accessors, destructor)
+    (f"    public int this[ApplicationModel m] {{ get {{ {ADD5} return 0; }} }}", "_ = this[application];", {}),
+    (f"    public static int operator +(SneakyConvention s, ApplicationModel m) {{ {ADD5} return 0; }}",
+     "int x = this + application;", {}),
+    (f"    public static implicit operator int(SneakyConvention s) {{ return 0; }}\n"
+     f"    public static explicit operator string(SneakyConvention s) {{ return \"\"; }}", "_ = application;", {}),
+    (f"    public event System.Action? Fired {{ add {{ }} remove {{ }} }}", "_ = application;", {}),
+    ("    ~SneakyConvention() { }", "_ = application;", {}),
+    # a second partial part carries the indexer
+    ("", "_ = application;", {"Part2.cs": "using Microsoft.AspNetCore.Mvc.ApplicationModels;\npublic partial class SneakyConvention\n{\n"
+                              f"    public int this[ApplicationModel m] {{ get {{ {ADD5} return 0; }} }}\n}}\n"}),
+])
+def test_r5_members_the_ir_does_not_record_block(tmp_path, mode, members, body, extra):
+    files = _conv4(members, body)
+    files["SneakyConvention.cs"] = files["SneakyConvention.cs"].replace("public class", "public partial class", 1)
+    files.update(extra)
+    a = _with_convention(tmp_path, mode, "new SneakyConvention()", files)
+    assert a.state == UNKNOWN and any("Conventions.Add" in r for r in a.reasons), (members, body)
+
+
+def test_r5_ops_segment_rules_out_reset_password(tmp_path, mode):
+    ctl = '''
+[ApiController, Route("api/ops")]
+public class OpsController : ControllerBase
+{
+    [HttpPost("reset-password"), AllowAnonymous] public IActionResult ResetPassword() => Ok();
+}
+[ApiController, Route("api/help")]
+public class HelpDeskController : ControllerBase
+{
+    [HttpPost("reset-password"), AllowAnonymous] public IActionResult ResetPassword() => Ok();
+}
+'''
+    fs = _findings(tmp_path, mode, _program(extra=ctl))
+    flagged = {f.route.handler_name for f in fs if f.check_id == "DNL-AUTHZ-002"}
+    assert flagged == {"OpsController.ResetPassword"}
+
+
 def test_d9_minimal_hosting_adds_authorization_middleware_itself(tmp_path, mode):
     assert not any(f.check_id == "DNL-AUTHZ-008" for f in _findings(tmp_path, mode, MINIMAL_NO_AUTHZ_MW))
 

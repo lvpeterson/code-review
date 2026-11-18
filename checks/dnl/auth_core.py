@@ -993,6 +993,21 @@ def _framework_vars(model: ProjectModel, m: MethodIR) -> set[str] | None:
     return fw
 
 
+def _unmodelled_members(model: ProjectModel, t: TypeIR) -> bool:
+    """True when the declaration (each partial part is its own TypeIR) holds an indexer, an operator or
+    conversion, an event with accessors or a destructor. The IR gap: neither the helper nor the tree-sitter
+    frontend records those members, so their bodies are never scanned; the type's source text is checked
+    instead (its line span, or the whole file when the span is unknown)."""
+    try:
+        lines = (model.root / t.file).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return True
+    if 0 < t.line <= t.end_line <= len(lines):
+        lines = lines[t.line - 1:t.end_line]
+    name = re.escape(t.name.split(".")[-1])
+    return bool(re.search(rf"\bthis\s*\[|\boperator\b|\bevent\b|~\s*{name}\s*\(", "\n".join(lines)))
+
+
 def _convention_type_benign(model: ProjectModel, tn: str, new: dict | None, depth: int) -> bool:
     types = [t for t in model.find_types(tn) if t.kind in ("class", "struct", "record")] if depth < 4 else []
     if new is not None and any(isinstance(n, dict) and n.get("k") == "lambda" for n in walk(new.get("args"))):
@@ -1002,6 +1017,8 @@ def _convention_type_benign(model: ProjectModel, tn: str, new: dict | None, dept
     if new is not None and _AUTHZ_TOUCH.search(_body_text(new.get("args"))):
         return False
     for t in types:
+        if _unmodelled_members(model, t):
+            return False
         for b in t.bases:
             bn = _simple(b)
             if bn in _CONVENTION_IFACES or bn in ("object", "Object"):
