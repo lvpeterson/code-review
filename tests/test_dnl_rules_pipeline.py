@@ -783,3 +783,196 @@ def test_used_ghost_name_with_const_named_policy_is_review(tmp_path, mode):
     hits = _of(found, "DNL-CFG-007")
     assert [(f.severity, f.confidence) for f in hits] == [("medium", "REVIEW")]
     assert "name is not a literal" in hits[0].description
+
+
+# -- inventory (DNL-INV-003, DNL-INV-004) ----------------------------------------------------------------
+
+def _ctl(route, cls="OrdersController", attrs="", action="[HttpGet]", base="ControllerBase"):
+    return ("using Microsoft.AspNetCore.Mvc;\n[ApiController]\n" + attrs + f'[Route("{route}")]\n'
+            f"public class {cls} : {base}\n{{\n    {action}\n    public IActionResult List() => Ok();\n}}\n")
+
+
+def _inv(tmp_path, mode, controllers, services=MVC, body="app.MapControllers();"):
+    extra = {f"C{i}.cs": text for i, text in enumerate(controllers)}
+    return _scan(tmp_path, mode, body, services, extra)
+
+
+def test_swagger_calls_in_production(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseSwagger();\napp.UseSwaggerUI();")
+    hits = _of(found, "DNL-INV-003")
+    assert len(hits) == 2 and {(f.severity, f.confidence) for f in hits} == {("low", None)}
+    assert len({f.line for f in hits}) == 2
+
+
+def test_swagger_under_development_guard_is_clean(tmp_path, mode):
+    body = "if (app.Environment.IsDevelopment())\n{\n    app.UseSwagger();\n    app.UseSwaggerUI();\n    app.MapOpenApi();\n}"
+    assert not _of(_scan(tmp_path, mode, body), "DNL-INV-003")
+
+
+def test_map_open_api_is_reported(tmp_path, mode):
+    assert ("DNL-INV-003", "low", None) in ids(_scan(tmp_path, mode, "app.MapOpenApi();"))
+
+
+def test_other_documentation_endpoints_are_reported(tmp_path, mode):
+    body = "app.UseReDoc();\napp.MapScalarApiReference();\napp.UseOpenApi();\napp.MapSwagger();"
+    assert len(_of(_scan(tmp_path, mode, body), "DNL-INV-003")) == 4
+
+
+def test_swagger_under_unparseable_guard_is_review(tmp_path, mode):
+    found = _scan(tmp_path, mode, "if (Flag.Check())\n{\n    app.UseSwagger();\n}")
+    assert [(f.severity, f.confidence) for f in _of(found, "DNL-INV-003")] == [("low", "REVIEW")]
+
+
+def test_open_api_behind_authorization_is_still_reported(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.MapOpenApi().RequireAuthorization();")
+    hits = _of(found, "DNL-INV-003")
+    assert len(hits) == 1 and "RequireAuthorization" in hits[0].description
+    plain = _of(_scan(tmp_path / "p", mode, "app.MapOpenApi();"), "DNL-INV-003")
+    assert "RequireAuthorization" not in plain[0].description
+
+
+def test_library_project_has_no_inventory_findings(tmp_path, mode):
+    files = {"Thing.cs": "public class Thing { public void Go(IApplicationBuilder app) { app.UseSwagger(); } }\n"}
+    assert scan(tmp_path, files, mode, sdk="Microsoft.NET.Sdk") == []
+
+
+def test_two_api_versions_in_paths_report_the_older(tmp_path, mode):
+    found = _inv(tmp_path, mode, [_ctl("api/v1/orders"), _ctl("api/v2/orders", "OrdersV2Controller")])
+    hits = _of(found, "DNL-INV-004")
+    assert [(f.severity, f.confidence) for f in hits] == [("low", "REVIEW")]
+    assert hits[0].route is not None and hits[0].route.path.endswith("/v1/orders") and "1.0" in hits[0].description
+
+
+def test_one_finding_per_older_version_at_its_first_route(tmp_path, mode):
+    found = _inv(tmp_path, mode, [_ctl("api/v1/orders"), _ctl("api/v1/items", "ItemsController"),
+                                  _ctl("api/v2/orders", "OrdersV2Controller"),
+                                  _ctl("api/v3/orders", "OrdersV3Controller")])
+    hits = _of(found, "DNL-INV-004")
+    assert sorted(f.route.path for f in hits) == ["/api/v1/orders", "/api/v2/orders"]
+
+
+def test_single_api_version_is_clean(tmp_path, mode):
+    found = _inv(tmp_path, mode, [_ctl("api/v1/orders"), _ctl("api/v1/items", "ItemsController")])
+    assert not _of(found, "DNL-INV-004")
+
+
+def test_deprecated_api_version_is_not_reported(tmp_path, mode):
+    old = _ctl("api/v1/orders", attrs='[ApiVersion("1.0", Deprecated = true)]\n')
+    new = _ctl("api/v2/orders", "OrdersV2Controller")
+    assert not _of(_inv(tmp_path, mode, [old, new]), "DNL-INV-004")
+
+
+def test_api_version_attributes_without_version_paths(tmp_path, mode):
+    old = _ctl("api/orders", attrs='[ApiVersion("1.0")]\n')
+    new = _ctl("api/orders2", "OrdersV2Controller", attrs='[ApiVersion("2.0")]\n')
+    hits = _of(_inv(tmp_path, mode, [old, new]), "DNL-INV-004")
+    assert [f.route.path for f in hits] == ["/api/orders"]
+
+
+def test_action_level_and_inherited_api_versions(tmp_path, mode):
+    base = 'using Microsoft.AspNetCore.Mvc;\n[ApiVersion("2.0")]\npublic abstract class BaseController : ControllerBase { }\n'
+    old = _ctl("api/orders", action='[HttpGet]\n    [ApiVersion("1.0")]', base="BaseController")
+    new = _ctl("api/orders2", "OrdersV2Controller", base="BaseController")
+    hits = _of(_inv(tmp_path, mode, [base, old, new]), "DNL-INV-004")
+    assert [f.route.path for f in hits] == ["/api/orders"] and hits[0].confidence == "REVIEW"
+
+
+def test_has_deprecated_api_version_suppresses(tmp_path, mode):
+    services = MVC + ("builder.Services.AddApiVersioning(o => "
+                      "o.Conventions.Controller<OrdersController>().HasDeprecatedApiVersion(1, 0));\n")
+    found = _inv(tmp_path, mode, [_ctl("api/v1/orders"), _ctl("api/v2/orders", "OrdersV2Controller")], services=services)
+    assert not _of(found, "DNL-INV-004")
+
+
+def test_non_literal_api_version_is_review(tmp_path, mode):
+    ctl = _ctl("api/orders", attrs="[ApiVersion(Versions.Old)]\n")
+    hits = _of(_inv(tmp_path, mode, [ctl]), "DNL-INV-004")
+    assert [(f.severity, f.confidence) for f in hits] == [("low", "REVIEW")]
+    assert hits[0].route is not None
+
+
+def test_swagger_paths_are_not_api_versions(tmp_path, mode):
+    found = _inv(tmp_path, mode, [_ctl("api/v1/orders")], body="app.UseSwagger();\napp.MapControllers();")
+    assert not _of(found, "DNL-INV-004")
+
+
+# -- data protection (DNL-CRY-009) -----------------------------------------------------------------------
+
+FS = 'builder.Services.AddDataProtection().PersistKeysToFileSystem(new DirectoryInfo("/keys"))'
+
+
+def _dp(tmp_path, mode, services, extra=None):
+    return _scan(tmp_path, mode, "app.UseRouting();", services, extra)
+
+
+def test_keys_on_file_system_without_protection(tmp_path, mode):
+    hits = _of(_dp(tmp_path, mode, FS + ";"), "DNL-CRY-009")
+    assert [(f.severity, f.confidence) for f in hits] == [("low", None)]
+    assert hits[0].route is None
+
+
+def test_keys_with_certificate_protection_are_clean(tmp_path, mode):
+    assert not _of(_dp(tmp_path, mode, FS + ".ProtectKeysWithCertificate(cert);"), "DNL-CRY-009")
+
+
+def test_keys_with_set_application_name_only_are_reported(tmp_path, mode):
+    assert ("DNL-CRY-009", "low", None) in ids(_dp(tmp_path, mode, FS + '.SetApplicationName("a");'))
+
+
+def test_protection_elsewhere_in_the_pipeline_counts(tmp_path, mode):
+    services = FS + ";\nbuilder.Services.AddDataProtection().ProtectKeysWithAzureKeyVault(uri, cred);"
+    assert not _of(_dp(tmp_path, mode, services), "DNL-CRY-009")
+
+
+def test_other_key_stores_are_reported(tmp_path, mode):
+    services = ("builder.Services.AddDataProtection().PersistKeysToStackExchangeRedis(mux);\n"
+                "builder.Services.AddDataProtection().PersistKeysToAzureBlobStorage(blob);\n"
+                "builder.Services.AddDataProtection().PersistKeysToDbContext<Db>();")
+    assert len(_of(_dp(tmp_path, mode, services), "DNL-CRY-009")) == 3
+
+
+def test_default_key_storage_is_clean(tmp_path, mode):
+    services = 'builder.Services.AddDataProtection().SetApplicationName("a");'
+    assert not _of(_dp(tmp_path, mode, services), "DNL-CRY-009")
+
+
+def test_keys_persisted_only_in_development_are_clean(tmp_path, mode):
+    services = "if (builder.Environment.IsDevelopment())\n{\n    " + FS + ";\n}"
+    assert not _of(_dp(tmp_path, mode, services), "DNL-CRY-009")
+
+
+def test_keys_under_unparseable_guard_are_review(tmp_path, mode):
+    found = _dp(tmp_path, mode, "if (Flag.Check())\n{\n    " + FS + ";\n}")
+    assert [(f.severity, f.confidence) for f in _of(found, "DNL-CRY-009")] == [("low", "REVIEW")]
+
+
+def test_conditional_protection_never_counts(tmp_path, mode):
+    services = FS + ";\nif (Flag.Check())\n{\n    builder.Services.AddDataProtection().ProtectKeysWithDpapi();\n}"
+    found = _dp(tmp_path, mode, services)
+    assert [(f.severity, f.confidence) for f in _of(found, "DNL-CRY-009")] == [("low", "REVIEW")]
+
+
+def test_unresolved_services_call_makes_it_review(tmp_path, mode):
+    found = _dp(tmp_path, mode, FS + ";\nbuilder.Services.AddCompanyDefaults();")
+    hits = _of(found, "DNL-CRY-009")
+    assert [(f.severity, f.confidence) for f in hits] == [("low", "REVIEW")]
+    assert "AddCompanyDefaults" in hits[0].description
+
+
+def test_builder_stored_and_handed_to_unknown_code_is_review(tmp_path, mode):
+    services = "var dp = builder.Services.AddDataProtection();\nKeyHelpers.Configure(dp);"
+    found = _dp(tmp_path, mode, services)
+    assert [(f.severity, f.confidence) for f in _of(found, "DNL-CRY-009")] == [("low", "REVIEW")]
+
+
+def test_builder_handed_to_a_followed_helper_is_read(tmp_path, mode):
+    services = "var dp = builder.Services.AddDataProtection();\nConfigureKeys(dp);"
+    helper = ('public static class K { public static void ConfigureKeys(IDataProtectionBuilder b) '
+              '{ b.PersistKeysToFileSystem(new DirectoryInfo("/keys")); } }\n')
+    found = _dp(tmp_path, mode, services, extra={"Keys.cs": helper})
+    assert [(f.severity, f.confidence) for f in _of(found, "DNL-CRY-009")] == [("low", None)]
+
+
+def test_builder_stored_and_configured_in_place_is_firm(tmp_path, mode):
+    services = 'var dp = builder.Services.AddDataProtection();\ndp.PersistKeysToFileSystem(new DirectoryInfo("/keys"));'
+    assert ("DNL-CRY-009", "low", None) in ids(_dp(tmp_path, mode, services))

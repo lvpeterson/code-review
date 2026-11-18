@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass, field
 
 from checks.dnl import rules_limits_core, rules_pipeline_auth, rules_secrets_core
-from checks.dnl.auth_core import _sensitive
+from checks.dnl.auth_core import _NON_AUTHZ_EXTENSIONS, _sensitive
 from checks.dnl.cfgctx import Ctx, build_ctx
 from checks.dnl.ir import attr_key, call_chain, call_name, const_str, literal_str, receiver_text, walk
 from checks.dnl.options import always_true, const, opt, options_of, param_escapes, verdict, walk_conditional
@@ -879,8 +879,280 @@ def _cors(ctx: Ctx) -> None:
                     r.file, r.line, route=ref.route, confidence="REVIEW")
 
 
+# -- inventory (DNL-INV-003, DNL-INV-004) ----------------------------------------------------------------
+
+# Calls that serve an API description or its UI (Swagger / OpenAPI / ReDoc / Scalar / NSwag).
+_OPENAPI_CALLS = ("UseSwagger", "UseSwaggerUI", "UseReDoc", "MapOpenApi", "MapScalarApiReference",
+                  "MapSwagger", "UseOpenApi")
+_VERSION_RE = re.compile(r"^\s*(\d+)(?:\.(\d+))?(?:-[\w.]+)?\s*$")
+_DATE_VERSION_RE = re.compile(r"^\s*(\d{4})-(\d{2})-(\d{2})(?:-[\w.]+)?\s*$")
+_PATH_VERSION_RE = re.compile(r"^v(\d+)(?:\.(\d+))?$", re.I)
+
+
+def _openapi(ctx: Ctx) -> None:
+    seen: set = set()
+    for pipe in ctx.pipes:
+        for c, conf in _certain_and_uncertain(ctx, pipe, *_OPENAPI_CALLS):
+            key = (c.file, c.line, c.name)
+            if key in seen:
+                continue
+            seen.add(key)
+            desc = (f"{c.name}() publishes the API description or its interactive UI in the Production pipeline, "
+                    "which hands an attacker the full endpoint list, parameters and models. Serve it only in "
+                    "Development (`if (app.Environment.IsDevelopment())`) or put it behind authentication.")
+            if any(call_name(x) == "RequireAuthorization" for x in c.chain):
+                desc += (" It also carries RequireAuthorization, which limits who can read it (reported for "
+                         "information; confirm the policy is not satisfied by any signed-in user).")
+            if conf:
+                desc += " The call sits under an environment condition that could not be parsed; confirm it is limited to Development."
+            ctx.add("DNL-INV-003", "low", f"{c.name} serves the API description in Production", desc, c.file, c.line,
+                    confidence=conf)
+
+
+def _int_lits(args) -> list[int] | None:
+    """The integer values of the first two arguments when both are int literals, else None."""
+    vals = [a.get("v") for a in args[:2] if isinstance(a, dict) and a.get("k") == "lit"
+            and isinstance(a.get("v"), int) and not isinstance(a.get("v"), bool)]
+    return vals if len(args) >= 2 and len(vals) == 2 else None
+
+
+def _version_key(expr) -> tuple | None:
+    """(major, minor) -- or (year, month, day) for a date version -- from a version literal (`"1.0"`, `1.0`,
+    `1`) or `new ApiVersion(1, 0)`; None when it is not a compile-time value."""
+    if not isinstance(expr, dict):
+        return None
+    if expr.get("k") == "new" and (expr.get("type") or "").split(".")[-1] == "ApiVersion":
+        args = expr.get("args") or []
+        return _args_version(args)
+    text = literal_str(expr)
+    if text is None and expr.get("k") == "lit" and isinstance(expr.get("v"), (int, float)) \
+            and not isinstance(expr.get("v"), bool):
+        text = repr(expr["v"])
+    if text is None:
+        return None
+    m = _DATE_VERSION_RE.match(text)
+    if m:
+        return tuple(int(x) for x in m.groups())
+    m = _VERSION_RE.match(text)
+    return (int(m.group(1)), int(m.group(2) or 0)) if m else None
+
+
+def _args_version(args) -> tuple | None:
+    """A version from constructor / attribute arguments: `(1, 0)` or a single literal (a status text after
+    it, `("1.0", "beta")`, is ignored)."""
+    nums = _int_lits(args)
+    if nums is not None:
+        return (nums[0], nums[1])
+    return _version_key(args[0]) if args else None
+
+
+def _version_text(key: tuple) -> str:
+    return f"{key[0]:04d}-{key[1]:02d}-{key[2]:02d}" if len(key) == 3 else f"{key[0]}.{key[1]}"
+
+
+def _path_version(path: str) -> tuple | None:
+    """The first `v<N>[.<M>]` segment among the first four path segments (`/api/v1/orders` -> (1, 0))."""
+    for seg in path.strip("/").split("/")[:4]:
+        m = _PATH_VERSION_RE.match(seg)
+        if m:
+            return (int(m.group(1)), int(m.group(2) or 0))
+    return None
+
+
+def _deprecated_versions(ctx: Ctx) -> tuple[set, bool]:
+    """(versions named by HasDeprecatedApiVersion anywhere in the solution, some call had an unreadable
+    argument). Conventions are matched by version only: they may sit on a version set or a controller."""
+    out: set = set()
+    unreadable = False
+    for t in ctx.model.types():
+        for m in t.methods:
+            for n in walk(m.body):
+                if n.get("k") != "call" or call_name(n) != "HasDeprecatedApiVersion":
+                    continue
+                key = _args_version(n.get("args") or [])
+                if key is None:
+                    unreadable = True
+                else:
+                    out.add(key)
+    return out, unreadable
+
+
+def _route_api_attrs(ctx: Ctx, ref: CoreRouteRef) -> list:
+    """The [ApiVersion] attributes that apply to a route: its action's, and those of its controller and the
+    controller's base classes (ApiVersionAttribute is inherited and combines)."""
+    attrs = []
+    if ref.method is not None:
+        attrs += [a for a in ref.method.attributes if attr_key(a.name) == "apiversion"]
+    if ref.type is not None and ref.style in ("controller", "razorpage"):
+        for t in _chain_types(ctx.model, ref.type):
+            attrs += [a for a in t.attributes if attr_key(a.name) == "apiversion"]
+    return attrs
+
+
+def _api_versions(ctx: Ctx) -> None:
+    # {version: [(ref, deprecated)]} in route order; attributes that could not be read, once each.
+    by_version: dict[tuple, list] = {}
+    unreadable: list[tuple] = []         # (ref, attr)
+    seen_attrs: set = set()
+    deprecated, dep_unreadable = _deprecated_versions(ctx)
+    for ref in ctx.refs:
+        meta = ref.route.meta
+        if meta.get("kind") == "openapi" or str(meta.get("env") or "").lower() == "development":
+            continue
+        mine: dict[tuple, bool] = {}
+        for a in _route_api_attrs(ctx, ref):
+            key = _args_version(a.args)
+            if key is None:
+                if id(a) not in seen_attrs:
+                    seen_attrs.add(id(a))
+                    unreadable.append((ref, a))
+                continue
+            flag = a.named.get("Deprecated") if isinstance(a.named, dict) else None
+            mine[key] = mine.get(key, True) and const(flag) is True
+        pv = _path_version(ref.route.path)
+        if pv is not None and pv not in mine:
+            mine[pv] = False
+        for key, dep in mine.items():
+            by_version.setdefault(key, []).append((ref, dep or key in deprecated))
+
+    def finding(ref, title, desc):
+        ctx.add("DNL-INV-004", "low", title, desc, ref.route.file, ref.route.line, route=ref.route, confidence="REVIEW")
+
+    tail = (" A HasDeprecatedApiVersion call with an argument that is not a literal could not be matched."
+            if dep_unreadable else "")
+    for ref, a in unreadable:
+        finding(ref, "API version could not be read",
+                f"The [ApiVersion] attribute at {ref.route.file}:{a.line or ref.route.line} takes a value that is not a "
+                "string or number literal, so the versions this solution serves cannot be listed. Confirm that no "
+                "older API version is still mapped." + tail)
+    if len(by_version) < 2:
+        return
+    newest = max(by_version)
+    for key in sorted(by_version):
+        if key == newest:
+            continue
+        live = [ref for ref, dep in by_version[key] if not dep]
+        if not live:
+            continue                      # every route of that version is marked deprecated
+        ref = live[0]
+        finding(ref, f"Older API version {_version_text(key)} is still mapped",
+                f"API version {_version_text(key)} ({len(live)} route(s), first {ref.route.path}) is still served "
+                f"next to {_version_text(newest)}. Old versions keep old bugs and missing controls reachable; "
+                "retire it, mark it deprecated with a sunset date, or confirm clients still need it." + tail)
+
+
+def _inventory(ctx: Ctx) -> None:
+    _openapi(ctx)
+    _api_versions(ctx)
+
+
+# -- data protection (DNL-CRY-009) -----------------------------------------------------------------------
+
+# Methods of IDataProtectionBuilder (and its extensions) that never register a key protector.
+_DP_BUILDER = ("PersistKeysTo", "ProtectKeysWith", "UnprotectKeysWith", "SetApplicationName", "SetDefaultKeyLifetime",
+               "DisableAutomaticKeyGeneration", "UseCryptographicAlgorithms", "UseCustomCryptographicAlgorithms",
+               "AddKeyEscrowSink", "AddKeyManagementOptions", "AddDataProtection")
+
+
+def _name_ids(node, name: str) -> bool:
+    return any(n.get("k") == "name" and n.get("id") == name for n in walk(node))
+
+
+def _builder_escape(c: PipeCall, bodies: list, by_node: dict) -> str | None:
+    """Why the builder returned by this AddDataProtection call may be configured out of sight, or None. A
+    chain that ends a statement is read in full. One stored in a local is read through the calls on that
+    local (they are pipeline calls); handing it to a call the pipeline did not follow, returning it or
+    aliasing it makes the rest invisible."""
+    outer = c.chain[-1] if c.chain else c.node
+    name = None
+    for body in bodies:
+        for n in walk(body):
+            k = n.get("k")
+            if k == "expr" and n.get("expr") is outer:
+                return None
+            if k == "local" and n.get("init") is outer:
+                name = n.get("name")
+            elif k == "assign" and n.get("value") is outer:
+                t = n.get("target")
+                name = t.get("id") if isinstance(t, dict) and t.get("k") == "name" else name
+    if name is None:
+        return ("the AddDataProtection builder is used as a value (passed on, returned or assigned to a member), "
+                "so key storage may be configured where this code cannot see")
+    for body in bodies:
+        for n in walk(body):
+            k = n.get("k")
+            if k == "call":
+                parts = list(n.get("args") or []) + list((n.get("named") or {}).values())
+                if any(_name_ids(a, name) for a in parts):
+                    pc = by_node.get(id(n))
+                    if pc is None or pc.target is None:
+                        return (f"the builder {name} is passed to {call_name(n)}(), which is not followed, so key "
+                                "storage and protection may be configured there")
+            elif k in ("return", "assign", "local"):
+                v = n.get("init") if k == "local" else n.get("value")
+                if isinstance(v, dict) and v.get("k") == "name" and v.get("id") == name:
+                    return f"the builder {name} is returned or copied to another variable, so it is configured out of sight"
+    return None
+
+
+def _data_protection(ctx: Ctx) -> None:
+    seen: set = set()
+    bodies = [m.body for t in ctx.model.types() for m in t.methods]
+    for pipe in ctx.pipes:
+        def runs(prefix: str, pipe=pipe):
+            """[(call, True | None)] of calls that run in Production or may (an unparsed guard)."""
+            return [(c, c.runs_in("Production")) for c in pipe.calls
+                    if c.name.startswith(prefix) and c.runs_in("Production") is not False]
+
+        if any(run for _c, run in runs("ProtectKeysWith")):
+            continue                        # an unconditional protector anywhere in the pipeline
+        notes: list[str] = []
+        for c, _run in runs("ProtectKeysWith"):
+            notes.append(f"{c.name} at {c.file}:{c.line} is under a condition that could not be parsed, so it "
+                         "may not run in Production")
+        by_node = {id(c.node): c for c in pipe.calls}
+        escapes = []
+        for c, _run in runs("AddDataProtection"):
+            why = _builder_escape(c, bodies, by_node)
+            if why:
+                escapes.append((c, why))
+        notes += [f"{why} (AddDataProtection at {c.file}:{c.line})" for c, why in escapes]
+        for c in pipe.unresolved():
+            if (c.kind == "services" and c.name not in _NON_AUTHZ_EXTENSIONS and c.runs_in("Production") is not False
+                    and not c.name.startswith(_DP_BUILDER)):
+                notes.append(f"{c.name} at {c.file}:{c.line} is not resolved and may register a key protector")
+        notes += pipe.notes
+        persists = runs("PersistKeysTo")
+        for c, run in persists:
+            if (c.file, c.line) in seen:
+                continue
+            seen.add((c.file, c.line))
+            desc = (f"{c.name}() stores the data-protection keys, which sign and encrypt cookies, antiforgery "
+                    "tokens and other protected payloads, and no ProtectKeysWith* (certificate, DPAPI, DPAPI-NG "
+                    "or Azure Key Vault) encrypts them at rest. Anyone who can read that store can forge or "
+                    "decrypt those payloads; the keys are written as plain XML.")
+            conf = None
+            if run is None:
+                conf = "REVIEW"
+                desc += " The call sits under an environment condition that could not be parsed."
+            if notes:
+                conf = "REVIEW"
+                desc += " Confirm that a protector is not registered elsewhere: " + "; ".join(notes) + "."
+            ctx.add("DNL-CRY-009", "low", "Data-protection keys are stored without encryption at rest", desc,
+                    c.file, c.line, confidence=conf)
+        if not persists:
+            for c, why in escapes:
+                if (c.file, c.line) in seen:
+                    continue
+                seen.add((c.file, c.line))
+                ctx.add("DNL-CRY-009", "low", "Data-protection key storage could not be read",
+                        f"AddDataProtection() at {c.file}:{c.line}: {why}. Confirm the keys are not persisted to a "
+                        "shared store without a ProtectKeysWith* protector.", c.file, c.line, confidence="REVIEW")
+
+
 # (name, fn(ctx)) in run order; each fn appends to ctx.out.
-_GROUPS: list = [("errors", _errors), ("transport", _transport), ("cors", _cors),
+_GROUPS: list = [("errors", _errors), ("transport", _transport), ("cors", _cors), ("inventory", _inventory),
+                 ("data_protection", _data_protection),
                  ("cookies", rules_pipeline_auth.check_cookies),
                  ("antiforgery", rules_pipeline_auth.check_antiforgery),
                  ("tokens", rules_pipeline_auth.check_tokens),
