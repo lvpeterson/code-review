@@ -358,6 +358,111 @@ finding with its route; otherwise the finding is medium REVIEW.
   are policy settings (`format`, `length`, `policy`, `regex`, `expir`, `required`,
   `minimum`) are not compared as secrets.
 
+## Configuration rules for ASP.NET Core
+
+These rules run for `languages/dotnet` (SDK-style web projects). The rule modules are
+`checks/dnl/rules_pipeline.py`, `rules_pipeline_auth.py`, `rules_secrets_core.py` and
+`rules_limits_core.py`; the findings share the DNL ids and OWASP tags of the rule table above, and
+rows marked "ASP.NET Core only" never fire for .NET Framework projects. Route-less findings are
+reported by the `config` analyzer of the `dotnet` package; route-bound ones (`DNL-CFG-015`,
+`DNL-CSRF-001/002`, `DNL-RES-004/005`, `DNL-INV-004`) carry their route and are reported by the
+analyzer that owns it.
+
+**The Production assumption.** The scan cannot know the deployed environment, so it assumes
+Production. A call or option set under an `env.IsDevelopment()` guard is not reported; a guard the
+reader cannot evaluate keeps the finding and turns it into REVIEW with a note saying so.
+`launchSettings.json` never changes this assumption: it only applies to `dotnet run`.
+
+**What degrades to REVIEW, never to clean.** A false "safe" is the worst outcome, so each of these
+produces a REVIEW finding (or turns a firm one into REVIEW):
+
+- a value that is not a compile-time literal (`ValidateIssuer = cfg.GetValue<bool>("V")`,
+  `RequireHttpsMetadata = !isDev`), or enum-looking text outside the rule's known-good set;
+- an assignment under a condition inside an option lambda (`if` / `else` / `switch` / ternary): a
+  conditional bad value is REVIEW, and a conditional good value never clears an earlier bad one;
+- an environment guard that cannot be parsed (see above);
+- an option argument the reader cannot follow: a method group, a variable, a configuration section,
+  or a lambda whose parameter escapes into a helper;
+- an absence finding (no HSTS, no HTTPS redirection, no exception handler, no rate limiter, no global
+  antiforgery filter, no `ProtectKeysWith*`) while the pipeline is not fully read: an unresolved
+  company-specific `services` / `app` extension could register the missing piece, and the finding
+  names that call;
+- a versioning scheme the rule does not read (minimal-API `HasApiVersion` and friends), and an
+  `appsettings*.json` file that cannot be parsed (a scan note, never a crash).
+
+A project with no web pipeline (a library) gets no absence findings. A solution with several web
+projects is read per project: each has its own pipeline and its findings point at its own files.
+
+**appsettings handling (per app directory).** `appsettings.json` and
+`appsettings.<Environment>.json` are read with a tolerant JSON reader (comments, trailing commas, a
+BOM and duplicate keys parse; line numbers are exact). Each app directory is its own scope: the
+effective Production settings of one project never mix with another's. The merge order is the .NET
+one: the base file, then `appsettings.Production.json` over it; a bad base value that the Production
+file overrides to a good one is not reported. `appsettings.Development.json` is never used for the
+Production verdict: a weak value there is ignored, a placeholder secret there is ignored, and a
+real-looking secret there is reported one severity lower (the file is committed all the same).
+`Properties/launchSettings.json` is read only as a Development-level secret source
+(`environmentVariables`, where `A__B` means `A:B`).
+
+**Reused ids.** These ids existed for .NET Framework projects; the same check now also fires for
+ASP.NET Core, from the pipeline and `appsettings*.json` instead of `web.config`:
+
+- `DNL-CFG-007` also fires for ASP.NET Core: `AllowAnyOrigin`, `SetIsOriginAllowed(_ => true)` and a
+  `"*"` origin in `AddCors` policies (high with credentials), reported at the policy definition.
+- `DNL-SESS-001` also fires for ASP.NET Core: cookie `SecurePolicy = None` in `AddCookie`,
+  `ConfigureApplicationCookie` and session options.
+- `DNL-SESS-002` also fires for ASP.NET Core: `Cookie.HttpOnly = false` in the same option lambdas.
+- `DNL-SESS-003` also fires for ASP.NET Core: an `ExpireTimeSpan` over a day while the expiry slides, or
+  a session `IdleTimeout` / `Cookie.MaxAge` over a day (REVIEW when it is not a literal `TimeSpan`).
+- `DNL-CSRF-001` also fires for ASP.NET Core: a mutating MVC action with no antiforgery validation (no
+  global `AutoValidateAntiforgeryToken` filter, no attribute on the action, class or base) in an app
+  that uses cookie authentication; token-only apps and `[ApiController]` types are skipped.
+- `DNL-SEC-001` also fires for ASP.NET Core: a password in a connection string in `appsettings*.json`
+  or `launchSettings.json` (placeholders, `Integrated Security`, vault references and `${VAR}`-style
+  tokens are clean).
+- `DNL-SEC-002` also fires for ASP.NET Core: a key, token or secret-named setting (`Jwt:Key`,
+  `ClientSecret`, `ApiKey`, ...) holding a literal in `appsettings*.json`.
+- `DNL-RES-001` also fires for ASP.NET Core: `MaxRequestBodySize = null` or a value over 100 MiB in
+  Kestrel / IIS / `FormOptions` options, and `[DisableRequestSizeLimit]` / `[RequestSizeLimit(..)]`
+  over that on a route.
+- `DNL-ERR-002` also fires for ASP.NET Core: a production exception handler (a `UseExceptionHandler`
+  lambda, an `ExceptionHandler` option, `CustomizeProblemDetails`) that writes the exception text,
+  stack trace or `ToString()` into the response.
+
+**The SEC-003 dependency.** `DNL-SEC-003` (a hard-coded credential in code) lives in
+`checks/dnl/rules_crypto.py`. Its wiring for the `dotnet` package belongs to the taint and coverage
+work (Plans 2 and 4), not to these configuration rules, so it does not fire for ASP.NET Core until
+that wiring lands. Until then a literal credential in `Program.cs` is seen only when it is a
+symmetric signing key (`DNL-SEC-004`).
+
+**Known limits** (a report is a floor, not a clean bill):
+
+- Identity, cookie and JWT options set from a `ConfigureOptions<T>` / `IConfigureOptions<T>` class are
+  not read; options bound from configuration or passed as a variable are REVIEW where the call is
+  visible.
+- A wrapped expression passed on (`Harden(o.Cookie ?? fallback)`) is not detected as an option escape;
+  a bare `o.Cookie` / `o` argument is.
+- Minimal-API versioning (`HasApiVersion`, `ApiVersionSet`, `[MapToApiVersion]`) is not read: INV-004
+  works from `[ApiVersion]` attributes and a leading `/v<N>` path segment and says so in one route-less
+  REVIEW per pipeline. `HasDeprecatedApiVersion` is matched to a controller by its simple type name,
+  without namespace or project scoping.
+- RES-005 follows a size parameter through one local and the common clamps. A cap that is carried only
+  through an unreadable source file, a truncated read, or a tuple / positional / property case pattern
+  that shadows a class constant can still give a clean result (a low-severity heuristic; an unreadable
+  source with a recognised `switch` already fails closed).
+- CORS: a policy name that is not a literal in `UseCors(name)` / `[EnableCors(Const)]` is not matched to
+  its policy while any policy exists; a wildcard policy is reported at its definition either way.
+- SEC-004 reads a literal key through constants and fields; a field reassigned from another type is
+  matched by name across the solution (over-REVIEW, not under).
+- Secrets: URL credentials (`https://user:pw@host`), `AccountKey` / `Passphrase` style keys and
+  keyword-prefixed names such as `Data-Password` are not detected, and a whole-value `keyvault:..`
+  without a path is treated as a reference.
+- Kestrel certificate settings clear CFG-013 even when the configured URL is HTTP-only.
+- A web project is recognised by an SDK name ending `.web`: a custom SDK that wraps it, with no
+  recognised app calls, is skipped for CFG-009.
+- The legacy `web.config` reader (`rules_config` / `rules_crypto`) still misses a quoted ADO.NET
+  password that contains `;`; the appsettings reader handles it.
+
 ## OWASP coverage
 
 Every category of the three lists has at least one DNL rule (enforced by
@@ -500,7 +605,7 @@ DNL-INV-001, which always carries it.
 | DNL-RES-005 | low | ASP.NET Core: an integer `pageSize` / `limit` / `take` / `count` / `perPage` / `top` / `maxResults` handler parameter reaches `Take` (directly or through one local) with no bound in the handler body (comparison, `Math.Min` / `Math.Clamp`, `[Range]`); a hand-off to another method is not followed | A06:2025 | A04:2021 | API4:2023 |
 | DNL-INV-002 | low | Web API HelpPage area (its `HelpController`, or `HelpPageAreaRegistration`) reachable without auth (an authorize attribute, global authorize filter or web.config rule covers it otherwise); Swagger UI / document endpoints (`EnableSwagger`, `EnableSwaggerUi`, `UseSwagger*`) unless web.config denies anonymous users for `swagger` (a global authorize filter does not cover the Swagger handler); controllers named `*Test*Controller`, `Debug*Controller` or `Diagnostics*Controller` in non-test projects (project name not ending in test / tests, no test framework reference) | A02:2025 | A05:2021 | API9:2023 |
 | DNL-INV-003 | low | ASP.NET Core only (`languages/dotnet`): `UseSwagger`, `UseSwaggerUI`, `UseReDoc`, `MapOpenApi`, `MapScalarApiReference`, `MapSwagger` or `UseOpenApi` in the Production pipeline (one finding per call; REVIEW under an unparsed environment guard; none under `IsDevelopment()`; a `RequireAuthorization` on the call is noted but still reported) | A02:2025 | A05:2021 | API9:2023 |
-| DNL-INV-004 | low | ASP.NET Core only (`languages/dotnet`): (REVIEW, route-bound) two or more API versions among the solution's routes, read from `[ApiVersion("1.0")]` attributes (action, controller, base class) and a leading `/v<N>[.<M>]` path segment; one finding per older version at its first route, none for a version whose routes are all `Deprecated = true` / `HasDeprecatedApiVersion`; an `[ApiVersion]` with a non-literal value is REVIEW; a `HasDeprecatedApiVersion` call suppresses only the routes of the controller its `Controller<T>()` chain names and only when it certainly runs in Production (any other call is named in a REVIEW finding); minimal-API `HasApiVersion` / `ApiVersionSet` / `[MapToApiVersion]` versioning is not read (one route-less REVIEW per project says so) | A02:2025 | A05:2021 | API9:2023 |
+| DNL-INV-004 | low | ASP.NET Core only (`languages/dotnet`): (REVIEW, route-bound) two or more API versions among the solution's routes, read from `[ApiVersion("1.0")]` attributes (action, controller, base class) and a leading `/v<N>[.<M>]` path segment; one finding per older version at its first route, none for a version whose routes are all `[ApiVersion(.., Deprecated = true)]` (decided per route); an `[ApiVersion]` with a non-literal value is REVIEW; a `HasDeprecatedApiVersion` call suppresses only the routes of the controller its `Controller<T>()` chain names and only when it certainly runs in Production (a call that cannot be tied to the route, or is not certain, is named in the REVIEW finding); minimal-API `HasApiVersion` / `ApiVersionSet` / `[MapToApiVersion]` versioning is not read (one route-less REVIEW per pipeline says so) | A02:2025 | A05:2021 | API9:2023 |
 | DNL-CONSUME-001 | low | (REVIEW) Outbound call to a hard-coded `http://` URL: `HttpClient` / `WebClient` / `RestClient` / `WebRequest.Create` URL or base address, `new Uri(..)`, resolved through locals, const / static readonly fields and properties, concatenation, interpolation and `String.Format`; plus `<system.serviceModel><client><endpoint address="http://...">` in web.config. `localhost`, `127.0.0.1` and `[::1]` are skipped as development endpoints | A08:2025 | A08:2021 | API10:2023 |
 | DNL-CONSUME-002 | low | (REVIEW) An outbound response body (`ReadAsAsync<T>`, `ReadAsStringAsync`, `WebClient.DownloadString`, `GetStringAsync`, RestSharp `Execute`), deserialized (`JsonConvert.DeserializeObject`, `JObject.Parse`) or used raw, reaching a SQL / dynamic LINQ / command / LDAP / XPath / path / redirect sink. Uses the taint source kind `external`, which the request-source rules (INJ, XSS, PATH, REDIR ...) never see | A08:2025 | A08:2021 | API10:2023 |
 | DNL-SCA-001 | high/medium/low | (Severity from the advisory.) NuGet package (`packages.config`, or a `packages\<Id>.<Version>\` HintPath with no `packages.config` entry) inside a known-vulnerable range from the offline advisory data | A03:2025 | A06:2021 | -- |

@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "Web": {
+      "commandName": "Project",
+      "applicationUrl": "http://localhost:5100",
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        "Jwt__Key": "Zx9kLm3pQlaunchkey01"
+      }
+    }
+  }
+}
