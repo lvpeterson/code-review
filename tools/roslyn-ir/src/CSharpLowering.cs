@@ -110,6 +110,7 @@ internal sealed class CSharpLowering
         j.WriteStartArray("attributes"); j.WriteEndArray();
         j.WriteStartArray("fields"); j.WriteEndArray();
         j.WriteStartArray("properties"); j.WriteEndArray();
+        w.StrArray("special_members", []);
         j.WriteStartArray("methods");
         j.WriteStartObject();
         w.Str("name", "<Main>$");
@@ -238,6 +239,22 @@ internal sealed class CSharpLowering
             }
         }
         j.WriteEndArray();
+
+        // Members the IR does not lower; presence only, so convention analysis can fail closed on them.
+        var special = new List<string>();
+        foreach (var m in members)
+        {
+            var kind = m switch
+            {
+                IndexerDeclarationSyntax => "indexer",
+                OperatorDeclarationSyntax or ConversionOperatorDeclarationSyntax => "operator",
+                EventDeclarationSyntax or EventFieldDeclarationSyntax => "event",
+                DestructorDeclarationSyntax => "destructor",
+                _ => null,
+            };
+            if (kind is not null && !special.Contains(kind)) special.Add(kind);
+        }
+        w.StrArray("special_members", special);
 
         j.WriteNumber("line", DeclLine(node, node.AttributeLists));
         j.WriteNumber("end_line", EndLine(node));

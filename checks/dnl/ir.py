@@ -89,6 +89,9 @@ class TypeIR:
     line: int
     end_line: int
     file: str = ""
+    # Member kinds the IR does not lower ("indexer", "operator", "event", "destructor"), presence only. None when
+    # the frontend does not report them (the VB lowering), so callers fall back to scanning the source text.
+    special_members: list[str] | None = None
 
     @property
     def full_name(self) -> str:
@@ -134,6 +137,7 @@ def _type(d: dict, path: str) -> TypeIR:
                     for p in d.get("properties") or []],
         methods=[_method(m) for m in d.get("methods") or []],
         line=d.get("line", 0), end_line=d.get("end_line", 0), file=path,
+        special_members=list(d["special_members"]) if isinstance(d.get("special_members"), list) else None,
     )
 
 

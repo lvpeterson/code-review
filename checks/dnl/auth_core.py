@@ -995,9 +995,11 @@ def _framework_vars(model: ProjectModel, m: MethodIR) -> set[str] | None:
 
 def _unmodelled_members(model: ProjectModel, t: TypeIR) -> bool:
     """True when the declaration (each partial part is its own TypeIR) holds an indexer, an operator or
-    conversion, an event with accessors or a destructor. The IR gap: neither the helper nor the tree-sitter
-    frontend records those members, so their bodies are never scanned; the type's source text is checked
-    instead (its line span, or the whole file when the span is unknown)."""
+    conversion, an event or a destructor. The IR records the presence of those kinds but does not lower their
+    bodies, so any of them blocks (fail closed). A type from a frontend that does not report them (the VB
+    lowering) falls back to scanning the type's source text (its line span, or the whole file when unknown)."""
+    if t.special_members is not None:
+        return bool(t.special_members)
     try:
         lines = (model.root / t.file).read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:

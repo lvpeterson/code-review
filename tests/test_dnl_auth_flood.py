@@ -566,6 +566,28 @@ def test_r5_members_the_ir_does_not_record_block(tmp_path, mode, members, body, 
     assert a.state == UNKNOWN and any("Conventions.Add" in r for r in a.reasons), (members, body)
 
 
+@pytest.mark.parametrize("kind, members", [
+    ("indexer", "    public int this[int i] { get { return i; } }"),
+    ("operator", "    public static int operator +(SneakyConvention s, int m) { return m; }"),
+    ("operator", "    public static implicit operator int(SneakyConvention s) { return 0; }"),
+    ("event", "    public event System.Action? Fired { add { } remove { } }"),
+    ("event", "    public event System.Action? Raised;"),
+    ("destructor", "    ~SneakyConvention() { }"),
+])
+def test_r6_ir_records_each_special_member_kind(tmp_path, mode, kind, members):
+    files = _conv4(members, "_ = application;")
+    app = App(tmp_path, mode, _program(), files)
+    parts = [t for t in app.model.find_types("SneakyConvention")]
+    assert parts and all(t.special_members is not None for t in parts)
+    assert kind in {k for t in parts for k in t.special_members}
+
+
+def test_r6_plain_convention_records_no_special_members(tmp_path, mode):
+    app = App(tmp_path, mode, _program(), _conv4("    public string Label { get; set; } = \"x\";", "_ = application;"))
+    parts = app.model.find_types("SneakyConvention")
+    assert parts and all(t.special_members == [] for t in parts)
+
+
 def test_r5_ops_segment_rules_out_reset_password(tmp_path, mode):
     ctl = '''
 [ApiController, Route("api/ops")]

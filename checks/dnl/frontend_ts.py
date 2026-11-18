@@ -87,6 +87,14 @@ def _raw_string_value(content: str) -> str:
     return out
 
 
+# Members the IR does not lower; recorded by kind (presence only) so convention analysis can fail closed.
+_SPECIAL_MEMBER_NODES = {
+    "indexer_declaration": "indexer", "operator_declaration": "operator",
+    "conversion_operator_declaration": "operator", "event_declaration": "event",
+    "event_field_declaration": "event", "destructor_declaration": "destructor",
+}
+
+
 class _Lowering:
     def __init__(self, src: bytes):
         self.src = src
@@ -287,6 +295,12 @@ class _Lowering:
                     rec["methods"].append(self.method(m))
             except Exception:  # noqa: BLE001 -- one bad member must not lose the file
                 pass
+        special: list[str] = []
+        for m in members:
+            kind = _SPECIAL_MEMBER_NODES.get(m.type)
+            if kind and kind not in special:
+                special.append(kind)
+        rec["special_members"] = special
         if plist is not None and t in ("record_declaration", "record_struct_declaration"):
             # Positional record parameters declare one property each, unless the body redeclares it.
             declared = {p["name"] for p in rec["properties"]}
@@ -1193,6 +1207,7 @@ def _merge(base: list[dict], extra: list[dict]) -> None:
             # A body-less fragment of a signature already present (a broken parse) adds nothing to scan.
             have[kind] += [x for x in t[kind] if _same(x) not in seen
                            and not (kind == "methods" and not x.get("body") and _method_key(x) in sigs)]
+        have["special_members"] = sorted(set(have.get("special_members") or []) | set(t.get("special_members") or []))
 
 
 def _lower_source(src: bytes) -> tuple[list[dict], int]:
