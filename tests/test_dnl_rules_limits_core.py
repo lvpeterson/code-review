@@ -181,9 +181,9 @@ def test_res004_unresolved_extension_is_review(tmp_path, mode):
 
 
 def test_res004_route_level_limiter_counts_for_that_route(tmp_path, mode):
-    f = scan(tmp_path / "a", mvc("[EnableRateLimiting(\"auth\")]\n" + LOGIN), mode)
+    f = scan(tmp_path / "a", mvc("[EnableRateLimiting(\"auth\")]\n" + LOGIN, LIMITER, "app.UseRateLimiter();"), mode)
     assert not got(f, "DNL-RES-004")
-    f = scan(tmp_path / "b", mvc(LOGIN, cls_attrs="[EnableRateLimiting(\"auth\")]"), mode)
+    f = scan(tmp_path / "b", mvc(LOGIN, LIMITER, "app.UseRateLimiter();", cls_attrs="[EnableRateLimiting(\"auth\")]"), mode)
     assert not got(f, "DNL-RES-004")
     f = scan(tmp_path / "c", mvc(LOGIN, body=""), mode)
     assert got(f, "DNL-RES-004")
@@ -192,10 +192,11 @@ def test_res004_route_level_limiter_counts_for_that_route(tmp_path, mode):
 def test_res004_minimal_api_group_and_endpoint(tmp_path, mode):
     f = scan(tmp_path / "a", prog("", 'app.MapPost("/login", () => Results.Ok());'), mode)
     assert got(f, "DNL-RES-004") == {("DNL-RES-004", "low", None)}
-    f = scan(tmp_path / "b", prog("", 'app.MapPost("/login", () => Results.Ok()).RequireRateLimiting("auth");'), mode)
+    body = 'app.UseRateLimiter();\napp.MapPost("/login", () => Results.Ok()).RequireRateLimiting("auth");'
+    f = scan(tmp_path / "b", prog(LIMITER, body), mode)
     assert not got(f, "DNL-RES-004")
-    body = 'var g = app.MapGroup("/auth").RequireRateLimiting("auth");\ng.MapPost("/login", () => Results.Ok());'
-    f = scan(tmp_path / "c", prog("", body), mode)
+    body = 'app.UseRateLimiter();\nvar g = app.MapGroup("/auth").RequireRateLimiting("auth");\ng.MapPost("/login", () => Results.Ok());'
+    f = scan(tmp_path / "c", prog(LIMITER, body), mode)
     assert not got(f, "DNL-RES-004")
 
 
@@ -297,3 +298,84 @@ def test_res005_development_only_route_is_skipped(tmp_path, mode):
     body = ('if (app.Environment.IsDevelopment()) {\n'
             'app.MapGet("/items", (int pageSize, AppDb db) => db.Items.Take(pageSize).ToList());\n}')
     assert not got(scan(tmp_path, prog("", body), mode), "DNL-RES-005")
+
+
+# -- fix round 1 ---------------------------------------------------------------------------------------
+
+ENABLED = "[EnableRateLimiting(\"auth\")]\n" + LOGIN
+
+
+def test_res004_route_policy_without_middleware_is_unenforced(tmp_path, mode):
+    f = scan(tmp_path / "a", mvc(ENABLED, LIMITER), mode)
+    assert got(f, "DNL-RES-004") == {("DNL-RES-004", "low", None)}
+    assert "unenforced" in of(f, "DNL-RES-004")[0].description
+    dev = "if (app.Environment.IsDevelopment()) { app.UseRateLimiter(); }"
+    f = scan(tmp_path / "b", mvc(ENABLED, LIMITER, dev), mode)
+    assert got(f, "DNL-RES-004") == {("DNL-RES-004", "low", None)}
+    f = scan(tmp_path / "c", mvc(ENABLED, LIMITER, "if (Helper.Flag()) { app.UseRateLimiter(); }"), mode)
+    assert got(f, "DNL-RES-004") == {("DNL-RES-004", "low", "REVIEW")}
+    f = scan(tmp_path / "d", mvc(ENABLED, LIMITER, "app.UseRateLimiter();"), mode)
+    assert not got(f, "DNL-RES-004")
+    body = 'app.MapPost("/login", () => Results.Ok()).RequireRateLimiting("auth");'
+    f = scan(tmp_path / "e", prog(LIMITER, body), mode)
+    assert got(f, "DNL-RES-004") == {("DNL-RES-004", "low", None)}
+
+
+def test_res004_identity_api_also_reported_next_to_routes(tmp_path, mode):
+    f = scan(tmp_path, mvc(LOGIN, body="app.MapIdentityApi<IdentityUser>();"), mode)
+    titles = [x.title for x in of(f, "DNL-RES-004")]
+    assert len(titles) == 2 and any("Identity" in t for t in titles)
+    f = scan(tmp_path / "b", mvc(LOGIN, LIMITER, "app.UseRateLimiter();\napp.MapIdentityApi<IdentityUser>();"), mode)
+    assert not got(f, "DNL-RES-004")
+
+
+def test_res005_comparison_that_guards_nothing_is_review(tmp_path, mode):
+    cases = {
+        "warn": "if (pageSize > 100) _log.Warn(\"big\");",
+        "count": "if (items.Count > pageSize) _log.Info(\"x\");",
+        "unused_min": "Math.Min(pageSize, 100);",
+        "other_local": "var capped = Math.Min(pageSize, 100);",
+    }
+    for name, stmt in cases.items():
+        ctl = ("[HttpGet] public IActionResult List(int pageSize) { " + stmt +
+               " return Ok(db.Items.Take(pageSize).ToList()); }")
+        f = scan(tmp_path / name, mvc(ctl), mode)
+        assert got(f, "DNL-RES-005") == {("DNL-RES-005", "low", "REVIEW")}, name
+
+
+def test_res005_guarding_forms_stay_clean(tmp_path, mode):
+    cases = {
+        "throw": "if (pageSize > 100) throw new ArgumentException();",
+        "clamp_assign": "if (pageSize > 100) pageSize = 100;",
+        "ternary": "pageSize = pageSize > 100 ? 100 : pageSize;",
+        "or": "if (pageSize < 1 || pageSize > 100) return BadRequest();",
+    }
+    for name, stmt in cases.items():
+        ctl = ("[HttpGet] public IActionResult List(int pageSize) { " + stmt +
+               " return Ok(db.Items.Take(pageSize).ToList()); }")
+        assert not got(scan(tmp_path / name, mvc(ctl), mode), "DNL-RES-005"), name
+
+
+def razor(attr: str) -> dict:
+    files = prog("builder.Services.AddRazorPages();", "app.MapRazorPages();")
+    files["Pages/Index.cshtml"] = f"@page\n@model IndexModel\n@attribute {attr}\n"
+    files["Pages/Index.cshtml.cs"] = ("using Microsoft.AspNetCore.Mvc.RazorPages;\nnamespace App;\n"
+                                      "public class IndexModel : PageModel { public void OnGet() { } }\n")
+    return files
+
+
+def test_res001_razor_directives(tmp_path, mode):
+    f = scan(tmp_path / "a", razor("[DisableRequestSizeLimit()]"), mode)
+    assert len(of(f, "DNL-RES-001")) == 1 and got(f, "DNL-RES-001") == {("DNL-RES-001", "low", None)}
+    f = scan(tmp_path / "b", razor("[DisableRequestSizeLimit]"), mode)
+    assert len(of(f, "DNL-RES-001")) == 1
+    f = scan(tmp_path / "c", razor("[RequestSizeLimit(100 * 1024 * 1024)]"), mode)
+    assert not got(f, "DNL-RES-001")
+    f = scan(tmp_path / "d", razor("[RequestSizeLimit(2000L * 1024 * 1024)]"), mode)
+    assert got(f, "DNL-RES-001") == {("DNL-RES-001", "low", None)}
+    f = scan(tmp_path / "e", razor("[RequestFormLimits(MultipartBodyLengthLimit = long.MaxValue)]"), mode)
+    assert got(f, "DNL-RES-001") == {("DNL-RES-001", "low", None)}
+    f = scan(tmp_path / "f", razor("[RequestFormLimits(MultipartBodyLengthLimit = 1000)]"), mode)
+    assert not got(f, "DNL-RES-001")
+    f = scan(tmp_path / "g", razor("[RequestSizeLimit(Limits.Max)]"), mode)
+    assert got(f, "DNL-RES-001") == {("DNL-RES-001", "low", "REVIEW")}
