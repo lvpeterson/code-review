@@ -19,6 +19,7 @@ by a small bounded parser (no `**`, shifts <= 64, capped magnitudes), anything e
 """
 from __future__ import annotations
 
+import json
 import re
 
 from checks.dnl.cfgctx import Ctx
@@ -549,7 +550,8 @@ def _rate_limiting(ctx: Ctx) -> None:
             if _env_state(r.meta.get("env")) == "review":
                 conf = "REVIEW"
             none = ("none certain in Production" if maybe_global else "no UseRateLimiter, no third-party limiter")
-            lead = (f"The Production pipeline has no limiter that certainly runs in Production ({none})"
+            lead = ("The Production pipeline has no limiter that certainly runs in Production"
+                    + ("" if maybe_global else f" ({none})")
                     if unenforced else
                     f"The Production pipeline has no rate limiting ({none}, no RequireRateLimiting / "
                     "[EnableRateLimiting] on the route or its group)")
@@ -632,6 +634,7 @@ def _bound_calls(e, names: set, consts: dict, need_const: bool = False) -> list[
 
 _STOP_KINDS = frozenset({"if", "loop", "cond", "lambda"})
 _OR, _AND = frozenset({"||", "or", "orelse"}), frozenset({"&&", "and", "andalso"})
+_SHORT = _OR | _AND | {"??"}      # the right operand of these may not run
 
 
 def _top(node, stop=_STOP_KINDS):
@@ -646,7 +649,8 @@ def _top(node, stop=_STOP_KINDS):
         if node.get("k") in stop:
             return
         for key, v in node.items():
-            if isinstance(v, (dict, list)) and not (node.get("k") == "try" and key == "catches"):
+            if isinstance(v, (dict, list)) and not (node.get("k") == "try" and key == "catches") and not (
+                    node.get("k") == "bin" and key == "r" and str(node.get("op")).lower() in _SHORT):
                 yield from _top(v, stop)
 
 
@@ -706,6 +710,13 @@ def _guards(cond, kind: str, names: set, consts: dict) -> bool:
 def _inside(branch, takes: list[dict]) -> bool:
     ids = {id(n) for n in walk(branch)}
     return all(id(t) in ids for t in takes)
+
+
+def _hidden_assign(body, names: set) -> bool:
+    """An assignment to the value or a carrier that the IR keeps as unparsed text (`ok && (n = 5) > 0`,
+    `x ?? (n = 5)`): it may or may not run, so it cannot be read as a cap or ruled out."""
+    pat = re.compile(r"(?<![\w.])(?:" + "|".join(re.escape(n) for n in sorted(names)) + r")\s*=(?!=)")
+    return any(n.get("k") == "unknown" and pat.search(str(n.get("text") or "")) for n in walk(body))
 
 
 def _value_caps(val, names: set, consts: dict) -> bool:
@@ -768,7 +779,9 @@ def _bound_state(body: list, names: set, takes: list[dict], consts: dict) -> str
         strong = True
     if strong:
         return "bound"
-    return "weak" if _cmp_nodes(body, names) or _bound_calls(body, names, consts) else None
+    if _cmp_nodes(body, names) or _bound_calls(body, names, consts) or _hidden_assign(body, names):
+        return "weak"
+    return None
 
 
 def _consts(ctx: Ctx, ref: CoreRouteRef) -> dict:
@@ -790,7 +803,7 @@ _IDENT = re.compile(r"[A-Za-z_]\w*")
 _CASE_PATTERN = re.compile(r"\bcase\s+[\w.<>\[\]?]+\s+([A-Za-z_]\w*)|\b([A-Za-z_]\w*)\s*(?:when\b|=>)")
 
 
-def _binders(ctx: Ctx, ref: CoreRouteRef, m) -> set:
+def _binders(ctx: Ctx, ref: CoreRouteRef, m) -> tuple[set, bool]:
     """Every name the handler binds, which shadows a class constant of that name: parameters, locals, lambda and
     local-function parameters, catch variables, names in a loop header (`foreach (var x in ..)`, `for (int x ..`),
     and any identifier inside text the IR keeps unparsed (`out var x`, `is T x`, tuple deconstruction). A `case T x`
@@ -808,14 +821,36 @@ def _binders(ctx: Ctx, ref: CoreRouteRef, m) -> set:
             out |= {x.get("id") for x in walk(n.get("header")) if x.get("k") == "name"}
         elif k == "unknown":
             out |= set(_IDENT.findall(str(n.get("text") or "")))
+    ok = True
     try:
         from checks.dnl.files import read_source
-        lines = read_source(ctx.model.root / ref.route.file).splitlines()[max(m.line - 1, 0):m.end_line or None]
+        if not ref.route.file or not m.end_line or m.end_line < m.line or m.end_line - m.line > 5000:
+            raise ValueError("no usable source range")
+        lines = read_source(ctx.model.root / ref.route.file).splitlines()[max(m.line - 1, 0):m.end_line]
         for hit in _CASE_PATTERN.finditer("\n".join(lines)):
             out |= {g for g in hit.groups() if g}
-    except Exception:  # noqa: BLE001 -- best effort only
-        pass
-    return out
+    except Exception:  # noqa: BLE001 -- the scan is best effort, but a failure is reported by the caller
+        ok = False
+    return out, ok
+
+
+def _has_switch(body) -> bool:
+    """A switch (the IR lowers it to `if`s over the governing expression): a `break;` outside a loop, sibling
+    `if`s with the same condition, or a ternary over a bare name (a switch expression). Loose on purpose: it is
+    only used to decide whether an unreadable source could hide a `case T x` binder."""
+    def same(x, y):
+        return json.dumps(x, sort_keys=True, default=str) == json.dumps(y, sort_keys=True, default=str)
+    for n in walk(body):
+        if n.get("k") == "other" and re.match(r"\s*break[^A-Za-z0-9_]", str(n.get("text") or "")):
+            return True
+        if n.get("k") == "cond" and isinstance(n.get("c"), dict) and n["c"].get("k") in ("name", "member"):
+            return True
+    for stmts in [body] + [n.get("then") for n in walk(body) if n.get("k") == "if"]:
+        conds = [{k: v for k, v in n["cond"].items() if k != "line"} for n in stmts or []
+                 if isinstance(n, dict) and n.get("k") == "if" and isinstance(n.get("cond"), dict)]
+        if any(same(conds[i], conds[j]) for i in range(len(conds)) for j in range(i + 1, len(conds))):
+            return True
+    return False
 
 
 def _page_findings(ctx: Ctx, ref: CoreRouteRef) -> list[tuple[str, int, bool]]:
@@ -825,8 +860,16 @@ def _page_findings(ctx: Ctx, ref: CoreRouteRef) -> list[tuple[str, int, bool]]:
     if m is None:
         return []
     out = []
-    shadow = _binders(ctx, ref, m)       # what the handler binds shadows a class constant of that name
+    shadow, scanned = _binders(ctx, ref, m)    # what the handler binds shadows a class constant of that name
     visible = {k: v for k, v in _consts(ctx, ref).items() if k not in shadow}
+    if not scanned and _has_switch(m.body):
+        # A `case T x` binder could hide behind the unreadable source: no class constant is trusted here, so a
+        # comparison against one stays REVIEW (literal caps still count).
+        visible = {}
+        note = (f"case-pattern binders of {ref.route.handler_name} could not be checked (its source could not be "
+                "read); class constants are not trusted as page-size caps there")
+        if note not in ctx.model.notes:
+            ctx.model.notes.append(note)
     for p in m.params:
         if not (_PAGE_PARAM.match(p.name) and _integer(p.type)):
             continue

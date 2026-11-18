@@ -589,7 +589,8 @@ def test_res004_review_guarded_limiter_wording(tmp_path, mode):
     for i, files in enumerate([mvc(ENABLED, LIMITER, "if (Helper.Flag()) { app.UseRateLimiter(); }"),
                                mvc(LOGIN, LIMITER, "if (Helper.Flag()) { app.UseRateLimiter(); }")]):
         d = of(scan(tmp_path / str(i), files, mode), "DNL-RES-004")[0].description
-        assert "none certain in Production" in d and "no UseRateLimiter, no third-party" not in d
+        assert ("none certain in Production" in d or "certainly runs in Production" in d) and "no UseRateLimiter, no third-party" not in d
+        assert "certainly runs in Production (none certain in Production)" not in d
 
 
 def test_unexpected_folding_error_is_a_model_note(tmp_path, monkeypatch, mode):
@@ -605,3 +606,39 @@ def test_unexpected_folding_error_is_a_model_note(tmp_path, monkeypatch, mode):
     found = rules_pipeline.check(model, refs)
     assert got(found, "DNL-RES-001") == {("DNL-RES-001", "low", "REVIEW")}
     assert any("unexpected error" in n and "RuntimeError" in n for n in model.notes), model.notes
+
+
+# -- fix round 5 ---------------------------------------------------------------------------------------
+
+def test_res005_short_circuit_right_operand_is_not_a_certain_carrier(tmp_path, mode):
+    take = " return Ok(db.Items.Take(n).ToList());"
+    cases = {
+        "and": "var n = pageSize; var ok = Flag() && (n = Math.Min(pageSize, 100)) > 0;",
+        "or": "var n = pageSize; var ok = Flag() || (n = Math.Min(pageSize, 100)) > 0;",
+        "coalesce": "var n = pageSize; var q = maybe ?? (n = Math.Min(pageSize, 100));",
+    }
+    for name, body in cases.items():
+        f = scan(tmp_path / name, _page(body + take), mode)
+        assert got(f, "DNL-RES-005") == {("DNL-RES-005", "low", "REVIEW")}, name
+
+
+def test_res005_unreadable_source_with_a_switch_fails_closed(tmp_path, monkeypatch, mode):
+    from cfgutil import make_app, prepare_model
+    from checks.dnl import files, rules_pipeline
+
+    fields = "private const int max = 100;"
+    tail = " if (pageSize > max) return BadRequest(); return Ok(db.Items.Take(pageSize).ToList());"
+    for name, stmt, expect in (("switch", "switch (o) { case int max: break; }", {("DNL-RES-005", "low", "REVIEW")}),
+                               ("plain", "", set())):
+        root = make_app(tmp_path / name, _page(stmt + tail, fields, "int pageSize, object o"))
+        model, refs = prepare_model(root, mode == "degraded")
+
+        def unreadable(path, *a, **k):
+            raise OSError("synthetic")
+
+        monkeypatch.setattr(files, "read_source", unreadable)
+        found = rules_pipeline.check(model, refs)
+        monkeypatch.undo()
+        assert got(found, "DNL-RES-005") == expect, name
+        if expect:
+            assert any("case-pattern binders" in n for n in model.notes), model.notes
