@@ -613,6 +613,16 @@ def _is_branch_shape(lam: dict) -> bool:
                and receiver_text((n.get("fn") or {}).get("obj")) == params[0] for n in walk(lam.get("body")))
 
 
+def _aliases_builder(lam: dict) -> bool:
+    """A one-parameter lambda that calls `Use*` / `Run*` / `Map*` on a receiver other than its parameter (an
+    alias such as `var b = api; b.UseX();`): its branch shape cannot be told without symbols."""
+    params = lam.get("params") or []
+    if len(params) != 1 or not isinstance(params[0], str):
+        return False
+    return any(n.get("k") == "call" and (call_name(n) or "").startswith(("Run", "Use", "Map"))
+               and receiver_text((n.get("fn") or {}).get("obj")) not in (params[0], "", None) for n in walk(lam.get("body")))
+
+
 def _callback_arg(ctx: _Ctx, call: dict, nm: str):
     """The callback a pipeline call takes: (kind, node-or-method) where kind is "lambda" or "method"; None
     when the call takes none (an options lambda, an endpoint handler, a plain value)."""
@@ -684,6 +694,9 @@ def _callbacks(ctx: _Ctx, call: dict, nm: str, kind: str, scope: dict, guards: t
             else:
                 ok = sym.rsplit(".", 1)[0].endswith(".MapExtensions")
             if not ok:
+                if cb[0] == "lambda" and not sym and _aliases_builder(cb[1]):
+                    ctx.notes.append(f"the lambda of {where} calls pipeline methods on something other than its "
+                                     f"parameter; middleware inside it is not modelled")
                 return
         if cb[0] == "other" or depth >= _MAX_DEPTH:
             ctx.notes.append(f"the branch of {where} could not be followed; middleware inside it is not modelled")
@@ -692,8 +705,6 @@ def _callbacks(ctx: _Ctx, call: dict, nm: str, kind: str, scope: dict, guards: t
         return
     if nm == "Configure" and (kind == "services" or targs):
         return          # `services.Configure<TOptions>(o => ..)` is an options callback, not a pipeline
-    if nm == "ConfigureServices" and kind == "app":
-        return
     cb = _callback_arg(ctx, call, nm)
     if cb is None:
         return

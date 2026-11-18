@@ -499,12 +499,13 @@ def _const_bool(e) -> bool | None:
         return e["v"] if isinstance(e.get("v"), bool) and e.get("t", "bool") == "bool" else None
     if k == "unknown":
         return False if re.fullmatch(r"\s*default\s*\(\s*(?:bool|System\.Boolean|Boolean)\s*\)\s*", e.get("text") or "") else None
-    if k == "unary" and e.get("op") == "!":
+    if k == "unary" and str(e.get("op")).lower() in ("!", "not"):
         v = _const_bool(e.get("e"))
         return None if v is None else not v
     if k != "bin":
         return None
-    op, l, r = e.get("op"), e.get("l"), e.get("r")
+    op, l, r = str(e.get("op")).lower(), e.get("l"), e.get("r")
+    op = {"=": "==", "<>": "!="}.get(op, op)
     if op in ("&&", "and", "andalso", "||", "or", "orelse"):
         lv, rv = _const_bool(l), _const_bool(r)
         if op in ("||", "or", "orelse"):
@@ -513,7 +514,7 @@ def _const_bool(e) -> bool | None:
             if lv is False and rv is False:
                 return False
             for a, b in ((l, r), (r, l)):
-                if isinstance(b, dict) and b.get("k") == "unary" and b.get("op") == "!" and _shape(b.get("e")) == _shape(a):
+                if isinstance(b, dict) and b.get("k") == "unary" and str(b.get("op")).lower() in ("!", "not")                         and isinstance(a, dict) and a.get("k") in ("name", "member", "lit") and _shape(b.get("e")) == _shape(a):
                     return True
             return None
         if lv is False or rv is False:

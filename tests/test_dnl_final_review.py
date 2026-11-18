@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from cfgutil import ids, mode, scan  # noqa: F401,E402
 from test_dnl_auth_flood import App, mode as auth_mode  # noqa: F401,E402
 from checks.dnl.auth_core import PROTECTED, UNKNOWN, UNPROTECTED  # noqa: E402
+from checks.dnl.pipeline import pipeline_for  # noqa: E402
 
 CTRLS = '''using Microsoft.AspNetCore.Mvc; using Microsoft.AspNetCore.Authorization;
 [Authorize] public class SecController : ControllerBase { [HttpGet("/sec")] public string Get() => "x"; }
@@ -62,7 +63,8 @@ def test_local_function_cors_and_cycle(tmp_path, mode):
             "  b.Services.AddCors(o => o.AddPolicy(\"a\", p => p.AllowAnyOrigin().AllowCredentials()));\n"
             "  if (b.Services == null) ConfigureServices(b);\n}\n")
     f = scan(tmp_path, {"Program.cs": prog}, mode)
-    assert any(x.check_id.startswith("DNL-CFG") for x in f), [x.check_id for x in f]
+    assert any(x.check_id == "DNL-CFG-007" for x in f), [x.check_id for x in f]
+    assert len([x for x in f if x.check_id == "DNL-CFG-007"]) >= 1      # the recursive call terminated with the finding intact
 
 
 # -- item 3: custom authorization services block PROTECTED -----------------------------------------
@@ -104,13 +106,13 @@ def test_unrelated_registration_keeps_protected(tmp_path, auth_mode):
 
 _NEVER_SHAPES = {
     "lit": "c => true", "true_or": 'c => true || c.User.IsInRole("a")', "not_false": "c => !false", "eq": "c => 1 == 1",
-    "taut": 'c => c.User.IsInRole("a") || !c.User.IsInRole("a")', "default_or": "c => default(bool) || true",
+    "taut": "c => c.Flag || !c.Flag", "default_or": "c => default(bool) || true",
     "not_ne": "c => !(1 != 1)", "str_eq": 'c => "a" == "a"', "block": "c => { return true || c.Flag; }",
 }
 _DENY_SHAPES = {
     "false_and": "c => false && true", "ident": "c => c.Flag", "false_or": "c => false || c.Flag",
     "ne": "c => 1 != 1", "diff": 'c => c.User.IsInRole("a") || !c.User.IsInRole("b")', "call": "c => Ok()",
-    "and_true": "c => c.Flag && true",
+    "and_true": "c => c.Flag && true", "call_taut": 'c => c.User.IsInRole("a") || !c.User.IsInRole("a")',
 }
 
 
@@ -223,3 +225,69 @@ def test_unfollowable_branch_adds_note(tmp_path, auth_mode):
     app = App(tmp_path, auth_mode, prog, {})
     pipe = pipeline_for(app.model, app.model.projects[0] if hasattr(app.model, "projects") and app.model.projects else None)
     assert any("branch" in n for n in pipe.notes), pipe.notes
+
+
+# -- re-review fixes ----------------------------------------------------------------------------------
+
+def _webhost_prog(reg):
+    return (USINGS + "var builder = WebApplication.CreateBuilder(args);\nbuilder.Services.AddControllers();\n"
+            "builder.WebHost.ConfigureServices(s => { " + reg + " });\nvar app = builder.Build();\n" + TAIL)
+
+
+def test_webhost_configure_services_never_denying_policy(tmp_path, auth_mode):
+    reg = ("s.AddAuthorization(o => o.DefaultPolicy = new AuthorizationPolicyBuilder()"
+           ".RequireAssertion(c => true).Build());")
+    a = App(tmp_path, auth_mode, _webhost_prog(reg), {"C.cs": CTRLS})("SecController.Get")
+    assert a.state == UNPROTECTED, (a.state, a.reasons, a.notes)
+
+
+def test_webhost_configure_services_cors_registration(tmp_path, mode):
+    prog = ("var builder = WebApplication.CreateBuilder(args);\n"
+            'builder.WebHost.ConfigureServices(s => { s.AddCors(o => o.AddPolicy("a", p => p.AllowAnyOrigin().AllowCredentials())); });\n'
+            "var app = builder.Build();\napp.Run();\n")
+    f = scan(tmp_path, {"Program.cs": prog}, mode)
+    assert any(x.check_id == "DNL-CFG-007" for x in f), [x.check_id for x in f]
+
+
+def test_vb_and_c_operator_spellings_fold():
+    from checks.dnl.auth_core import _const_bool
+    T, F = {"k": "lit", "v": True, "t": "bool"}, {"k": "lit", "v": False, "t": "bool"}
+    n = lambda v: {"k": "lit", "v": v, "t": "number"}
+    x = {"k": "name", "id": "Foo"}
+    call = {"k": "call", "fn": {"k": "name", "id": "Next"}, "args": []}
+    b = lambda op, l, r: {"k": "bin", "op": op, "l": l, "r": r}
+    assert _const_bool(b("OrElse", T, call)) is True
+    assert _const_bool(b("Or", T, x)) is True
+    assert _const_bool(b("AndAlso", F, x)) is False
+    assert _const_bool(b("And", F, x)) is False
+    assert _const_bool({"k": "unary", "op": "Not", "e": F}) is True
+    assert _const_bool(b("=", n(1), n(1))) is True
+    assert _const_bool(b("<>", n(1), n(1))) is False
+    assert _const_bool(b("OrElse", x, {"k": "unary", "op": "Not", "e": x})) is True
+    assert _const_bool(b("AndAlso", x, T)) is None
+    assert _const_bool(b("||", call, {"k": "unary", "op": "!", "e": call})) is None
+
+
+def test_guarded_custom_authz_service_stays_protected_in_production(tmp_path, auth_mode):
+    prog = (USINGS + "var b = WebApplication.CreateBuilder(args);\nb.Services.AddControllers(); b.Services.AddAuthorization();\n"
+            "if (b.Environment.IsDevelopment()) { b.Services.AddScoped<IAuthorizationService, As>(); }\n"
+            "var app = b.Build();\n" + TAIL)
+    a = App(tmp_path, auth_mode, prog, {"C.cs": CTRLS, "X.cs": "public class As {}"})("SecController.Get")
+    assert a.state == PROTECTED, (a.state, a.reasons, a.notes)
+
+
+def test_namespaced_top_level_controller_is_a_route(tmp_path, auth_mode):
+    prog = (USINGS + "var b = WebApplication.CreateBuilder(args);\nb.Services.AddControllers();\nvar app = b.Build();\napp.MapControllers(); app.Run();\n")
+    files = {"C.cs": 'using Microsoft.AspNetCore.Mvc;\nnamespace My.Area { public class NsController : ControllerBase '
+                     '{ [HttpGet("/ns")] public string Get() => "x"; } }\n'}
+    paths = {r.route.path for r in App(tmp_path, auth_mode, prog, files).refs}
+    assert "/ns" in paths, paths
+
+
+def test_map_lambda_with_aliased_builder_adds_note(tmp_path, auth_mode):
+    prog = ("var builder = WebApplication.CreateBuilder(args);\nvar app = builder.Build();\n"
+            'app.Map("/x", api => { var b = api; b.UseDeveloperExceptionPage(); });\napp.MapGet("/", () => 1);\napp.Run();\n')
+    a = App(tmp_path, auth_mode, prog, {})
+    pl = pipeline_for(a.model, a.model.projects[0] if hasattr(a.model, "projects") else None)
+    if auth_mode:       # degraded: no symbols, so the alias cannot be resolved and the pipeline says so
+        assert any("other than its parameter" in n for n in pl.notes), pl.notes

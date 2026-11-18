@@ -323,9 +323,17 @@ A report is a floor, not a clean bill.
   `IAuthorizationMiddlewareResultHandler`, `IAuthorizationHandlerProvider` or
   application-model provider / convention registered in DI makes `[Authorize]`
   routes UNKNOWN; the implementation bodies are not analysed.
-- A `RequireAssertion` lambda is folded for constants (`true`, `!false`,
-  `1 == 1`, `x || !x`, short-circuit); any other body counts as a deny without a
-  note.
+- `IAuthorizationHandler` registrations are not treated as replacing authorization
+  (most apps register handlers), so they never block PROTECTED. A custom handler
+  is analysed only when `DNL-AUTHZ-003` can see it: a handler class whose
+  `HandleRequirementAsync` succeeds on every path and never calls `Fail` is
+  reported, and a policy whose requirement is bound to it counts as never
+  denying. A handler that calls `Succeed()` unconditionally through helpers,
+  delegates or a requirement the analysis cannot bind to it is not analysed.
+- A `RequireAssertion` lambda is folded for constants in C# and VB (`true` /
+  `True`, `!false` / `Not False`, `1 == 1` / `1 = 1`, `x || !x`, short-circuit
+  `||` / `OrElse` and `&&` / `AndAlso`; `x || !x` only for a name, member or
+  literal `x`, never a call); any other body counts as a deny without a note.
 - Nested controller classes are never listed (MVC does not discover them).
 - A `Directory.Build.props` above the scan root is not read, and
   `Web.config` in an SDK-style project is not read.
