@@ -362,7 +362,7 @@ class _Lowering:
                 "attributes": [], "handles": [], "implements": [], "body": body,
                 "line": line, "end_line": end}
         return {"name": "Program", "namespace": "", "kind": "class", "modifiers": ["static", "partial"],
-                "bases": [], "attributes": [], "fields": [], "properties": [], "methods": [main],
+                "bases": [], "attributes": [], "fields": [], "properties": [], "special_members": [], "methods": [main],
                 "line": line, "end_line": end}
 
     def fields(self, node: Node, members: list[Node]) -> list[dict]:

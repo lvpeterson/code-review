@@ -107,13 +107,18 @@ CRYPTO_EXPECTED = {
     ("DNL-CRY-008", CRYPTO_FILE, 48, "medium"),
     ("DNL-SEC-003", CRYPTO_FILE, 62, "high"),
 }
+# Findings other rule modules add on the same fixture (the pipeline / identity config rules), each
+# verified against the source: Login passes lockoutOnFailure: false to CheckPasswordSignInAsync.
+CRYPTO_CONFIG_EXTRA = {
+    ("DNL-SEC-006", "Controllers/FlowsController.cs", 25, "medium"),
+}
 
 
 @pytest.mark.parametrize("mode", ["helper", "degraded"])
 def test_crypto_findings_on_core(mode, monkeypatch):
     results = _carried(monkeypatch, mode)
     got = _family(results, ("DNL-CRY-", "DNL-SEC-"))
-    assert got == CRYPTO_EXPECTED
+    assert got == CRYPTO_EXPECTED | CRYPTO_CONFIG_EXTRA
     assert not [g for g in got if g[1].endswith("SafeCrypto.cs")]
 
 
@@ -230,6 +235,14 @@ RESOURCES_EXPECTED = {
     ("DNL-INV-002", "Program.cs", 15, "low"),                         # guard on a config value: unknown -> Production
     ("DNL-INV-002", "Program.cs", 19, "low"),                         # IsDevelopment() || StartsWith(..): unknown
 }
+# Same-prefix findings from the pipeline rules, each verified against the fixture source: Login (line 22)
+# has no limiter, and the three UseSwagger calls (Program.cs 11, 15, 19) are not proven Development-only.
+RESOURCES_PIPELINE_EXTRA = {
+    ("DNL-RES-004", "Controllers/FlowsController.cs", 22, "low"),
+    ("DNL-INV-003", "Program.cs", 11, "low"),
+    ("DNL-INV-003", "Program.cs", 15, "low"),
+    ("DNL-INV-003", "Program.cs", 19, "low"),
+}
 
 
 @pytest.mark.parametrize("mode", ["helper", "degraded"])
@@ -237,7 +250,7 @@ def test_resources_inventory_on_core(mode, monkeypatch):
     results = _carried(monkeypatch, mode)
     # SaveChecked (file.Length guard), the capped Take(Math.Min(..)) page and the swagger UI under
     # IsDevelopment() stay silent
-    assert _family(results, ("DNL-RES-", "DNL-INV-")) == RESOURCES_EXPECTED
+    assert _family(results, ("DNL-RES-", "DNL-INV-")) == RESOURCES_EXPECTED | RESOURCES_PIPELINE_EXTRA
     # only the proven Development guard (line 8) is suppressed; the text names the Core remedy
     sw = next(f for r in results for f in r.findings if f.check_id == "DNL-INV-002" and f.line == 11)
     assert "Development" in sw.description and "web.config" not in sw.description
@@ -306,7 +319,7 @@ def test_one_crashing_module_does_not_hide_others(monkeypatch):
     notes = [n for r in results for n in r.notes]
     assert any("rules_errors failed (RuntimeError: boom)" in n for n in notes)
     got = _family(results, ("DNL-CRY-", "DNL-SEC-"))
-    assert got == CRYPTO_EXPECTED
+    assert got == CRYPTO_EXPECTED | CRYPTO_CONFIG_EXTRA
     assert not _family(results, ("DNL-ERR-",))
     # the modules wired after the crashing one still ran
     assert _family(results, ("DNL-LOG-", "DNL-SESS-")) >= LOGGING_EXPECTED
@@ -315,6 +328,18 @@ def test_one_crashing_module_does_not_hide_others(monkeypatch):
 # -- Web.config guard (Review Focus 3) --------------------------------------------------------------
 
 WEB_CONFIG_ONLY = FX / "web_config_only_core"
+
+
+# Ids only the legacy Web.config analyzers produce (rules_config CFG-001..006, rules_wcf_config WCF-*).
+# CFG-007 is shared with the Core CORS rule and CFG-008..015 are Core pipeline rules built from
+# Program.cs / appsettings, so those are told apart by the file they point at.
+_WEB_CONFIG_ONLY_IDS = {f"DNL-CFG-00{i}" for i in range(1, 7)}
+
+
+def _from_web_config(f):
+    name = Path(f.file).name.lower()
+    return (f.check_id in _WEB_CONFIG_ONLY_IDS or f.check_id.startswith("DNL-WCF-")
+            or name == "web.config" or name.endswith(".config"))
 
 
 @pytest.mark.parametrize("root", [CARRIED_APP, WEB_CONFIG_ONLY], ids=["carried_app", "web_config_only_core"])
@@ -330,8 +355,7 @@ def test_web_config_checks_do_not_run_on_core(root, mode, request, monkeypatch):
     results = _dotnet(root, allow_degraded=(mode == "degraded"))
     assert results
     findings = [f for r in results for f in r.findings]
-    assert not [f for f in findings if f.check_id.startswith(("DNL-CFG-", "DNL-WCF-"))]
-    assert not [f for f in findings if Path(f.file).name.lower() == "web.config"]
+    assert not [f for f in findings if _from_web_config(f)]
     assert not [n for r in results for n in r.notes if "failed (" in n]
 
 
@@ -346,7 +370,7 @@ def test_legacy_still_reads_web_config_in_mixed_solution(tmp_path):
     project._CACHE.clear()
     legacy = [f for r in _legacy(root) for f in r.findings if Path(f.file).name == "Web.config"]
     assert "DNL-CFG-002" in {f.check_id for f in legacy}     # customErrors mode="Off"
-    assert not [f for r in _dotnet(root) for f in r.findings if f.check_id.startswith("DNL-CFG-")]
+    assert not [f for r in _dotnet(root) for f in r.findings if _from_web_config(f)]
 
 
 # -- degraded parity ---------------------------------------------------------------------------------
