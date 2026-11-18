@@ -176,6 +176,9 @@ def _is_controller(model: ProjectModel, t: TypeIR, chain: list[TypeIR]) -> bool:
     mods = {x.lower() for x in t.modifiers}
     if t.kind != "class" or "public" not in mods or "abstract" in mods or "<" in t.name:
         return False
+    # MVC's controller feature provider requires a top-level public type: a nested class is never discovered.
+    if "." in t.name:
+        return False
     if _open_generic(model, [t]):
         return False
     if any(has_attr(ct.attributes, "NonController") for ct in chain):

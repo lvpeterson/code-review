@@ -71,7 +71,9 @@ Route discovery handles attribute routing (`[Route]`, `[HttpX]`, `[Area]`,
 `[ApiVersion]` paths), conventional controller routes, Razor Pages under `Pages/`
 and `Areas/<A>/Pages/` (with `_ViewImports` directives), minimal-API lambdas,
 `MapGroup` prefixes and conventions, `UseEndpoints` lambdas and `Startup`
-classes. Code calling a solution method is followed inline.
+classes. Code calling a solution method, a local function, a host callback
+(`ConfigureWebHostDefaults` / `ConfigureServices` / `Configure` lambdas) or a
+`Map` / `MapWhen` / `UseWhen` branch is followed inline.
 
 ## What is analysed
 
@@ -198,7 +200,8 @@ untrusted data, is reported as REVIEW, one severity lower, with no route.
 ## Configuration rules
 
 Run on the pipeline of each web project (`Program.cs` top-level code, a `Startup`
-class, or a static `Main`; solution methods are followed at the call site) and on
+class, or a static `Main`; solution methods, local functions and host callbacks are
+followed at the call site, branch lambdas as conditional code) and on
 `appsettings*.json`. Modules: `rules_pipeline`, `rules_pipeline_auth`,
 `rules_secrets_core`, `rules_limits_core`, with `pipeline.py`, `options.py`,
 `cfgctx.py` and `appsettings.py` as readers. The ids and severities are in the
@@ -306,6 +309,30 @@ A report is a floor, not a clean bill.
   REVIEW route recovered from source text.
 - Two lambdas on one source line share a key, so findings may be attributed to
   both.
+- Calls are followed only when the target is a unique solution method (by name
+  when the helper gave no symbol), a local function or a lambda-valued local, or a
+  host / branch callback written as a lambda or a solution method group. A delegate
+  held in a field or property, a callback from another project, and an overload set
+  that cannot be told apart without symbols are not followed: a model note says so
+  and the absence findings that depend on the pipeline stay REVIEW.
+- A middleware branch (`Map` / `MapWhen` / `UseWhen`) is walked as conditional
+  code: findings inside still fire, but UseHttpsRedirection, UseHsts,
+  UseExceptionHandler and UseAuthorization inside a branch never count as covering
+  the whole app.
+- A user-defined `IPolicyEvaluator`, `IAuthorizationService`,
+  `IAuthorizationMiddlewareResultHandler`, `IAuthorizationHandlerProvider` or
+  application-model provider / convention registered in DI makes `[Authorize]`
+  routes UNKNOWN; the implementation bodies are not analysed.
+- A `RequireAssertion` lambda is folded for constants (`true`, `!false`,
+  `1 == 1`, `x || !x`, short-circuit); any other body counts as a deny without a
+  note.
+- Nested controller classes are never listed (MVC does not discover them).
+- A `Directory.Build.props` above the scan root is not read, and
+  `Web.config` in an SDK-style project is not read.
+- A multi-target project reports its findings once per target package.
+- On net7.0+ minimal hosting `UseAuthentication` / `UseAuthorization` placed in
+  the wrong order are not flagged (only Startup-style and pre-net7.0 pipelines are
+  checked for order).
 
 **Taint and object rules**
 
