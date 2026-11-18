@@ -40,6 +40,20 @@ _OPS = {"*": lambda a, b: a * b, "+": lambda a, b: a + b, "-": lambda a, b: a - 
         "/": lambda a, b: a // b if b else UNKNOWN, "<<": lambda a, b: a << b if 0 <= b < 64 else UNKNOWN}
 
 
+_UNEXPECTED: list[str] = []       # errors the folding did not expect; check() turns them into model notes
+
+
+class _Stop(Exception):
+    """The text is not a constant this folder reads (or it is too big or too deep): UNKNOWN."""
+
+
+def _note_unexpected(exc: Exception) -> None:
+    """Folding is total, but only the expected failures are silent: anything else is a programming error and
+    must stay visible (a model note), while the value still reads as UNKNOWN."""
+    if not isinstance(exc, (_Stop, ArithmeticError, ValueError, RecursionError, IndexError)):
+        _UNEXPECTED.append(f"{type(exc).__name__}: {exc}")
+
+
 _CAP = 2**80                      # intermediate results above this abort the folding (UNKNOWN)
 
 
@@ -61,7 +75,8 @@ def _num(e, consts: dict | None = None):
     reads as UNKNOWN."""
     try:
         return _num_of(e, consts)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _note_unexpected(exc)
         return UNKNOWN
 
 
@@ -233,16 +248,13 @@ _FOLD_TOKEN = re.compile(r"\s*(?:(\d[\d_]*)[lLuU]*|(<<|[-+*/()])|([A-Za-z_][\w.]
 _MAX_TOKENS, _MAX_DEPTH = 200, 40
 
 
-class _Stop(Exception):
-    """The text is not a constant this folder reads (or it is too big or too deep): UNKNOWN."""
-
-
 def _fold(text: str):
     """`_fold_text`, made total: whatever goes wrong (a malformed expression, a recursion limit, an overflow)
     reads as UNKNOWN, so one odd directive can never take the rest of the rules down with it."""
     try:
         return _fold_text(text)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _note_unexpected(exc)
         return UNKNOWN
 
 
@@ -536,17 +548,17 @@ def _rate_limiting(ctx: Ctx) -> None:
             more = f" and {len(open_routes) - 5} more" if len(open_routes) > 5 else ""
             if _env_state(r.meta.get("env")) == "review":
                 conf = "REVIEW"
-            lead = ("The Production pipeline has no limiter that certainly runs in Production (no UseRateLimiter, no "
-                    "third-party limiter)"
+            none = ("none certain in Production" if maybe_global else "no UseRateLimiter, no third-party limiter")
+            lead = (f"The Production pipeline has no limiter that certainly runs in Production ({none})"
                     if unenforced else
-                    "The Production pipeline has no rate limiting (no UseRateLimiter, no third-party limiter, no "
-                    "RequireRateLimiting / [EnableRateLimiting] on the route or its group)")
+                    f"The Production pipeline has no rate limiting ({none}, no RequireRateLimiting / "
+                    "[EnableRateLimiting] on the route or its group)")
             desc = (f"{lead} while it serves login, token or password-reset endpoints: {names}{more}. They are "
                     "open to credential stuffing, password guessing and reset-mail floods.")
             if unenforced:
                 desc += (" A rate-limiting policy is named on "
                          + ", ".join(f"{x.route.handler_name} ({x.route.path})" for x in unenforced[:5])
-                         + ", but UseRateLimiter is not in the Production pipeline, so the policy is unenforced.")
+                         + ", but no rate limiter middleware is certain in the Production pipeline, so the policy is unenforced.")
             elif pipe.named("AddRateLimiter") and not pipe.named("UseRateLimiter"):
                 desc += " AddRateLimiter registers policies, but without UseRateLimiter nothing enforces them."
             if note:
@@ -559,7 +571,8 @@ def _rate_limiting(ctx: Ctx) -> None:
             c = identity[0]
             ctx.add("DNL-RES-004", "low", "No rate limiting on the Identity API endpoints",
                     "MapIdentityApi registers the /login, /refresh, /forgotPassword and /resetPassword endpoints, "
-                    "and the Production pipeline has no rate limiting (no UseRateLimiter, no third-party limiter). "
+                    "and the Production pipeline has no rate limiting ("
+                    + ("none certain in Production" if maybe_global else "no UseRateLimiter, no third-party limiter") + "). "
                     "Confirm a limiter covers them." + (f" Not certain: {note}." if note else ""),
                     c.file, c.line, confidence="REVIEW")
 
@@ -621,20 +634,20 @@ _STOP_KINDS = frozenset({"if", "loop", "cond", "lambda"})
 _OR, _AND = frozenset({"||", "or", "orelse"}), frozenset({"&&", "and", "andalso"})
 
 
-def _top(node):
+def _top(node, stop=_STOP_KINDS):
     """Pre-order over the nodes that run whenever the code around them runs: it stops at (but yields) an `if`,
     a loop, a ternary and a lambda or local function (their bodies may not run, or run elsewhere), and skips
     `catch` handlers."""
     if isinstance(node, list):
         for x in node:
-            yield from _top(x)
+            yield from _top(x, stop)
     elif isinstance(node, dict):
         yield node
-        if node.get("k") in _STOP_KINDS:
+        if node.get("k") in stop:
             return
         for key, v in node.items():
             if isinstance(v, (dict, list)) and not (node.get("k") == "try" and key == "catches"):
-                yield from _top(v)
+                yield from _top(v, stop)
 
 
 def _acts(stmts, names: set) -> bool:
@@ -695,6 +708,19 @@ def _inside(branch, takes: list[dict]) -> bool:
     return all(id(t) in ids for t in takes)
 
 
+def _value_caps(val, names: set, consts: dict) -> bool:
+    """An expression that hands over a capped value: a ternary giving the constant to the "too big" arm and the
+    value to the other, or a Min / Clamp call with a constant operand."""
+    for n in walk(val):
+        if n.get("k") != "cond":
+            continue
+        big, small = (n.get("t"), n.get("f")) if _guards(n.get("c"), "exceed", names, consts) else (
+            (n.get("f"), n.get("t")) if _guards(n.get("c"), "within", names, consts) else (None, None))
+        if isinstance(_num(big, consts), (int, float)) and _tracked(small, names):
+            return True
+    return bool(_bound_calls(val, names, consts, need_const=True))
+
+
 def _bound_state(body: list, names: set, takes: list[dict], consts: dict) -> str | None:
     """"bound" when the handler certainly caps the value, "weak" when a comparison or Min / Clamp mentions it
     but nothing shows that it limits what reaches Take (REVIEW), None when nothing does. A cap is: a
@@ -715,27 +741,31 @@ def _bound_state(body: list, names: set, takes: list[dict], consts: dict) -> str
             strong = True
         if _guards(cond, "within", names, consts) and (_acts(other, names) or _inside(then, takes)):
             strong = True
-    contexts: list[tuple[object, bool]] = [(a, True) for t in takes for a in t.get("args") or []]
+    # Carriers: a local or assignment that holds the (capped) value Take reads. Only a statement the handler
+    # always reaches counts (not under an if / else / loop / switch / try / lambda / ternary arm); the last such
+    # carrier before the Take wins, and a later conditional re-assignment from the raw value undoes it.
+    top = {id(n) for n in _top(body, _STOP_KINDS | {"try"})}
+    carriers: dict[str, list[tuple[object, bool]]] = {}
     for n in walk(body):
-        before = order.get(id(n), 1 << 30) < first_take
+        if order.get(id(n), 1 << 30) >= first_take:
+            continue
         if n.get("k") == "local" and n.get("name") in names:
-            contexts.append((n.get("init"), before and n.get("name") in reach))
+            carriers.setdefault(n["name"], []).append((n.get("init"), id(n) in top))
         elif (n.get("k") == "assign" and n.get("op") == "=" and isinstance(n.get("target"), dict)
               and n["target"].get("k") == "name" and n["target"].get("id") in names):
-            contexts.append((n.get("value"), before and n["target"]["id"] in reach))
-    for val, reaches in contexts:
-        if not reaches:
-            continue
-        for n in walk(val):
-            if n.get("k") != "cond":
-                continue
-            # The arm taken when the comparison says "too big" must be the constant, the other the value.
-            big, small = (n.get("t"), n.get("f")) if _guards(n.get("c"), "exceed", names, consts) else (
-                (n.get("f"), n.get("t")) if _guards(n.get("c"), "within", names, consts) else (None, None))
-            if isinstance(_num(big, consts), (int, float)) and _tracked(small, names):
-                strong = True
-        if _bound_calls(val, names, consts, need_const=True):
+            carriers.setdefault(n["target"]["id"], []).append((n.get("value"), id(n) in top))
+    for target, items in carriers.items():
+        state = False
+        for val, certain in items:
+            capped = _value_caps(val, names, consts)
+            if certain:
+                state = capped
+            elif not capped and _mentions(val, names):
+                state = False
+        if state and target in reach:
             strong = True
+    if any(_value_caps(a, names, consts) for t in takes for a in t.get("args") or []):
+        strong = True
     if strong:
         return "bound"
     return "weak" if _cmp_nodes(body, names) or _bound_calls(body, names, consts) else None
@@ -756,6 +786,38 @@ def _consts(ctx: Ctx, ref: CoreRouteRef) -> dict:
     return out
 
 
+_IDENT = re.compile(r"[A-Za-z_]\w*")
+_CASE_PATTERN = re.compile(r"\bcase\s+[\w.<>\[\]?]+\s+([A-Za-z_]\w*)|\b([A-Za-z_]\w*)\s*(?:when\b|=>)")
+
+
+def _binders(ctx: Ctx, ref: CoreRouteRef, m) -> set:
+    """Every name the handler binds, which shadows a class constant of that name: parameters, locals, lambda and
+    local-function parameters, catch variables, names in a loop header (`foreach (var x in ..)`, `for (int x ..`),
+    and any identifier inside text the IR keeps unparsed (`out var x`, `is T x`, tuple deconstruction). A `case T x`
+    pattern is not in the IR, so the method's source lines are scanned for it as well (best effort)."""
+    out = {q.name for q in m.params}
+    for n in walk(m.body):
+        k = n.get("k")
+        if k == "local":
+            out.add(n.get("name"))
+        elif k == "lambda":
+            out |= {x for x in n.get("params") or [] if isinstance(x, str)}
+        elif k == "try":
+            out |= {c.get("name") for c in n.get("catches") or [] if isinstance(c, dict)}
+        elif k == "loop":
+            out |= {x.get("id") for x in walk(n.get("header")) if x.get("k") == "name"}
+        elif k == "unknown":
+            out |= set(_IDENT.findall(str(n.get("text") or "")))
+    try:
+        from checks.dnl.files import read_source
+        lines = read_source(ctx.model.root / ref.route.file).splitlines()[max(m.line - 1, 0):m.end_line or None]
+        for hit in _CASE_PATTERN.finditer("\n".join(lines)):
+            out |= {g for g in hit.groups() if g}
+    except Exception:  # noqa: BLE001 -- best effort only
+        pass
+    return out
+
+
 def _page_findings(ctx: Ctx, ref: CoreRouteRef) -> list[tuple[str, int, bool]]:
     """[(parameter, line of the Take call, weak)] for page-size parameters reaching Take with no certain
     bound; `weak` when some comparison or Min / Clamp mentions the value but does not visibly cap it."""
@@ -763,9 +825,7 @@ def _page_findings(ctx: Ctx, ref: CoreRouteRef) -> list[tuple[str, int, bool]]:
     if m is None:
         return []
     out = []
-    # Parameters and locals of the handler (and lambda parameters in it) shadow class constants of that name.
-    shadow = {q.name for q in m.params} | {n.get("name") for n in walk(m.body) if n.get("k") == "local"} | {
-        x for n in walk(m.body) if n.get("k") == "lambda" for x in n.get("params") or [] if isinstance(x, str)}
+    shadow = _binders(ctx, ref, m)       # what the handler binds shadows a class constant of that name
     visible = {k: v for k, v in _consts(ctx, ref).items() if k not in shadow}
     for p in m.params:
         if not (_PAGE_PARAM.match(p.name) and _integer(p.type)):
@@ -830,6 +890,7 @@ def _settings_all(ctx: Ctx) -> None:
 def check(ctx: Ctx) -> None:
     """Each sub-rule runs on its own: one that crashes adds a model note naming it (its findings are missing)
     and never hides the others. Looked up by name at call time, the aggregator's isolation stays the outer net."""
+    _UNEXPECTED.clear()
     for name, fn_name in (("code_limits", "_code_all"), ("settings_limit", "_settings_all"),
                           ("route_limits", "_route_limits"), ("rate_limiting", "_rate_limiting"),
                           ("page_sizes", "_page_sizes")):
@@ -840,3 +901,8 @@ def check(ctx: Ctx) -> None:
             note = f"limits.{name} failed ({type(exc).__name__}: {exc}); its findings are missing"
             if note not in ctx.model.notes:
                 ctx.model.notes.append(note)
+    for msg in dict.fromkeys(_UNEXPECTED):
+        note = f"limits folding hit an unexpected error ({msg}); the value read as unknown (REVIEW)"
+        if note not in ctx.model.notes:
+            ctx.model.notes.append(note)
+    _UNEXPECTED.clear()

@@ -531,3 +531,77 @@ def test_res004_unenforced_lead_with_review_guarded_limiter(tmp_path, mode):
     f = scan(tmp_path, mvc(ENABLED, LIMITER, "if (Helper.Flag()) { app.UseRateLimiter(); }"), mode)
     d = of(f, "DNL-RES-004")[0].description
     assert "runs no rate limiter" not in d and "certainly runs in Production" in d
+
+
+# -- fix round 4 ---------------------------------------------------------------------------------------
+
+def test_res005_conditional_carriers_do_not_cap(tmp_path, mode):
+    take = " return Ok(db.Items.Take(n).ToList());"
+    review = {
+        "if": "var n = pageSize; if (Flag()) { n = pageSize > 100 ? 100 : pageSize; }" + take,
+        "foreach": "var n = pageSize; foreach (var x in xs) { n = Math.Min(pageSize, 100); }" + take,
+        "else": "var n = pageSize; if (Flag()) { } else { n = Math.Min(pageSize, 100); }" + take,
+        "try": "var n = pageSize; try { n = Math.Min(pageSize, 100); } catch (Exception) { }" + take,
+        "lambda": "var n = pageSize; Action a = () => { n = Math.Min(pageSize, 100); };" + take,
+        "later_raw": "var n = Math.Min(pageSize, 100); if (Flag()) { n = pageSize; }" + take,
+    }
+    for name, body in review.items():
+        f = scan(tmp_path / name, _page(body), mode)
+        assert got(f, "DNL-RES-005") == {("DNL-RES-005", "low", "REVIEW")}, name
+    clean = {
+        "top_level": "var n = pageSize; n = Math.Min(pageSize, 100);" + take,
+        "last_wins": "var n = pageSize; if (Flag()) { n = pageSize; } n = Math.Min(pageSize, 100);" + take,
+        "declared": "var n = Math.Min(pageSize, 100);" + take,
+    }
+    for name, body in clean.items():
+        assert not got(scan(tmp_path / name, _page(body), mode), "DNL-RES-005"), name
+
+
+def test_res005_every_binder_shadows_a_class_constant(tmp_path, mode):
+    fields = "private const int max = 100;"
+    tail = " if (pageSize > max) return BadRequest(); return Ok(db.Items.Take(pageSize).ToList());"
+    binders = {
+        "foreach": "foreach (var max in xs) { }",
+        "out_var": "int.TryParse(s, out var max);",
+        "out_int": "int.TryParse(s, out int max);",
+        "for": "for (int max = 0; max < 3; max++) { }",
+        "catch": "try { } catch (Exception max) { }",
+        "is_pattern": "if (o is int max) { }",
+        "case_pattern": "switch (o) { case int max: break; }",
+        "tuple": "var (max, other) = Get();",
+        "lambda": "Func<int, int> f = max => max;",
+        "local_fn": "int Local(int max) => max;",
+    }
+    for name, stmt in binders.items():
+        f = scan(tmp_path / name, _page(stmt + tail, fields), mode)
+        assert got(f, "DNL-RES-005") == {("DNL-RES-005", "low", "REVIEW")}, name
+    assert not got(scan(tmp_path / "plain", _page(tail, fields), mode), "DNL-RES-005")
+
+
+def test_malformed_directive_open_paren(tmp_path, mode):
+    f = scan(tmp_path, razor("[RequestFormLimits(MultipartBodyLengthLimit = (1, 2))]"), mode)
+    assert ("DNL-RES-001", "low", "REVIEW") in got(f, "DNL-RES-001")
+    f = scan(tmp_path / "b", razor("[RequestSizeLimit((1)]"), mode)
+    assert ("DNL-RES-001", "low", "REVIEW") in got(f, "DNL-RES-001")
+
+
+def test_res004_review_guarded_limiter_wording(tmp_path, mode):
+    for i, files in enumerate([mvc(ENABLED, LIMITER, "if (Helper.Flag()) { app.UseRateLimiter(); }"),
+                               mvc(LOGIN, LIMITER, "if (Helper.Flag()) { app.UseRateLimiter(); }")]):
+        d = of(scan(tmp_path / str(i), files, mode), "DNL-RES-004")[0].description
+        assert "none certain in Production" in d and "no UseRateLimiter, no third-party" not in d
+
+
+def test_unexpected_folding_error_is_a_model_note(tmp_path, monkeypatch, mode):
+    from cfgutil import make_app, prepare_model
+    from checks.dnl import rules_limits_core, rules_pipeline
+
+    def boom(*a):
+        raise RuntimeError("synthetic")
+
+    monkeypatch.setattr(rules_limits_core, "_apply", boom)
+    root = make_app(tmp_path, kestrel("o.Limits.MaxRequestBodySize = 1 * 2"))
+    model, refs = prepare_model(root, mode == "degraded")
+    found = rules_pipeline.check(model, refs)
+    assert got(found, "DNL-RES-001") == {("DNL-RES-001", "low", "REVIEW")}
+    assert any("unexpected error" in n and "RuntimeError" in n for n in model.notes), model.notes
