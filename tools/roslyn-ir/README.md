@@ -1,7 +1,7 @@
 # roslyn-ir
 
 A small .NET 8 console tool that parses C# and VB.NET sources with Roslyn and
-emits a JSON IR (schema 2) for the `dotnet_legacy` analyzer. The Python side
+emits a JSON IR (schema 2) for the `dotnet` and `dotnet_legacy` analyzers. The Python side
 (`checks/dnl/`) drives it as a subprocess; this is the only C# code in the repo.
 
 ## Build
@@ -61,7 +61,11 @@ pinned to `[8.0.11]`) are DotnetPlatform packages, so the csproj uses
   an unknown name falls back to `net48` with a stderr warning) choosing the
   reference-assembly folder, and `"global_usings": ["Microsoft.AspNetCore.Http", ...]`
   (C# only): namespaces compiled as `global using` directives, standing in for
-  an SDK project's implicit usings.
+  an SDK project's implicit usings. `"defines": ["NET8_0", "TRACE", ...]` (C# only)
+  sets the preprocessor symbols of that entry's parse, so `#if` branches are
+  lowered the way the build sees them. A multi-targeted project is sent as two
+  entries over the same files (one per profile, each with its own `refs` and
+  `defines`); the Python model routes each IR back to the right package.
 
   Writes JSON Lines to stdout, one object per file, in input order. A file that
   cannot be read or lowered yields `{"path": rel, "error": "<message>"}` and the
@@ -80,7 +84,9 @@ failure), 2 usage.
   `project`, `parse_errors` (count of Roslyn error diagnostics), `types`.
 - Type: `name`, `namespace`, `kind` (`class`|`interface`|`struct`|`module`|`enum`),
   `modifiers`, `bases` (simple names), `attributes`, `fields`, `properties`,
-  `methods`, `line`, `end_line`. Nested types are flattened as `Outer.Inner`.
+  `methods`, `special_members`, `line`, `end_line`. `special_members` lists the
+  member kinds the IR does not lower (`indexer`, `operator`, `event`, `destructor`;
+  presence only, C# types), so convention analysis can fail closed on them. Nested types are flattened as `Outer.Inner`.
 - Attr: `name` (qualifier and `Attribute` suffix stripped), `args`, `named`, `line`.
 - Field: `name`, `type`, `line`, `init`, `is_const`. Enum members are const fields.
 - Prop: `name`, `type`, `attributes`, `line`, and optional `get` / `set` (Stmt

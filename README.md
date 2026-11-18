@@ -41,11 +41,11 @@ python main.py <target_path> --sarif report.sarif
 python main.py <target_path> --language python --framework flask   # skip detection
 python main.py <target_path> --allow-path "/health" --allow-path "/api/public/*"
 python main.py <target_path> --fail-on medium   # exit 1 if any medium+ finding exists (CI use)
-python main.py <target_path> --allow-degraded   # .NET Framework: continue without the Roslyn helper
+python main.py <target_path> --allow-degraded   # .NET: continue without the Roslyn helper (reduced precision)
 python main.py <target_path> --sca              # + known-vulnerable dependencies via osv-scanner (on PATH)
 ```
 
-Legacy .NET Framework targets need the Roslyn helper in `tools/roslyn-ir`. It
+C# / .NET targets (ASP.NET Core and .NET Framework) need the Roslyn helper in `tools/roslyn-ir`. It
 is built automatically on first use if the .NET 8 SDK is installed (Windows:
 `winget install Microsoft.DotNet.SDK.8`; Linux: `apt install dotnet-sdk-8.0`,
 `dnf install dotnet-sdk-8.0` or `./dotnet-install.sh --channel 8.0`). Without
@@ -206,13 +206,17 @@ Currently implemented (route extraction + baseline checks):
 - **javascript**: express, nextjs, hono
 - **go**: gin, net_http
 - **dotnet**: controllers, razorpages, minimalapi, config, deps (ASP.NET Core on modern .NET, on the
-  shared C# engine; three-state authorization per route; request-to-sink taint
-  (injection, redirect, path, SSRF, logging, XSS in Razor views and pages),
-  IDOR / over-posting / excessive exposure, offline SCA for SDK projects and the
-  carried-over crypto / deserialization / XXE / integrity / error / session /
-  logging / flow / resource families; needs the Roslyn helper,
-  `--allow-degraded` applies) -- see `languages/dotnet/README.md`
-- **dotnet_legacy**: mvc, webapi, webforms, wcf, config, deps (.NET Framework MVC 5,
+  shared C# engine; SDK projects, loose Core files and the modern build of multi-targeted projects;
+  PROTECTED / ANONYMOUS / UNPROTECTED / UNKNOWN authorization per route, fail-closed;
+  request-to-sink taint (injection, redirect, path, SSRF, logging, XSS in Razor views and pages),
+  IDOR / over-posting / excessive exposure; configuration rules over the Program.cs / Startup
+  pipeline and `appsettings*.json` (error pages, HTTPS / HSTS, CORS, antiforgery, cookies, JWT
+  validation, Identity options, secrets, request limits, rate limiting, Swagger exposure); offline
+  SCA for SDK projects; and the carried-over crypto / deserialization / XXE / integrity / error /
+  session / logging / flow / resource families; needs the Roslyn helper, `--allow-degraded`
+  applies) -- see `languages/dotnet/README.md`
+- **dotnet_legacy**: mvc, webapi, webforms, wcf, config, deps (.NET Framework MVC 5 and the
+  net4x build of multi-targeted projects,
   Web API 2, WebForms, WCF services and Web.config, C# and VB, via the Roslyn
   helper in `tools/roslyn-ir`; cross-file taint analysis for injection / XSS /
   path / redirect / SSRF / deserialization / XXE, object-level authz, WCF

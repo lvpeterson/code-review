@@ -7,7 +7,9 @@ alike: ASP.NET MVC 5, Web API 2, WebForms (`.aspx` / `.asmx`), WCF services,
 `Web.config` (with XDT transforms) and the dependencies those apps bundle.
 ASP.NET Core (SDK-style projects on modern .NET) stays with `languages/dotnet`. DNL is
 the shared C#/.NET engine (project model, Roslyn helper IR, auth and route modules) used by
-both packages; one helper run serves a mixed solution. It runs
+both packages; one helper run serves a mixed solution. A multi-targeted SDK project (for example
+`net48;net8.0`) is analysed by both packages: this one reads its net48 build, `languages/dotnet`
+the modern one (see that README for how ownership is decided). It runs
 automatically when `main.py` detects such a target, and every finding carries
 OWASP Web Top 10 2025 and 2021 tags plus an API Security Top 10 2023 tag where
 it applies (HTML report OWASP tab, JSON `owasp` field, SARIF rule tags).
@@ -430,11 +432,9 @@ ASP.NET Core, from the pipeline and `appsettings*.json` instead of `web.config`:
   lambda, an `ExceptionHandler` option, `CustomizeProblemDetails`) that writes the exception text,
   stack trace or `ToString()` into the response.
 
-**The SEC-003 dependency.** `DNL-SEC-003` (a hard-coded credential in code) lives in
-`checks/dnl/rules_crypto.py`. Its wiring for the `dotnet` package belongs to the taint and coverage
-work (Plans 2 and 4), not to these configuration rules, so it does not fire for ASP.NET Core until
-that wiring lands. Until then a literal credential in `Program.cs` is seen only when it is a
-symmetric signing key (`DNL-SEC-004`).
+**Hard-coded credentials in code.** `DNL-SEC-003` lives in `checks/dnl/rules_crypto.py` and runs for
+ASP.NET Core too (files of test projects are skipped). A literal symmetric signing key is reported
+as `DNL-SEC-004` instead.
 
 **Known limits** (a report is a floor, not a clean bill):
 
