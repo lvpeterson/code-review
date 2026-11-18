@@ -433,3 +433,101 @@ def test_res004_unenforced_lead_sentence(tmp_path, mode):
     f = scan(tmp_path, mvc(ENABLED, LIMITER), mode)
     d = of(f, "DNL-RES-004")[0].description
     assert "no RequireRateLimiting" not in d and "unenforced" in d
+
+
+# -- fix round 3 ---------------------------------------------------------------------------------------
+
+def test_fold_and_num_are_total():
+    from checks.dnl.options import UNKNOWN
+    from checks.dnl.rules_limits_core import _fold, _num
+    for text in ["(1", "(1, 2)", "1 +", "/0", "1 / 0", "9" * 5000, "(" * 150 + "1" + ")" * 150, ")", "", "-", "1 << ",
+                 "1 2", "* 3", "1 << -1", "9**9"]:
+        assert _fold(text) is UNKNOWN, text[:20]
+    assert _fold("100 * 1024 * 1024") == 104857600
+    deep = {"k": "lit", "v": 1, "t": "number"}
+    for _ in range(3000):
+        deep = {"k": "bin", "op": "+", "l": deep, "r": {"k": "lit", "v": 1, "t": "number"}}
+    assert _num(deep) is UNKNOWN or isinstance(_num(deep), int)
+    assert _num({"k": "bin", "op": "<<", "l": {"k": "lit", "v": 1.5, "t": "number"},
+                 "r": {"k": "lit", "v": 2, "t": "number"}}) is UNKNOWN
+    assert _num({"k": "bin", "op": "/", "l": {"k": "lit", "v": 1, "t": "number"},
+                 "r": {"k": "lit", "v": 0, "t": "number"}}) is UNKNOWN
+
+
+def test_malformed_directives_never_drop_other_findings(tmp_path, mode):
+    bad = ["[RequestFormLimits(MultipartBodyLengthLimit = (1, 2))]", "[RequestSizeLimit(1 +)]",
+           "[RequestSizeLimit(/0)]", "[RequestSizeLimit(" + "9" * 5000 + ")]",
+           "[RequestSizeLimit(" + "(" * 150 + "1" + ")" * 150 + ")]"]
+    for i, attr in enumerate(bad):
+        files = razor(attr)
+        files["Program.cs"] = BUILDER.format(
+            services="builder.Services.AddRazorPages();",
+            body='app.MapRazorPages();\napp.MapGet("/items", (int pageSize, AppDb db) => db.Items.Take(pageSize).ToList());')
+        f = scan(tmp_path / str(i), files, mode)
+        assert ("DNL-RES-005", "low", None) in ids(f), attr[:40]
+        assert ("DNL-RES-001", "low", "REVIEW") in got(f, "DNL-RES-001"), attr[:40]
+
+
+def test_each_limits_sub_rule_is_isolated(tmp_path, monkeypatch, mode):
+    from cfgutil import make_app, prepare_model
+    from checks.dnl import rules_limits_core, rules_pipeline
+
+    def boom(ctx):
+        raise RuntimeError("synthetic")
+
+    files = {**mvc(LOGIN, body=""), "Program.cs": BUILDER.format(
+        services="builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = null);\nbuilder.Services.AddControllers();",
+        body="app.MapControllers();\napp.MapGet(\"/i\", (int pageSize, AppDb db) => db.Items.Take(pageSize).ToList());")}
+    for victim, expect_missing in (("_rate_limiting", "DNL-RES-004"), ("_page_sizes", "DNL-RES-005"),
+                                   ("_code_limits", "DNL-RES-001")):
+        root = make_app(tmp_path / victim, files)
+        monkeypatch.setattr(rules_limits_core, victim, boom)
+        model, refs = prepare_model(root, mode == "degraded")
+        found = rules_pipeline.check(model, refs)
+        have = {f.check_id for f in found}
+        assert expect_missing not in have
+        assert {"DNL-RES-001", "DNL-RES-004", "DNL-RES-005"} - {expect_missing} <= have, victim
+        assert any(victim.strip("_") in n and "failed" in n for n in model.notes), model.notes
+        monkeypatch.undo()
+
+
+def _page(body: str, fields: str = "", params: str = "int pageSize") -> dict:
+    return mvc(fields + f"\n[HttpGet] public IActionResult List({params}) {{ {body} }}")
+
+
+def test_res005_ternary_arm_order_and_guard_order(tmp_path, mode):
+    review = {
+        "reversed_ternary": "var n = pageSize > 100 ? pageSize : 100; return Ok(db.Items.Take(n).ToList());",
+        "reversed_within": "var n = pageSize <= 100 ? 100 : pageSize; return Ok(db.Items.Take(n).ToList());",
+        "guard_after_take": "var r = db.Items.Take(pageSize).ToList(); if (pageSize > 100) return BadRequest(); return Ok(r);",
+        "assign_after_take": "var r = db.Items.Take(pageSize).ToList(); if (pageSize > 100) pageSize = 100; return Ok(r);",
+        "min_after_take": "var r = db.Items.Take(pageSize).ToList(); pageSize = Math.Min(pageSize, 100); return Ok(r);",
+    }
+    for name, body in review.items():
+        f = scan(tmp_path / name, _page(body), mode)
+        assert got(f, "DNL-RES-005") == {("DNL-RES-005", "low", "REVIEW")}, name
+    clean = {
+        "ternary": "var n = pageSize > 100 ? 100 : pageSize; return Ok(db.Items.Take(n).ToList());",
+        "ternary_within": "var n = pageSize <= 100 ? pageSize : 100; return Ok(db.Items.Take(n).ToList());",
+        "guard_before": "if (pageSize > 100) return BadRequest(); var r = db.Items.Take(pageSize).ToList(); return Ok(r);",
+    }
+    for name, body in clean.items():
+        assert not got(scan(tmp_path / name, _page(body), mode), "DNL-RES-005"), name
+
+
+def test_res005_parameters_and_locals_shadow_class_constants(tmp_path, mode):
+    fields = "private const int max = 100;"
+    take = " return Ok(db.Items.Take(pageSize).ToList());"
+    f = scan(tmp_path / "param", _page("if (pageSize > max) return BadRequest();" + take, fields,
+                                       "int pageSize, int max"), mode)
+    assert got(f, "DNL-RES-005") == {("DNL-RES-005", "low", "REVIEW")}
+    f = scan(tmp_path / "local", _page("var max = Config.Max(); if (pageSize > max) return BadRequest();" + take, fields), mode)
+    assert got(f, "DNL-RES-005") == {("DNL-RES-005", "low", "REVIEW")}
+    f = scan(tmp_path / "const", _page("if (pageSize > max) return BadRequest();" + take, fields), mode)
+    assert not got(f, "DNL-RES-005")
+
+
+def test_res004_unenforced_lead_with_review_guarded_limiter(tmp_path, mode):
+    f = scan(tmp_path, mvc(ENABLED, LIMITER, "if (Helper.Flag()) { app.UseRateLimiter(); }"), mode)
+    d = of(f, "DNL-RES-004")[0].description
+    assert "runs no rate limiter" not in d and "certainly runs in Production" in d
