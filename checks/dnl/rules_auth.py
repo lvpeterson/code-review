@@ -73,7 +73,7 @@ def check_routes(model: ProjectModel, refs: list[RouteRef], filters: list[auth.G
         wcf = r.meta.get("kind") == "wcf"
         if webforms or wcf:
             if configs is None:
-                configs = load_configs(model.root)
+                configs = load_configs(model.root, model.owns)
             info = (auth.resolve_webforms if webforms else auth.resolve_wcf)(model, ref, configs)
         else:
             info = auth.resolve(model, ref, filters, chain_for)

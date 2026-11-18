@@ -110,7 +110,7 @@ def _code_results(model: ProjectModel) -> dict[str, tuple[list[Route], list[Find
     findings += guarded("rules_errors", lambda: rules_errors.check(model, refs))
 
     def run_misc():
-        found, notes = rules_misc.check(model, refs, load_configs(model.root))
+        found, notes = rules_misc.check(model, refs, load_configs(model.root, model.owns))
         misc_notes.extend(notes)
         return found
     findings += guarded("rules_misc", run_misc)
@@ -138,7 +138,7 @@ class _DnlAnalyzer(BaseFrameworkAnalyzer):
     @property
     def model(self) -> ProjectModel:
         if self._model is None:
-            self._model = project.get_model(self.target_path)
+            self._model = project.get_model(self.target_path, "dotnet_legacy")
         return self._model
 
     def find_routes(self) -> list[Route]:
@@ -150,10 +150,9 @@ class _DnlAnalyzer(BaseFrameworkAnalyzer):
     def analyze(self) -> ScanResult:
         result = super().analyze()
         result.degraded = self.model.degraded
-        # Model notes describe the whole scan: the first analyzer to report takes them.
-        notes = [] if self.model.cache.get("notes_taken") else list(self.model.notes)
-        self.model.cache["notes_taken"] = True
-        result.notes = notes + self._notes
+        # Model notes describe the whole scan: each analyzer reports the ones added since the last
+        # report (pointer shared with the dotnet package), so a late crash note is never lost.
+        result.notes = self.model.take_notes() + self._notes
         return result
 
 
@@ -191,12 +190,12 @@ class ConfigAnalyzer(_DnlAnalyzer):
         api_dirs = {p.dir for p in projects if _API_REF in p.references}
         aspx_dirs = {p.dir for p in projects if next(iter_dnl_files(p.dir, (".aspx",)), None) is not None}
         aspx_dirs |= routes.webforms_site_dirs(model)
-        configs = load_configs(model.root)
+        configs = load_configs(model.root, model.owns)
         findings, self._notes = rules_config.check_configs(
             configs, api_dirs, aspx_dirs, project_dirs={p.dir for p in projects})
         wcf_findings, wcf_notes = rules_wcf_config.check_configs(configs, rules_wcf_config.hosted_services(model))
         findings += wcf_findings
-        self._notes += wcf_notes + rules_wcf_config.non_web_config_notes(model.root)
+        self._notes += wcf_notes + rules_wcf_config.non_web_config_notes(model.root, model.owns)
         # Route-less findings whose owning code analyzer is not enumerated land here.
         return findings + list(_code_results(model)["config"][1])
 

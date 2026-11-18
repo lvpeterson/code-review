@@ -257,7 +257,7 @@ def check_res002(ctx: Ctx) -> list[Finding]:
     seen: set = set()
     for ref in ctx.refs:
         r, t, m = ref.route, ref.type, ref.method
-        if m is None or t is None or r.meta.get("kind") not in ("mvc", "webapi") or (t.file, m.line) in seen:
+        if m is None or t is None or r.meta.get("kind") not in ("mvc", "webapi", "controller") or (t.file, m.line) in seen:
             continue
         seen.add((t.file, m.line))
         if glob or _pagesize_attr(ctx.model, t, m):
@@ -286,6 +286,8 @@ _UPLOAD_TYPE = re.compile(r"(?i)httppostedfile|iformfile|multipartformdata|multi
                           r"fileupload|htmlinputfile")
 _UPLOAD_MEMBERS = {"postedfile", "filebytes", "filecontent", "hasfile", "files"}
 _ANY = "*"
+# Key in the size-alias dict that holds the names of upload parameters (IFormFile), whose `.Length` is a size.
+_UPLOADS = "\0uploads"
 _REQUEST_ROOTS = ("request", "this.request", "httpcontext.current.request", "system.web.httpcontext.current.request")
 
 
@@ -350,7 +352,8 @@ def _size_keys(e, al: dict, sizes: dict) -> frozenset:
             nm = (n.get("name") or "").lower()
             if nm == "contentlength":
                 out |= _key_set(_canon(n.get("obj"), al))
-            elif nm == "length" and any(x in receiver_text(n.get("obj")).lower() for x in ("inputstream", "filebytes")):
+            elif nm == "length" and (any(x in receiver_text(n.get("obj")).lower() for x in ("inputstream", "filebytes"))
+                                     or _canon(n.get("obj"), al) in sizes.get(_UPLOADS, ())):
                 out |= _key_set(_canon(n.get("obj"), al))
         elif k == "name" and (n.get("id") or "").lower() in sizes:
             out |= sizes[(n.get("id") or "").lower()]
@@ -412,6 +415,12 @@ def _aliases(m) -> tuple[dict, dict, dict]:
     al: dict = {}
     sizes: dict = {}
     data: dict = {}
+    # ASP.NET Core: an `IFormFile` parameter is the upload itself (`file.CopyToAsync(stream)` saves it,
+    # `file.Length` is its size); there is no InputStream / ContentLength to go through.
+    ups = {p.name.lower() for p in m.params if p.name and re.search(r"(?i)iformfile", p.type or "")}
+    if ups:
+        sizes[_UPLOADS] = frozenset(ups)
+        data.update({u: frozenset({u}) for u in ups})
     nodes = [n for n in walk(m.body) if n.get("k") in ("local", "assign", "call")]
     for _ in range(len(nodes) + 1):
         before = (len(al), len(sizes), sum(len(v) + 1 for v in data.values()))
@@ -722,20 +731,29 @@ def check_inv002(ctx: Ctx, configs) -> list[Finding]:
     # Swagger UI / document endpoints.
     if True:
         seen: set = set()
+        # ASP.NET Core: the route of a `UseSwagger()` call records the environment the pipeline runs it in;
+        # one that definitely cannot run in Production (`if (env.IsDevelopment())`) does not publish the document
+        # there; a guard that could not be parsed is never trusted (the environment is assumed Production).
+        dev_only = {(r.route.file, r.route.line) for r in ctx.refs
+                    if r.route.meta.get("kind") == "openapi" and r.route.meta.get("dev_only")}
         for t in model.types():
             for m in t.methods:
                 prefix = _swagger_prefix(m.body)
                 if _swagger_denied(configs, prefix):
                     continue
                 for n in walk(m.body):
-                    if n.get("k") == "call" and (call_name(n) or "").lower() in _SWAGGER and (t.file, n.get("line")) not in seen:
+                    if n.get("k") == "call" and (call_name(n) or "").lower() in _SWAGGER and (t.file, n.get("line")) not in seen \
+                            and (t.file, n.get("line")) not in dev_only:
                         seen.add((t.file, n.get("line")))
                         out.append(ctx.finding(
                             t, m.name, "DNL-INV-002", "low", "Swagger UI reachable without authentication",
                             f"{call_name(n)}(..) publishes the API description (routes, parameters, models) to "
                             "any caller. The UI is served by a message handler, so a global authorize filter "
-                            "does not cover it; only a web.config <location path=\"swagger\"> deny rule, "
-                            "authentication middleware or removal from production does", n.get("line") or 0))
+                            "does not cover it; " + (
+                                "only restricting it to Development or requiring authorization does"
+                                if (model.project_of(t.file) is not None and not model.project_of(t.file).is_legacy) else
+                                "only a web.config <location path=\"swagger\"> deny rule, "
+                                "authentication middleware or removal from production does"), n.get("line") or 0))
 
     # Test and debug controllers in non-test projects.
     for t in model.types():

@@ -830,15 +830,19 @@ _TITLE = {
 _SEVERITY = {"DNL-DESER-001": "medium", "DNL-DESER-002": "high", "DNL-DESER-003": "high", "DNL-XXE-001": "medium"}
 
 
-def check(model: ProjectModel, refs=()) -> list[Finding]:
-    """DESER-001..003 / XXE-001 / XXE-002 configuration-shape findings. `refs` (RouteRefs) decide which
-    findings carry a route, and the taint rows decide which lines are left to rules_taint."""
+def check(model: ProjectModel, refs=(), taint_reports: bool = True) -> list[Finding]:
+    """DESER-001..003 / XXE-001 / XXE-002 configuration-shape findings. `refs` (RouteRefs, legacy or
+    Core) decide which findings carry a route, and the taint rows decide which lines are left to
+    rules_taint. `taint_reports=False` (the SDK-project analyzers, which do not run rules_taint) leaves
+    no line to it: every insecure parse / formatter call is reported here."""
     if not model.files:
         return []
-    from checks.dnl import rules_taint
     scan = _scan(model, refs)
-    proven_lines = {(r.hit.file, r.hit.line, rules_taint.RULE_FOR_KIND[r.hit.kind])
-                    for r in rules_taint.rows_for(model, refs) if r.hit.kind in ("deser", "xxe")}
+    proven_lines: set[tuple] = set()
+    if taint_reports:
+        from checks.dnl import rules_taint
+        proven_lines = {(r.hit.file, r.hit.line, rules_taint.RULE_FOR_KIND[r.hit.kind])
+                        for r in rules_taint.rows_for(model, refs) if r.hit.kind in ("deser", "xxe")}
     found: dict[tuple, Finding] = {}
     for s in scan.sites:
         if (s.file, s.line, s.rule) in proven_lines:

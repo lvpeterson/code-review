@@ -101,12 +101,26 @@ _COMPARE_OPS = frozenset({
 })
 _SOURCE_RES = [(s, re.compile(s.sym), re.compile(s.text) if s.text else None) for s in T.SOURCES]
 _REQUEST_RE = re.compile(T.REQUEST_TEXT)
+_CORE_REQUEST_RE = re.compile(T.CORE_REQUEST_TEXT)
 _FIELD_SRC_RE = re.compile(T.FIELD_SOURCE_TYPES)
 _EXT_SYM_RE = re.compile(T.EXTERNAL_SYM)
 _INCOMING_RE = re.compile(T.INCOMING_REQUEST_TEXT)
 _EXT_SYM_ONLY_RE = re.compile(T.EXTERNAL_SYM_ONLY_RE)
 _SAN_RES = [(s, re.compile(s.member)) for s in T.SANITIZERS]
+# A variable that holds an exception, by name (`ex`, `err`, `ioEx`, `sqlException`), for log-call argument order.
+# ... and one that holds an event id or a level (`eventId`, `evt`, `logLevel`), never the template.
+_LEVEL_NAME_RE = re.compile(r"(?i)^(event|eventid|evt|eid|level|loglevel|lvl|\w+eventid|\w+loglevel)$")
+_EXC_NAME_RE = re.compile(r"^(e|ex|exc|err|error|exception|[a-z]\w*(Ex|Exception))$")
 _GUARD = {g.shape: g for g in T.GUARDS}
+_BODY_SYM_RE = re.compile(r"^Microsoft\.AspNetCore\.Http\.Http(Request|Response)\.Body$")
+_BODY_TEXT_RE = re.compile(r"(?i)(^|\.)(request|response)\.body$")
+# Calls whose result is a stream (never a path), by name.
+_STREAM_CALLS = frozenset({"openreadstream", "openread", "openwrite", "getresponsestream", "getrequeststream",
+                           "getstream", "readasstreamasync", "getstreamasync", "openstream"})
+# Receiver types of TryGetValue that hold request input.
+_REQUEST_COLLECTIONS = frozenset({"iquerycollection", "iformcollection", "iheaderdictionary",
+                                  "irequestcookiecollection", "querycollection", "formcollection",
+                                  "headerdictionary", "requestcookiecollection", "routevaluedictionary"})
 _REQUEST_PROP_RE = re.compile(r"(?i)^((this|me)\.)?((httpcontext\.current|context|page)\.)?request$")
 _HELPER_RES = [(h, re.compile(h.member)) for h in T.STRING_HELPERS]
 _TERMINATORS = ("return", "throw")
@@ -134,6 +148,20 @@ _SYNC_CALLBACKS = re.compile(r"(?i)^(foreach|select|selectmany|where|any|all|fir
                              r"tolist|toarray|todictionary|tolookup|exists|findall|convertall|truefor\w*)$")
 # Static receivers of the LINQ / parallel forms: `Enumerable.Where(source, x => ..)`.
 _STATIC_SEQ_TYPES = {"enumerable", "queryable", "parallel", "parallelenumerable"}
+
+
+_ZIP_ENTRY_DECL_RE = re.compile(r"^\s*(?:var\s+)?(?:[\w.]*\.)?ZipArchiveEntry\s+(\w+)\s*$")
+# A literal that is only a scheme and / or slashes (`"https://"`, `"//"`, `"/"`, ""): the host is still the request's.
+_SCHEME_ONLY_RE = re.compile(r"(?i)\s*([a-z][a-z0-9+.\-]*:)?/{0,2}\s*")
+# Marker in `Taint.cleansed`: the value starts with an untainted prefix (SSRF: only the path is controlled).
+# It survives a merge only when every merged value has it, so a fully tainted contribution removes it.
+PREFIX_MARK = "~prefix"
+# `scheme://host` with nothing after the host: the appended value still extends the host (`"https://h" + p`).
+_HOST_ONLY_RE = re.compile(r"(?i)\s*[a-z][a-z0-9+.\-]*://[^/]*$")
+
+
+def _with_prefix(t: Taint) -> Taint:
+    return Taint(t.origins, t.cleansed | {PREFIX_MARK})
 
 
 def _strip_literals(text: str) -> str:
@@ -346,13 +374,44 @@ class _Analysis:
                     return self._origin(s.name, line)
             return None
         text = text if text is not None else self._text(e)
+        core = self._is_core_project()
         for s, _, text_re in _SOURCE_RES:
+            if s.core_text and not core:
+                continue                    # a legacy `request.Method` is some other library's, not Core's
             if text_re and text and text_re.match(text):
                 return self._origin(s.name, line)
+        typed = self._typed_core_source(e)
+        if typed is not None:
+            return typed
         if e.get("k") == "member" and (e.get("name") or "").lower() in T.FIELD_SOURCE_MEMBERS:
             tn = self.type_of(self._recv(e))
             if tn and _FIELD_SRC_RE.match(_simple(tn)):
                 return self._origin(f"{_simple(tn)}.{e.get('name')}", line)
+        return None
+
+    def _typed_core_source(self, e: dict) -> Taint | None:
+        """No-sym Core request read through a receiver whose declared / inferred type is `HttpContext`
+        (`c.Request`, `c.Request.Query`, `c.GetRouteValue`) or `HttpRequest` (`req.Query`), whatever the
+        variable is called. Same members and origin names as the Core rows of the source table."""
+        if e.get("k") != "member":
+            return None
+        proj = self.model.project_of(self.t.file)
+        if not self.model.core_project(proj):
+            return None                     # legacy `HttpRequest` is System.Web's: its rows are unchanged
+        name = (e.get("name") or "").lower()
+        recv = self._recv(e)
+        if not isinstance(recv, dict):
+            return None
+        rt = _simple(self.type_of(recv) or "").lower()
+        if rt == "ziparchiveentry" and name in ("fullname", "name"):
+            return self._origin("archive entry name", e.get("line", 0))
+        if rt == "httpcontext":
+            if name == "request":
+                return self._origin("Request", e.get("line", 0))
+            if name == "getroutevalue":
+                return self._origin("RouteValues", e.get("line", 0))
+        elif rt == "httprequest" and name in T.CORE_REQUEST_MEMBERS:
+            return self._origin(T.CORE_REQUEST_MEMBERS[name], e.get("line", 0))
         return None
 
     # -- sink matching ---------------------------------------------------
@@ -365,30 +424,151 @@ class _Analysis:
         self.hits[k] = SinkHit(sink.kind, sink.name, self.t.file, line,
                                merge(old.taint, value) if old else value, self.method_name)
 
+    def _is_core_project(self) -> bool:
+        proj = self.model.project_of(self.t.file)
+        return self.model.core_project(proj)
+
+    def _sink_applies(self, sink: T.Sink) -> bool:
+        """Rows tied to one family: `legacy_only` (System.Web) skips Core projects, `core_only` skips the rest."""
+        if sink.legacy_only or sink.core_only:
+            return self._is_core_project() == sink.core_only
+        return True
+
+    def _recv_str(self, recv: Any) -> str:
+        """Receiver text for the `recv_text` regexes; a call receiver reads `Response.GetTypedHeaders()`."""
+        text = self._text(recv)
+        if not text and isinstance(recv, dict) and recv.get("k") == "call":
+            fn = recv.get("fn") or {}
+            if fn.get("k") == "member":
+                text = f"{self._text(fn)}()"
+            elif fn.get("k") == "name":
+                text = f"{fn.get('id') or ''}()"
+        return text or ""
+
+    def _recv_gate_ok(self, sink: T.Sink, recv: Any) -> bool:
+        """`recv_gate`: the receiver must look like the sink's own object (declared Core type or receiver text),
+        for rows whose resolved sym names a generic type (`IDictionary.Add` on a response header dictionary)."""
+        if recv is None:
+            return False
+        if sink.recv_text and re.search(sink.recv_text, self._recv_str(recv)):
+            return True
+        return _simple(self.type_of(recv)) in {_simple(x) for x in sink.types if x.startswith("Microsoft.")}
+
     def _sink_matches(self, sink: T.Sink, member: str, sym: str | None, recv: Any, bare: bool) -> bool:
-        if sink.member.lower() != member.lower():
+        if sink.member.lower() != member.lower() or not self._sink_applies(sink):
             return False
         if sym:
             stype, smem = _split_sym(sym)
-            return smem.lower() == member.lower() and stype in sink.types
+            return (smem.lower() == member.lower() and stype in sink.types
+                    and (not sink.recv_gate or self._recv_gate_ok(sink, recv)))
+        if sink.recv_gate and not self._recv_gate_ok(sink, recv):
+            return False
         if sink.unresolved_ok and not bare:
             return True
         if recv is not None:
             names, _ = self._recv_names(recv)
             if names & {_simple(x) for x in sink.types}:
                 return True
-            if sink.recv_text and re.search(sink.recv_text, self._text(recv) or ""):
+            if sink.recv_text and re.search(sink.recv_text, self._recv_str(recv)):
                 return True
         if sink.derives and (recv is None or (self._text(recv) or "").lower() in ("this", "me", "base")):
             return self.model.derives_from(self.t, set(sink.derives))
         return False
+
+    # -- log message argument / content-type condition (Core sinks) -------------------------------
+
+    def _can_be_template(self, a: Any) -> bool:
+        """A later positional argument that could be the message template: a string literal, an interpolated
+        string, a concatenation, or a string-typed / untyped value."""
+        if not isinstance(a, dict):
+            return False
+        k = a.get("k")
+        if k == "lit":
+            return literal_str(a) is not None
+        if k in ("interp", "bin"):
+            return True
+        if k == "new":
+            return False
+        tn = _simple(self.type_of(a))
+        return not tn or tn == "string"
+
+    def _not_log_message(self, a: Any, later_template: bool = True) -> bool:
+        """An argument that is certainly not the message template: LogLevel, EventId, an exception, null or a
+        number. An unknown-typed variable counts as an exception / level / event id only when it is named like
+        one AND a later argument can be the template; alone, it is the message."""
+        if not isinstance(a, dict):
+            return True
+        k = a.get("k")
+        if k == "lit":
+            return literal_str(a) is None
+        if k == "new":
+            tn = _simple(a.get("type_full") or a.get("type"))
+            return tn == "eventid" or tn.endswith("exception")
+        sym = a.get("sym") or ""
+        if sym.startswith("Microsoft.Extensions.Logging.LogLevel.") or re.search(r"(?i)(^|\.)loglevel\.\w+$", self._text(a)):
+            return True
+        tn = _simple(self.type_of(a))
+        if tn in ("eventid", "loglevel") or tn.endswith("exception"):
+            return True
+        return (k == "name" and not tn and later_template
+                and bool(_EXC_NAME_RE.match(a.get("id") or "") or _LEVEL_NAME_RE.match(a.get("id") or "")))
+
+    def _log_message_index(self, args: list, skip_first: bool) -> int | None:
+        """Index of the message-template argument: the first one that is not a level / event id / exception.
+        `skip_first` drops the logger of a static `LoggerExtensions.LogX(logger, ..)` call."""
+        for i, a in enumerate(args):
+            if i == 0 and skip_first:
+                continue
+            later = any(self._can_be_template(b) for b in args[i + 1:])
+            if not self._not_log_message(a, later):
+                return i
+        return None
+
+    @staticmethod
+    def _content_type_arg(call: dict, args: list, idx: int) -> Any:
+        if idx < len(args):
+            return args[idx]
+        for k, v in (call.get("named") or {}).items():
+            if k.lower() == "contenttype":
+                return v
+        return None
 
     def _arg_ok(self, sink: T.Sink, arg: Any) -> bool:
         """Path sinks take a string in arg slots that overloads reuse for streams / bytes."""
         if sink.kind != "path":
             return True
         tn = self.type_of(arg)
-        return not tn or _simple(tn) in ("string", "object")
+        if tn:
+            return _simple(tn) in ("string", "object", "stringvalues")
+        return not self._stream_like(arg)
+
+    def _stream_like(self, e: Any) -> bool:
+        """An expression with no declared type that is evidently a stream, not a path: the request / response
+        `Body`, `file.OpenReadStream()` and the other stream-returning calls. A typed value is judged by its type."""
+        if not isinstance(e, dict):
+            return False
+        tn = _simple(self.type_of(e) or "").lower()
+        if tn:
+            return tn.endswith("stream")
+        k = e.get("k")
+        if k == "member" and (e.get("name") or "").lower() == "body":
+            sym = e.get("sym")
+            if sym:
+                return bool(_BODY_SYM_RE.match(sym))
+            return bool(_BODY_TEXT_RE.search(self._text(e) or ""))
+        if k == "call":
+            fn = e.get("fn") or {}
+            name = (fn.get("name") if fn.get("k") == "member" else fn.get("id")) or ""
+            if name.lower() not in _STREAM_CALLS:
+                return False
+            sym = e.get("sym")
+            if sym:
+                return sym.startswith(("System.", "Microsoft."))     # a project method of that name is no stream factory
+            recv = self._recv(fn) if fn.get("k") == "member" else None
+            if (self._text(recv) or "").split(".")[-1].lower() == "zipfile":
+                return False                            # ZipFile.OpenRead returns a ZipArchive
+            return not self._targets(e, fn, recv)
+        return False
 
     def _check_call_sinks(self, call: dict, name: str, recv: Any, args: list, vals: list, nvals: list) -> None:
         bare = recv is None
@@ -397,6 +577,17 @@ class _Analysis:
             if sink.assign or sink.member == ".ctor":
                 continue
             if not self._sink_matches(sink, name, call.get("sym"), recv, bare):
+                continue
+            if sink.ct_arg is not None and not T.html_content_type(self._content_type_arg(call, args, sink.ct_arg)):
+                continue
+            if sink.msg_arg:
+                # Only the message template is a sink; placeholder arguments are structured values.
+                i = self._log_message_index(args, bool(names & {"loggerextensions"}))
+                if i is not None and i < len(vals):
+                    self._record(sink, vals[i], call.get("line", 0))
+                for k, v in zip((call.get("named") or {}).keys(), nvals):
+                    if k.lower() in ("message", "state", "messageformat"):
+                        self._record(sink, v, call.get("line", 0))
                 continue
             # `Type.Member(recv, ..)`: only a receiver that names the sink's own type shifts the index
             static = sink.static_args is not None and bool(names & {_simple(x) for x in sink.types})
@@ -413,7 +604,7 @@ class _Analysis:
         tname = tf or e.get("type") or ""
         hit_type = False
         for sink in T.SINKS:
-            if sink.member != ".ctor":
+            if sink.member != ".ctor" or not self._sink_applies(sink):
                 continue
             if tf:
                 ok = tf in sink.types
@@ -430,9 +621,9 @@ class _Analysis:
         return hit_type
 
     def _check_assign_sinks(self, member_name: str, sym: str | None, recv: Any, type_full: str | None,
-                            value: Taint | None, line: int) -> None:
+                            value: Taint | None, line: int, siblings: dict | None = None) -> None:
         for sink in T.SINKS:
-            if not sink.assign or sink.member.lower() != member_name.lower():
+            if not sink.assign or sink.member.lower() != member_name.lower() or not self._sink_applies(sink):
                 continue
             if sym:
                 stype, _ = _split_sym(sym)
@@ -441,6 +632,11 @@ class _Analysis:
                 ok = type_full in sink.types or _simple(type_full) in {_simple(x) for x in sink.types}
             else:
                 ok = self._sink_matches(sink, member_name, None, recv, False)
+            if ok and sink.recv_gate:
+                ok = self._recv_gate_ok(sink, recv)
+            if ok and sink.ct_member and siblings is not None:
+                # Inside an object initializer the content type is known: none set means text/plain.
+                ok = T.html_content_type(siblings.get(sink.ct_member.lower()))
             if ok:
                 self._record(sink, value, line)
 
@@ -491,7 +687,9 @@ class _Analysis:
         obj = e.get("obj")
         for a in e.get("args") or []:
             self.ev(a)
-        if not e.get("sym") and _REQUEST_RE.match(self._text(obj) or ""):
+        if not e.get("sym") and (_REQUEST_RE.match(self._text(obj) or "")
+                                 or (self._is_core_project()
+                                     and _CORE_REQUEST_RE.match(self._text(obj) or ""))):
             return self._origin("Request", e.get("line", 0))
         src = self._source(e)
         if src is not None:
@@ -564,7 +762,44 @@ class _Analysis:
         a, b = self.ev(e.get("l")), self.ev(e.get("r"))
         if str(e.get("op") or "").lower() in _COMPARE_OPS:
             return None
-        return merge(a, b)
+        out = merge(a, b)
+        if out is not None and e.get("op") == "+" and self._path_only(e):
+            return _with_prefix(out)
+        return out
+
+    def _leading(self, e: Any) -> Any:
+        """First non-empty piece of a concatenation / interpolated string (None when there is none)."""
+        if not isinstance(e, dict):
+            return None
+        if e.get("k") == "bin" and e.get("op") == "+":
+            lead = self._leading(e.get("l"))
+            return lead if lead is not None else self._leading(e.get("r"))
+        if e.get("k") == "interp":
+            for p in e.get("parts") or []:
+                lead = self._leading(p)
+                if lead is not None:
+                    return lead
+            return None
+        if e.get("k") == "lit" and literal_str(e) == "":
+            return None
+        return e
+
+    def _path_only(self, e: dict) -> bool:
+        """A Core string that starts with something the request did not supply and that is not just a scheme or
+        slashes: a relative literal (`"users/" + id`), a literal base URL, or an untainted value
+        (`$"{baseUrl}{x}"`). Only the tail of the result is attacker-controlled."""
+        if not self._is_core_project():
+            return False
+        lead = self._leading(e)
+        if lead is None:
+            return False
+        if lead.get("k") == "lit":
+            v = literal_str(lead)
+            if v is None or _SCHEME_ONLY_RE.fullmatch(v):
+                return False
+            # an absolute URL fixes the host only when the literal goes on past it (`https://h/`, `https://h/api`)
+            return not _HOST_ONLY_RE.match(v)
+        return self.ev(lead) is None
 
     def _ev_unary(self, e: dict) -> Taint | None:
         self.ev(e.get("e"))
@@ -574,6 +809,8 @@ class _Analysis:
         out = None
         for p in e.get("parts") or []:
             out = merge(out, self.ev(p))
+        if out is not None and self._path_only(e):
+            return _with_prefix(out)
         return out
 
     def _ev_cond(self, e: dict) -> Taint | None:
@@ -582,6 +819,11 @@ class _Analysis:
 
     def _ev_cast(self, e: dict) -> Taint | None:
         v = self.ev(e.get("e"))
+        for sink in T.SINKS:
+            # `(MarkupString)x` builds the same raw-HTML value as `new MarkupString(x)`
+            if sink.member == ".cast" and self._sink_applies(sink) and _simple(e.get("type")) in {
+                    _simple(x) for x in sink.types}:
+                self._record(sink, v, e.get("line", 0))
         if _simple(e.get("type")) in T.SAFE_CAST_TYPES:
             return cleanse(v, ["*"])
         return v
@@ -592,13 +834,21 @@ class _Analysis:
         nvals = [self.ev(a) for a in (e.get("named") or {}).values()]
         init_vals = []
         tf = e.get("type_full")
+        sibs = {(ent.get("name") or "").lower(): ent.get("value") for ent in e.get("init") or [] if ent.get("name")}
         for ent in e.get("init") or []:
             v = self.ev(ent.get("value"))
             self._init_cache[id(ent)] = v
             init_vals.append(v)
             if ent.get("name"):
-                self._check_assign_sinks(ent["name"], None, None, tf or e.get("type"), v, e.get("line", 0))
+                self._check_assign_sinks(ent["name"], None, None, tf or e.get("type"), v, e.get("line", 0), sibs)
         if self._check_new_sinks(e, args, vals, nvals):
+            if _simple(e.get("type_full") or e.get("type") or "").lower() == "streamreader" and args                     and self._is_core_project() and self._stream_like(args[0]):
+                # `new StreamReader(Request.Body)`: what the reader reads is the stream's data, so the reader
+                # carries the stream's taint (a StreamReader over a path does not: the file is not request data).
+                out = None
+                for v in vals[:1]:
+                    out = merge(out, v)
+                return out
             return None
         if self.summaries is not None:
             self._call_ctors(e, args, vals, nvals)
@@ -615,7 +865,8 @@ class _Analysis:
             return False
         sym = call.get("sym")
         if sym:
-            return sym.lower().startswith("system.web.mvc.controller.")
+            low = sym.lower()
+            return low.startswith(("system.web.mvc.controller.", "microsoft.aspnetcore.mvc.controller."))
         if not self.model.derives_from(self.t, {"Controller"}):
             return False
         chain = [self.t] + [bt for b in self.model.base_chain(self.t) for bt in self.model.find_types(b)]
@@ -663,6 +914,14 @@ class _Analysis:
         src = self._source(e) or self._source(fn) or self._request_default(fn)
         if src is not None:
             return src
+        if low == "trygetvalue" and len(args) >= 2 and recv is not None and self._is_core_project():
+            # `Request.Query.TryGetValue("c", out var v)`: the out variable holds the collection's data
+            src = rv
+            if src is None and _simple(self.type_of(recv) or "").lower() in _REQUEST_COLLECTIONS:
+                src = self._origin("Request", line)
+            if src is not None:
+                self._bind_out_args(args[:1] + args[-1:], src, clean=False)
+                return None
         # sanitizers
         san = self._sanitize(e, fn, name, recv, args, vals, rv)
         if san is not False:
@@ -807,6 +1066,12 @@ class _Analysis:
         for s, mre in _SAN_RES:
             if not mre.match(name):
                 continue
+            if s.recv_exclude and re.search(s.recv_exclude, self._text(recv) or ""):
+                # An encoder that does not escape: the result is the input, not a clean value.
+                out = rv
+                for v in vals:
+                    out = merge(out, v)
+                return out
             if sym:
                 stype, _ = _split_sym(sym)
                 if s.types and stype not in s.types:
@@ -815,7 +1080,8 @@ class _Analysis:
                 if bare:
                     if not s.bare_ok:
                         continue
-                elif not (names & {_simple(x) for x in s.types}):
+                elif not (names & {_simple(x) for x in s.types}
+                          or (s.recv_text and re.search(s.recv_text, self._text(recv) or ""))):
                     continue
             if s.name == "ldap-escape":
                 # A project method merely named like an escaper must actually rewrite something.
@@ -863,8 +1129,9 @@ class _Analysis:
             c |= {"header", "log"}
         return Taint(value.origins, frozenset(c))
 
-    def _bind_out_args(self, args: list, src: Taint | None) -> None:
-        """TryParse(text, out x): x is a number whatever text held."""
+    def _bind_out_args(self, args: list, src: Taint | None, clean: bool = True) -> None:
+        """TryParse(text, out x): x is a number whatever text held. `clean=False`: x keeps the taint
+        (`TryGetValue(key, out x)`)."""
         for a in args[1:]:
             if not isinstance(a, dict):
                 continue
@@ -874,7 +1141,8 @@ class _Analysis:
             elif a.get("k") in ("unknown", "other") and a.get("text"):
                 nm = a["text"].split()[-1]
             if nm:
-                self.env[self.key(nm)] = cleanse(src, ["*"])
+                self._drop_paths(self.key(nm))
+                self.env[self.key(nm)] = cleanse(src, ["*"]) if clean else src
                 self.locals.add(self.key(nm))
 
     # -- project method calls ---------------------------------------------
@@ -1186,6 +1454,15 @@ class _Analysis:
     def _apply_guards(self, guards: list[tuple[str, frozenset]]) -> None:
         for kk, kinds in guards:
             cur = self.env.get(kk, self.field_taint.get(kk))
+            if cur is None and "." in kk:
+                # `Url.IsLocalUrl(model.ReturnUrl)`: a member path is tainted through its root object (a bound
+                # parameter or property), so the cleansed value is recorded under the path itself.
+                parts = kk.split(".")
+                for n in range(len(parts) - 1, 0, -1):
+                    pre = ".".join(parts[:n])
+                    cur = self.env.get(pre, self.field_taint.get(pre))
+                    if cur is not None:
+                        break
             if cur is not None:
                 self.env[kk] = cleanse(cur, kinds)
 
@@ -1207,11 +1484,14 @@ class _Analysis:
     def _st_local(self, s: dict) -> bool:
         kk = self.key(s.get("name") or "")
         init = s.get("init")
+        self._drop_paths(kk)
         self.env[kk] = self.ev(init)
         self.locals.add(kk)
         tn = s.get("type_full") or s.get("type")
         if not tn or tn.lower() in ("var", "dim"):
             tn = self.type_of(init)
+            if not tn and self._stream_like(init):
+                tn = "Stream"
         if tn:
             self.types[kk] = tn
         else:
@@ -1298,6 +1578,7 @@ class _Analysis:
             value = None
         if k == "name":
             kk = self.key(target.get("id") or "")
+            self._drop_paths(kk)
             self.env[kk] = value
             self._note_write(target.get("id") or "", value)
             if kk not in self.locals:
@@ -1311,9 +1592,15 @@ class _Analysis:
             self._call_setter(recv, target.get("name") or "", value)
             text = self._text(target)
             if text:
+                self._drop_paths(self.key(text))
                 self.env[self.key(text)] = value
                 self._note_write(text, value)
         elif k == "index":
+            # `Response.Headers["X"] = v`: an indexer assignment is the `Item` member of the receiver.
+            obj = target.get("obj")
+            if obj is not None:
+                self._check_assign_sinks("Item", target.get("sym"), obj,
+                                         None if target.get("sym") else self._assign_type(obj), value, line)
             text = self._text(target.get("obj"))
             if text:
                 kk = self.key(text)
@@ -1355,28 +1642,71 @@ class _Analysis:
             self.env = self._merge_envs(env_t, env_e)
         return False
 
-    @staticmethod
-    def _merge_envs(a: dict, b: dict) -> dict:
+    def _root_value(self, env: dict, key: str) -> Taint | None:
+        """Value of a dotted member path that `env` has no entry for: the nearest tracked root's taint
+        (`model.ReturnUrl` is as tainted as `model`)."""
+        parts = key.split(".")
+        for n in range(len(parts) - 1, 0, -1):
+            pre = ".".join(parts[:n])
+            if pre in env:
+                return env[pre]
+            if pre in self.field_taint:
+                return self.field_taint[pre]
+        return None
+
+    def _merge_envs(self, a: dict, b: dict) -> dict:
         out = {}
         for k in a.keys() | b.keys():
-            out[k] = merge(a.get(k), b.get(k))
+            va = a[k] if k in a else (self._root_value(a, k) if "." in k else None)
+            vb = b[k] if k in b else (self._root_value(b, k) if "." in k else None)
+            out[k] = merge(va, vb)
         return out
+
+    def _drop_paths(self, kk: str) -> None:
+        """A name was (re)assigned: member paths recorded under it (`kk.x`, e.g. a guarded `model.ReturnUrl`)
+        describe the old object."""
+        pre = kk + "."
+        for k in [k for k in self.env if k.startswith(pre)]:
+            del self.env[k]
+
+    def _is_entries(self, coll: Any) -> bool:
+        """`<x>.Entries` where x is a ZipArchive: by sym / declared type when known, by the name alone otherwise."""
+        if not isinstance(coll, dict) or coll.get("k") != "member" or coll.get("name") != "Entries":
+            return False
+        sym = coll.get("sym")
+        if sym:
+            return sym.startswith("System.IO.Compression.ZipArchive.")
+        tn = self.type_of(self._recv(coll))
+        return not tn or _simple(tn) == "ziparchive"
 
     def _st_loop(self, s: dict) -> bool:
         header = s.get("header") or []
         # foreach: [loop variable, collection]; `for` / `while` headers hold expressions only.
         tup = _TUPLE_DECL_RE.match(header[0].get("text") or "") if len(header) == 2 and isinstance(header[0], dict) \
             and header[0].get("k") == "unknown" else None
-        if len(header) == 2 and isinstance(header[0], dict) and header[0].get("k") == "name" \
-                and (header[1] or {}).get("k") != "unary":
-            self.env[self.key(header[0].get("id") or "")] = self.ev(header[1])
-            self.locals.add(self.key(header[0].get("id") or ""))
+        decl = _ZIP_ENTRY_DECL_RE.match(header[0].get("text") or "") if len(header) == 2             and isinstance(header[0], dict) and header[0].get("k") == "unknown" else None
+        if len(header) == 2 and isinstance(header[0], dict) and header[0].get("k") == "name"                 and (header[1] or {}).get("k") != "unary":
+            lv = self.key(header[0].get("id") or "")
+            self._drop_paths(lv)
+            self.env[lv] = self.ev(header[1])
+            self.locals.add(lv)
+            if self._is_entries(header[1]):
+                self.types[lv] = "ZipArchiveEntry"      # `foreach (var e in archive.Entries)`
+            else:
+                self.types.pop(lv, None)
+        elif decl is not None:
+            lv = self.key(decl.group(1))
+            self._drop_paths(lv)
+            self.env[lv] = self.ev(header[1])
+            self.locals.add(lv)
+            self.types[lv] = "ZipArchiveEntry"
         elif tup is not None and isinstance(header[1], dict):
             # `foreach (var (a, b) in xs)`: every deconstructed name carries the collection's taint.
             v = self.ev(header[1])
             for piece in tup.group(1).split(","):
                 words = _IDENT_RE.findall(piece)
                 if words and words[-1] != "_":
+                    self._drop_paths(self.key(words[-1]))
                     self.env[self.key(words[-1])] = v
                     self.locals.add(self.key(words[-1]))
         else:
@@ -1396,6 +1726,7 @@ class _Analysis:
         for c in s.get("catches") or []:
             self.env = self._merge_envs(pre, after_body)
             if c.get("name"):
+                self._drop_paths(self.key(c["name"]))
                 self.env[self.key(c["name"])] = None
                 self.locals.add(self.key(c["name"]))
             self.block(c.get("body"))

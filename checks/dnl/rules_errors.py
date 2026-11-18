@@ -198,6 +198,9 @@ class _Auth:
     such a method (two levels)."""
 
     def __init__(self, model):
+        self.model = model
+        self._scopes: dict = {}
+        self.strict = False                  # True: no solution-wide fallback for unbound calls
         self.by_name: dict = {}
         self.owner: dict = {}
         for t in model.types():
@@ -206,7 +209,41 @@ class _Auth:
                 self.owner[id(m)] = t
         self._memo: dict = {}
 
-    def _targets(self, call: dict):
+    def _scope(self, owner) -> set:
+        """Full names of the types an unqualified call can bind to: the owner, its enclosing types,
+        base types found in the solution (generic arguments ignored) and the types named by
+        `using static` in the owner's file."""
+        key = id(owner)
+        if key in self._scopes:
+            return self._scopes[key]
+        found = [owner]
+        parts = owner.name.split(".")
+        for i in range(1, len(parts)):
+            found += [ot for ot in self.model.find_types(parts[i - 1]) if ot.namespace == owner.namespace]
+        try:
+            text = (self.model.root / owner.file).read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            text = ""
+        for m in _STATIC_USING.finditer(text):
+            found += self.model.find_types(m.group(1).split(".")[-1])
+        names: set = set()
+        queue = list(found)
+        while queue:
+            cur = queue.pop()
+            if cur.full_name.lower() in names:
+                continue
+            names.add(cur.full_name.lower())
+            for b in cur.bases:
+                queue += self.model.find_types(re.sub(r"<.*", "", b).split(".")[-1])
+        self._scopes[key] = names
+        return names
+
+    def _extensions(self, nm: str) -> list:
+        """Extension methods (static class, first parameter marked `this`) with this name."""
+        return [m for t, m in self.by_name.get(nm, ())
+                if "static" in (t.modifiers or []) and m.params and "this" in (m.params[0].modifiers or [])]
+
+    def _targets(self, call: dict, owner=None):
         nm = (call_name(call) or "").lower()
         fn = call.get("fn") or {}
         cands = self.by_name.get(nm, ())
@@ -217,10 +254,19 @@ class _Auth:
         obj = fn.get("obj") if fn.get("k") == "member" else None
         if obj is None or (isinstance(obj, dict) and obj.get("k") == "name"
                            and (obj.get("id") or "").lower() in ("this", "me", "base", "mybase", "myclass")):
+            if owner is not None:
+                # Without a resolved symbol an unqualified call belongs to the enclosing type (or a base);
+                # a same-named method of an unrelated type is not what runs.
+                scope = self._scope(owner)
+                hit = [m for t, m in cands if t.full_name.lower() in scope]
+                hit += [m for m in self._extensions(nm) if m not in hit]
+                # Nothing bound in scope (a base the solution lacks, a framework member): the old
+                # solution-wide candidates, so a real decision is never lost.
+                return hit if hit or self.strict else [m for _t, m in cands]
             return [m for _t, m in cands]
         return []
 
-    def decides(self, stmts, depth: int = 2, seen: frozenset = frozenset()) -> bool:
+    def decides(self, stmts, depth: int = 2, seen: frozenset = frozenset(), owner=None) -> bool:
         for n in walk(stmts):
             if _is_marker(n):
                 return True
@@ -228,19 +274,21 @@ class _Auth:
             return False
         for n in walk(stmts):
             if n.get("k") == "call":
-                for m in self._targets(n):
+                for m in self._targets(n, owner):
                     if id(m) in seen:
                         continue
-                    key = (id(m), depth)
+                    key = (id(m), depth, owner is not None, self.strict)
                     if key not in self._memo:
                         self._memo[key] = (bool(_DECISION_NAME.search(m.name))
-                                           or self.decides(m.body, depth - 1, seen | {id(m)}))
+                                           or self.decides(m.body, depth - 1, seen | {id(m)},
+                                                           self.owner[id(m)] if owner is not None else None))
                     if self._memo[key]:
                         return True
         return False
 
 
 _UNKNOWN = {"k": "?"}
+_STATIC_USING = re.compile(r"(?m)^\s*(?:global\s+)?using\s+static\s+([\w.]+)\s*;")
 
 
 def _value_sources(body: list) -> dict:
@@ -365,8 +413,9 @@ class _Truth:
     """Resolves an expression to "true" / "false" / "?" : literals, `!x`, locals with a single value
     source, consts, and project methods whose every return agrees."""
 
-    def __init__(self, auth: _Auth, t, m_body: list):
+    def __init__(self, auth: _Auth, t, m_body: list, owner=None):
         self.auth = auth
+        self.owner = owner                   # enclosing type when scoped call resolution applies (Core)
         self.srcs = _value_sources(m_body)
         # Only a const is a fixed value: any other field or property can be changed elsewhere.
         self.fields = {f.name.lower(): f.init for f in t.fields if f.is_const and f.init is not None}
@@ -379,7 +428,8 @@ class _Truth:
             v = v.get("e")
         if not isinstance(v, dict) or v.get("k") not in ("call", "member"):
             return False
-        return _is_marker(v) or (v.get("k") == "call" and bool(self.auth._targets(v)) and self.auth.decides([v]))
+        return _is_marker(v) or (v.get("k") == "call" and bool(self.auth._targets(v, self.owner))
+                                                      and self.auth.decides([v], owner=self.owner))
 
     def of(self, e, depth: int = 2, seen: frozenset = frozenset()) -> str:
         if not isinstance(e, dict):
@@ -412,9 +462,10 @@ class _Truth:
             return "?"
         if k == "call" and depth > 0:
             outs = set()
-            targets = self.auth._targets(e)
+            targets = self.auth._targets(e, self.owner)
             for m in targets:
-                inner = _Truth(self.auth, self.auth.owner[id(m)], m.body)
+                inner = _Truth(self.auth, self.auth.owner[id(m)], m.body,
+                               self.auth.owner[id(m)] if self.owner is not None else None)
                 rets = [n.get("value") for n in walk(m.body) if n.get("k") == "return" and n.get("value") is not None]
                 outs |= {inner.of(r, depth - 1) for r in rets} or {"?"}
             return outs.pop() if len(outs) == 1 and targets else "?"
@@ -689,15 +740,25 @@ def check(model, refs=()) -> list:
     for t in model.types():
         if t.kind == "enum":
             continue
+        core = model.is_core_file(t.file)
         for label, m, body, _scope in iter_bodies(t):
             bool_like = m is None or (m.return_type or "").replace(" ", "").lower() in _BOOLS
-            truth = _Truth(ctx.auth, t, body)
+            truth = _Truth(ctx.auth, t, body, t if core else None)
             mname = (m.name if m else label).lower()
             for tr in _tries(body):
                 truth.skip = {id(n) for n in walk(tr.get("body"))}
                 known = label.lower() in _KNOWN_DECISION
                 named = bool(_DECISION_NAME.search(label)) and bool_like
-                decision = known or named or ctx.auth.decides(tr.get("body"))
+                # Core only: legacy keeps the solution-wide bare-name resolution.
+                decision = known or named or ctx.auth.decides(tr.get("body"), owner=t if core else None)
+                via_fallback = False
+                if decision and core and not (known or named):
+                    # Is the decision still found without the solution-wide fallback for unbound calls?
+                    ctx.auth.strict = True
+                    try:
+                        via_fallback = not ctx.auth.decides(tr.get("body"), owner=t)
+                    finally:
+                        ctx.auth.strict = False
                 lines = ctx.catch_lines(t.file, tr)
                 after = _tail(body, tr)
                 for c, line in zip(tr["catches"], lines):
@@ -708,7 +769,7 @@ def check(model, refs=()) -> list:
                         emit(_finding(ctx, t, label, "DNL-ERR-001", "medium",
                                       "Fail-open catch around an authorization decision",
                                       f"The catch ({ctype or 'all exceptions'}) around an authorization decision "
-                                      f"{verdict[0]}", line, verdict[1]))
+                                      f"{verdict[0]}", line, "REVIEW" if via_fallback else verdict[1]))
                     elif not cbody and ctype in _CATCH_ALL:
                         # An empty catch-all always yields ERR-001 or ERR-003, never neither.
                         emit(_finding(ctx, t, label, "DNL-ERR-003", "low", "Swallowed exception",

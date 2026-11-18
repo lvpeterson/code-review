@@ -1,0 +1,4 @@
+@page
+@using System.Text.Encodings.Web
+@model CommentModel
+<p>@Html.Raw(HtmlEncoder.Default.Encode(Model.Text))</p>

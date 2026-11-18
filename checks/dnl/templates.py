@@ -1,4 +1,4 @@
-"""Razor and ASPX template scanning for the legacy .NET analyzer.
+"""Razor and ASPX template scanning for the .NET analyzers (legacy MVC / WebForms and ASP.NET Core).
 
 `scan` lists the places a template writes a value without HTML-encoding it:
 Razor `@Html.Raw(..)`, `@(new HtmlString(..))` and `@MvcHtmlString.Create(..)`
@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from checks.dnl.files import read_source, resolve_ci
-from checks.dnl.ir import call_name, literal_str, receiver_text, walk
+from checks.dnl.ir import call_name, has_attr, literal_str, receiver_text, walk
 
 RAZOR_EXT = (".cshtml", ".vbhtml")
 ASPX_EXT = (".aspx", ".ascx", ".master")
@@ -39,6 +39,7 @@ class Output:
 # `X.HtmlEncode(..)` style wrappers that make the whole expression HTML-safe.
 _ENCODER = re.compile(
     r"(?is)^(?:(?:System\.Web\.|System\.Net\.)?(?:HttpUtility|Server|WebUtility|AntiXssEncoder|Encoder)\.(?:HtmlEncode|HtmlAttributeEncode)"
+    r"|(?:System\.Text\.Encodings\.Web\.)?(?:HtmlEncoder|JavaScriptEncoder)\.Default\.Encode"
     r"|(?:System\.Web\.Mvc\.)?Html\.Encode|(?:Microsoft\.Security\.Application\.)?Sanitizer\.GetSafeHtmlFragment"
     r"|Json\.Encode)\s*\(")
 _CHAR_LIT = re.compile(r"'(?:\\.|[^'\\\n])'")
@@ -46,8 +47,9 @@ _NON_LITERAL = re.compile(r"^[\s+&()\d.]*$")
 _STR_LIT = re.compile(r'@?"(?:[^"\\]|\\.|"")*"')
 # Framework helpers that emit trusted markup / URLs when every argument is a constant.
 _BENIGN_CALL = re.compile(
-    r"(?is)^(?:ResolveUrl|ResolveClientUrl|Url\s*\.\s*(?:Action|Content|RouteUrl)"
-    r"|Html\s*\.\s*(?:Partial|Action|RenderPartial|RenderAction|AntiForgeryToken|ActionLink|BeginForm)"
+    r"(?is)^(?:ResolveUrl|ResolveClientUrl|Url\s*\.\s*(?:Action|Content|RouteUrl|Page)"
+    r"|Html\s*\.\s*(?:Partial|PartialAsync|Action|RenderPartial|RenderPartialAsync|RenderAction|AntiForgeryToken|ActionLink|BeginForm)"
+    r"|Component\s*\.\s*InvokeAsync"
     r"|Scripts\s*\.\s*Render|Styles\s*\.\s*Render)\s*\(")
 _TAINT_NAMES = re.compile(r"(?i)\b(?:Model|ViewBag|ViewData|Request|Eval|Bind)\b")
 _CONST_TOKEN = re.compile(r"(?i)\b(?:true|false|null|nothing)\b|\d+(?:\.\d+)?")
@@ -141,7 +143,7 @@ _RAZOR_COMMENT = re.compile(r"@\*.*?\*@", re.DOTALL)
 # `Html.Raw(` anywhere (it also appears bare inside code blocks); the helpers need their `@` transition.
 _RAZOR_RAW = re.compile(r"(?<![\w.])Html\s*\.\s*Raw\s*\(", re.IGNORECASE)
 _RAZOR_HELPER = re.compile(
-    r"(?<![\w@])@(?:\(\s*new\s+(?:System\.Web\.)?HtmlString\s*\(|(?:System\.Web\.Mvc\.)?MvcHtmlString\s*\.\s*Create\s*\()",
+    r"(?<![\w@])@(?:\(\s*new\s+(?:System\.Web\.|Microsoft\.AspNetCore\.Html\.)?HtmlString\s*\(|(?:System\.Web\.Mvc\.)?MvcHtmlString\s*\.\s*Create\s*\()",
     re.IGNORECASE)
 
 
@@ -249,17 +251,36 @@ def _find_view(base: Path, rel: str) -> Path | None:
     return None
 
 
+def _area_attr(t) -> str | None:
+    """Area named by `[Area("X")]` on a Core controller (the namespace has no `Areas.` segment)."""
+    a = has_attr(t.attributes, "Area")
+    return literal_str(a.args[0]) if a is not None and a.args else None
+
+
+def _page_views(model, ref) -> list[Path]:
+    """The Razor Page's own .cshtml (`meta["page_file"]`, relative to the scan root)."""
+    rel = ref.route.meta.get("page_file")
+    if not rel:
+        return []
+    hit = resolve_ci(model.root, rel)
+    return [hit] if hit is not None and hit.is_file() else []
+
+
 def views_for(model, ref) -> list[Path]:
     """Razor views the MVC action renders: one per `View(..)` / `PartialView(..)` call in its body,
     by convention `Views/<Controller>/<Name or Action>` then `Views/Shared/<Name>`."""
-    if ref.method is None or ref.type is None or ref.route.meta.get("kind") != "mvc":
+    kind = ref.route.meta.get("kind")
+    if kind == "razorpage":
+        return _page_views(model, ref)
+    if ref.method is None or ref.type is None or kind not in ("mvc", "controller"):
         return []
     base = ref.project.dir if ref.project is not None else model.root
     controller = ref.type.name.split(".")[-1]
     if controller.lower().endswith("controller"):
         controller = controller[: -len("controller")]
     area = _AREA_NS.search(ref.type.namespace)
-    roots = ([f"Areas/{area.group(1)}/Views"] if area else []) + ["Views"]
+    area_name = area.group(1) if area else _area_attr(ref.type) if kind == "controller" else None
+    roots = ([f"Areas/{area_name}/Views"] if area_name else []) + ["Views"]
     found: list[Path] = []
     for n in walk(ref.method.body):
         if n.get("k") != "call" or (call_name(n) or "").lower() not in ("view", "partialview"):

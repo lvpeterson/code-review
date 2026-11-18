@@ -14,12 +14,13 @@ online, authoritative path stays `--sca` (osv-scanner, checks/sca.py).
 """
 from __future__ import annotations
 
+import datetime
 import json
 import re
 from functools import lru_cache
 from pathlib import Path
 
-from checks.dnl.files import iter_dnl_files, read_source
+from checks.dnl.files import read_source
 from checks.dnl.findings import dnl_finding
 from checks.dnl.project import ProjectModel
 from core.models import Finding
@@ -136,6 +137,35 @@ def _advisories() -> dict:
     return _load(_DATA)[0]
 
 
+@lru_cache(maxsize=None)
+def _load_eol(path: Path) -> tuple[str | None, tuple[dict, ...]]:
+    """(eol_as_of, rows) of the end-of-support table beside the advisories (read by the
+    ASP.NET Core rules only; `_load` ignores these keys). Rows with a bad date, an empty
+    framework or a non-https source are dropped; a missing or malformed file gives (None, ())."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        as_of = data.get("eol_as_of")
+        datetime.date.fromisoformat(as_of)
+        rows = []
+        for r in data.get("eol", []):
+            try:
+                datetime.date.fromisoformat(r["eol"])
+                if isinstance(r["tfm"], str) and r["tfm"].strip() and str(r["source"]).startswith("https://"):
+                    rows.append({"tfm": r["tfm"].strip().lower(), "eol": r["eol"], "source": r["source"]})
+            except (KeyError, TypeError, ValueError):
+                continue
+        return as_of, tuple(rows)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None, ()
+
+
+def eol_table(path: Path = _DATA) -> tuple[str | None, list[dict]]:
+    """Public: (eol_as_of ISO date or None, [{"tfm", "eol", "source"}]) with lower-cased
+    framework monikers; see `_load_eol`."""
+    as_of, rows = _load_eol(path)
+    return as_of, list(rows)
+
+
 def _match(entries: list[dict], version: str) -> list[dict]:
     return [e for e in entries if version_in(e["affected"], version)]
 
@@ -209,7 +239,7 @@ def _check_packages(model: ProjectModel, notes: list[str]) -> tuple[list[Finding
     """SCA-001 over packages.config; also returns the package ids declared per directory."""
     findings: list[Finding] = []
     declared: dict[Path, set[str]] = {}
-    for path in iter_dnl_files(model.root, (".config",)):
+    for path in model.iter_files((".config",)):
         if path.name.lower() != "packages.config":
             continue
         text = _safe_read(path, notes)
@@ -294,7 +324,7 @@ _LOOPBACK = re.compile(r"^http://(localhost|127\.0\.0\.1|\[::1\])([:/]|$)", re.I
 
 def _check_nuget_config(model: ProjectModel, notes: list[str]) -> list[Finding]:
     findings: list[Finding] = []
-    for path in iter_dnl_files(model.root, (".config",)):
+    for path in model.iter_files((".config",)):
         if path.name.lower() != "nuget.config":
             continue
         text = _blank_comments(_safe_read(path, notes))
@@ -376,7 +406,7 @@ _DISPLAY = {"jquery-ui": "jQuery UI", "jquery-validation": "jQuery Validation", 
 
 def _check_js(model: ProjectModel, notes: list[str]) -> list[Finding]:
     findings: list[Finding] = []
-    for path in iter_dnl_files(model.root, (".js",)):
+    for path in model.iter_files((".js",)):
         try:
             parts = path.resolve().relative_to(model.root).parts[:-1]
         except ValueError:

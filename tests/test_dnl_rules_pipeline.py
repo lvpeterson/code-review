@@ -1,0 +1,1106 @@
+"""rules_pipeline skeleton: shared config context, per-project pipelines, absence confidence."""
+from cfgutil import ids, make_app, mode, prepare_model, run_check, scan  # noqa: F401
+
+from checks.dnl import cfgctx, rules_pipeline
+
+PROGRAM = "var app = WebApplication.CreateBuilder(args).Build();\n{body}\napp.Run();\n"
+WITH_BUILDER = ("var builder = WebApplication.CreateBuilder(args);\n{services}\nvar app = builder.Build();\n"
+                "{body}\napp.Run();\n")
+
+
+def ctx_of(tmp_path, files, mode_):
+    model, refs = prepare_model(make_app(tmp_path, files), degraded=(mode_ == "degraded"))
+    return cfgctx.build_ctx(model, refs)
+
+
+def test_library_project_reports_nothing(tmp_path, mode):
+    files = {"Thing.cs": "public class Thing { public int Value() => 1; }\n"}
+    root = make_app(tmp_path, files, sdk="Microsoft.NET.Sdk")
+    assert run_check(root, degraded=(mode == "degraded")) == []
+    model, refs = prepare_model(root, degraded=(mode == "degraded"))
+    assert cfgctx.build_ctx(model, refs).pipes == []
+
+
+def test_two_web_projects_reported_separately(tmp_path, mode):
+    prog = PROGRAM.format(body="app.UseDeveloperExceptionPage();")
+    csproj = make_app(tmp_path / "tmpl", {}) / "App.csproj"
+    for d in ("A", "B"):
+        sub = tmp_path / d
+        sub.mkdir(parents=True, exist_ok=True)
+        (sub / f"{d}.csproj").write_text(csproj.read_text(), encoding="utf-8")
+        (sub / "Program.cs").write_text(prog, encoding="utf-8")
+    (tmp_path / "tmpl" / "App.csproj").unlink()
+    model, refs = prepare_model(tmp_path, degraded=(mode == "degraded"))
+    ctx = cfgctx.build_ctx(model, refs)
+    assert len(ctx.pipes) == 2
+    assert len({p.project.name for p in ctx.pipes}) == 2
+    found = [f for f in rules_pipeline.check(model, refs) if f.check_id == "DNL-CFG-008"]
+    assert sorted(f.file.split("/")[0] for f in found) == ["A", "B"]
+
+
+def test_startup_configure_split_across_helpers(tmp_path, mode):
+    startup = """
+public class Startup
+{
+    public void ConfigureServices(IServiceCollection services) { services.AddControllers(); }
+    public void Configure(IApplicationBuilder app)
+    {
+        ConfigureSecurity(app);
+        app.UseRouting();
+    }
+    private void ConfigureSecurity(IApplicationBuilder app)
+    {
+        app.UseHsts();
+    }
+}
+"""
+    ctx = ctx_of(tmp_path, {"Startup.cs": startup}, mode)
+    assert len(ctx.pipes) == 1
+    assert ctx.pipes[0].named("UseHsts")
+    assert ctx.prod_calls(ctx.pipes[0], "UseHsts", kinds=("app",))
+
+
+def test_absent_confidence_unresolved_extension(tmp_path, mode):
+    prog = WITH_BUILDER.format(services="builder.Services.AddCompanyDefaults();", body="app.UseRouting();")
+    ctx = ctx_of(tmp_path, {"Program.cs": prog}, mode)
+    conf, note = ctx.absent_confidence(ctx.pipes[0])
+    assert conf == "REVIEW" and "AddCompanyDefaults" in note
+
+
+def test_absent_confidence_known_extension_is_firm(tmp_path, mode):
+    prog = WITH_BUILDER.format(services="builder.Services.AddDbContext<Db>();", body="app.UseRouting();")
+    prog += "public class Db {}\n"
+    ctx = ctx_of(tmp_path, {"Program.cs": prog}, mode)
+    assert ctx.absent_confidence(ctx.pipes[0]) == (None, "")
+
+
+def test_absent_confidence_unparseable_guard(tmp_path, mode):
+    prog = PROGRAM.format(body="if (Flag.Check()) { app.UseHsts(); }\napp.UseRouting();")
+    ctx = ctx_of(tmp_path, {"Program.cs": prog}, mode)
+    pipe = ctx.pipes[0]
+    assert pipe.named("UseHsts") == [] and ctx.uncertain_calls(pipe, "UseHsts")
+    conf, note = ctx.absent_confidence(pipe)
+    assert conf == "REVIEW" and "UseHsts" in note
+
+
+def test_ctx_add_goes_through_dnl_finding(tmp_path, mode):
+    ctx = ctx_of(tmp_path, {"Program.cs": PROGRAM.format(body="")}, mode)
+    ctx.add("DNL-AUTHZ-001", "low", "t", "d", "Program.cs", 1, confidence="REVIEW", api_surface=True)
+    f = ctx.out[0]
+    assert (f.check_id, f.severity, f.confidence, f.route) == ("DNL-AUTHZ-001", "low", "REVIEW", None)
+    assert f.owasp
+
+
+# -- errors and exception pages (DNL-CFG-008, DNL-CFG-009, DNL-ERR-002) ---------------------------
+
+def _scan(tmp_path, mode, body, services="", extra=None):
+    files = {"Program.cs": WITH_BUILDER.format(services=services, body=body)}
+    files.update(extra or {})
+    return scan(tmp_path, files, mode)
+
+
+def _of(findings, check_id):
+    return [f for f in findings if f.check_id == check_id]
+
+
+def test_developer_page_unguarded(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseDeveloperExceptionPage();")
+    assert ("DNL-CFG-008", "medium", None) in ids(found)
+
+
+def test_developer_page_guarded_is_clean(tmp_path, mode):
+    body = ("if (app.Environment.IsDevelopment()) { app.UseDeveloperExceptionPage(); }\n"
+            "else { app.UseExceptionHandler(\"/e\"); }")
+    found = _scan(tmp_path, mode, body)
+    assert not _of(found, "DNL-CFG-008") and not _of(found, "DNL-CFG-009")
+
+
+def test_developer_page_unparseable_guard_is_review(tmp_path, mode):
+    found = _scan(tmp_path, mode, "if (Flags.Debug()) { app.UseDeveloperExceptionPage(); }")
+    assert ("DNL-CFG-008", "medium", "REVIEW") in ids(found)
+
+
+def test_detailed_errors_in_settings(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseExceptionHandler(\"/e\");",
+                  extra={"appsettings.json": '{\n  "Logging": {},\n  "DetailedErrors": true\n}\n'})
+    hits = _of(found, "DNL-CFG-008")
+    assert [(f.file, f.line, f.severity, f.confidence) for f in hits] == [("appsettings.json", 3, "medium", None)]
+
+
+def test_detailed_errors_fixed_by_production_override(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseExceptionHandler(\"/e\");",
+                  extra={"appsettings.json": '{"DetailedErrors": true}',
+                         "appsettings.Production.json": '{"DetailedErrors": false}'})
+    assert not _of(found, "DNL-CFG-008")
+
+
+def test_detailed_errors_only_in_development_file_is_clean(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseExceptionHandler(\"/e\");",
+                  extra={"appsettings.Development.json": '{"DetailedErrors": true}'})
+    assert not _of(found, "DNL-CFG-008")
+
+
+def test_detailed_errors_in_circuit_options(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseExceptionHandler(\"/e\");",
+                  services="builder.Services.AddServerSideBlazor(o => { o.DetailedErrors = true; });")
+    assert ("DNL-CFG-008", "medium", None) in ids(found)
+
+
+def test_detailed_errors_from_expression_is_review(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseExceptionHandler(\"/e\");",
+                  services="builder.Services.AddServerSideBlazor(o => { o.DetailedErrors = Flags.Verbose(); });")
+    assert ("DNL-CFG-008", "medium", "REVIEW") in ids(found)
+
+
+def test_detailed_errors_false_is_clean(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseExceptionHandler(\"/e\");",
+                  services="builder.Services.AddServerSideBlazor(o => { o.DetailedErrors = false; });")
+    assert not _of(found, "DNL-CFG-008")
+
+
+def test_no_exception_handler_is_review(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseRouting();")
+    assert ("DNL-CFG-009", "low", "REVIEW") in ids(found)
+
+
+def test_exception_handler_present_is_clean(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseExceptionHandler(\"/e\");\napp.UseRouting();")
+    assert not _of(found, "DNL-CFG-009")
+
+
+def test_status_code_pages_count_as_handler(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseStatusCodePagesWithReExecute(\"/s/{0}\");\napp.UseRouting();")
+    assert not _of(found, "DNL-CFG-009")
+
+
+def test_handler_only_in_development_is_missing(tmp_path, mode):
+    body = "if (app.Environment.IsDevelopment()) { app.UseExceptionHandler(\"/e\"); }\napp.UseRouting();"
+    assert ("DNL-CFG-009", "low", "REVIEW") in ids(_scan(tmp_path, mode, body))
+
+
+def test_library_project_has_no_missing_handler(tmp_path, mode):
+    files = {"Thing.cs": "public class Thing { public int Value() => 1; }\n"}
+    found = scan(tmp_path, files, mode, sdk="Microsoft.NET.Sdk")
+    assert found == []
+
+
+LEAKY = ('app.UseExceptionHandler(a => a.Run(async c => {{ var f = c.Features.Get<IExceptionHandlerFeature>(); '
+         'await c.Response.WriteAsync({expr}); }}));')
+
+
+def test_handler_lambda_leaks_exception(tmp_path, mode):
+    found = _scan(tmp_path, mode, LEAKY.format(expr="f.Error.Message"))
+    assert ("DNL-ERR-002", "medium", None) in ids(found)
+
+
+def test_handler_lambda_constant_message_is_clean(tmp_path, mode):
+    found = _scan(tmp_path, mode, LEAKY.format(expr='"Something went wrong"'))
+    assert not _of(found, "DNL-ERR-002")
+
+
+def test_handler_lambda_leak_through_local_and_interpolation(tmp_path, mode):
+    body = ('app.UseExceptionHandler(a => a.Run(async c => { var f = c.Features.Get<IExceptionHandlerFeature>(); '
+            'var ex = f.Error; var text = $"failed: {ex.StackTrace}"; await c.Response.WriteAsync(text); }));')
+    assert ("DNL-ERR-002", "medium", None) in ids(_scan(tmp_path, mode, body))
+
+
+def test_handler_lambda_logging_only_is_clean(tmp_path, mode):
+    body = ('app.UseExceptionHandler(a => a.Run(async c => { var f = c.Features.Get<IExceptionHandlerFeature>(); '
+            'Log.Write(f.Error.Message); await c.Response.WriteAsync(f.Error.GetType().Name); }));')
+    assert not _of(_scan(tmp_path, mode, body), "DNL-ERR-002")
+
+
+def test_exception_handler_option_leaks_via_results(tmp_path, mode):
+    body = ('app.UseExceptionHandler(o => { o.ExceptionHandler = async c => { var f = c.Features.Get<IExceptionHandlerFeature>(); '
+            'await Results.Problem(detail: f.Error.ToString()).ExecuteAsync(c); }; });')
+    assert ("DNL-ERR-002", "medium", None) in ids(_scan(tmp_path, mode, body))
+
+
+def test_problem_details_customize_leaks_detail(tmp_path, mode):
+    services = ('builder.Services.AddProblemDetails(o => { o.CustomizeProblemDetails = c => '
+                '{ c.ProblemDetails.Detail = c.Exception.Message; }; });')
+    assert ("DNL-ERR-002", "medium", None) in ids(_scan(tmp_path, mode, "app.UseExceptionHandler();", services))
+
+
+def test_problem_details_extensions_leak(tmp_path, mode):
+    services = ('builder.Services.AddProblemDetails(o => { o.CustomizeProblemDetails = c => '
+                '{ c.ProblemDetails.Extensions["trace"] = c.Exception.StackTrace; }; });')
+    assert ("DNL-ERR-002", "medium", None) in ids(_scan(tmp_path, mode, "app.UseExceptionHandler();", services))
+
+
+def test_problem_details_without_exception_is_clean(tmp_path, mode):
+    services = ('builder.Services.AddProblemDetails(o => { o.CustomizeProblemDetails = c => '
+                '{ c.ProblemDetails.Detail = "failed"; c.ProblemDetails.Extensions["id"] = c.HttpContext.TraceIdentifier; }; });')
+    assert not _of(_scan(tmp_path, mode, "app.UseExceptionHandler();", services), "DNL-ERR-002")
+
+
+def test_leaking_handler_in_development_only_is_clean(tmp_path, mode):
+    body = "if (app.Environment.IsDevelopment()) {\n" + LEAKY.format(expr="f.Error.Message") + "\n}"
+    assert not _of(_scan(tmp_path, mode, body), "DNL-ERR-002")
+
+
+def test_leaking_handler_under_unparseable_guard_is_review(tmp_path, mode):
+    body = "if (Flags.Debug()) {\n" + LEAKY.format(expr="f.Error.Message") + "\n}"
+    assert ("DNL-ERR-002", "medium", "REVIEW") in ids(_scan(tmp_path, mode, body))
+
+
+# -- transport (DNL-CFG-010, 011, 013, 014) ----------------------------------------------------------
+
+def test_no_https_redirection_or_hsts_is_firm(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseRouting();")
+    assert ("DNL-CFG-010", "low", None) in ids(found)
+    assert ("DNL-CFG-011", "low", None) in ids(found)
+
+
+def test_https_redirection_and_hsts_present_is_clean(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseHttpsRedirection();\napp.UseHsts();\napp.UseRouting();")
+    assert not _of(found, "DNL-CFG-010") and not _of(found, "DNL-CFG-011")
+
+
+def test_hsts_outside_development_counts(tmp_path, mode):
+    body = "if (!app.Environment.IsDevelopment()) { app.UseHsts(); }\napp.UseHttpsRedirection();"
+    assert not _of(_scan(tmp_path, mode, body), "DNL-CFG-011")
+
+
+def test_hsts_only_in_development_is_reported(tmp_path, mode):
+    body = "if (app.Environment.IsDevelopment()) { app.UseHsts(); }\napp.UseHttpsRedirection();"
+    assert ("DNL-CFG-011", "low", None) in ids(_scan(tmp_path, mode, body))
+
+
+def test_add_hsts_alone_does_not_count(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseRouting();", services="builder.Services.AddHsts(o => { });")
+    assert ("DNL-CFG-011", "low", None) in ids(found)
+
+
+def test_hsts_header_literal_counts(tmp_path, mode):
+    body = ('app.Use(async (c, next) => { c.Response.Headers["Strict-Transport-Security"] = "max-age=31536000"; '
+            'await next(); });\napp.UseHttpsRedirection();')
+    assert not _of(_scan(tmp_path, mode, body), "DNL-CFG-011")
+
+
+def test_hsts_header_append_counts(tmp_path, mode):
+    body = ('app.Use(async (c, next) => { c.Response.Headers.Append("strict-transport-security", "max-age=1"); '
+            'await next(); });\napp.UseHttpsRedirection();')
+    assert not _of(_scan(tmp_path, mode, body), "DNL-CFG-011")
+
+
+def test_hsts_header_in_development_only_does_not_count(tmp_path, mode):
+    body = ('if (app.Environment.IsDevelopment()) { app.Use(async (c, next) => '
+            '{ c.Response.Headers["Strict-Transport-Security"] = "max-age=1"; await next(); }); }')
+    assert ("DNL-CFG-011", "low", None) in ids(_scan(tmp_path, mode, body))
+
+
+def test_unresolved_extension_makes_transport_review(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseCompanyDefaults();\napp.UseRouting();")
+    for cid in ("DNL-CFG-010", "DNL-CFG-011"):
+        hits = _of(found, cid)
+        assert [f.confidence for f in hits] == ["REVIEW"]
+        assert "UseCompanyDefaults" in hits[0].description
+
+
+def test_known_logging_extension_stays_firm(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseSerilogRequestLogging();\napp.UseRouting();")
+    assert ("DNL-CFG-010", "low", None) in ids(found)
+    assert ("DNL-CFG-011", "low", None) in ids(found)
+
+
+def test_unparseable_guard_around_hsts_is_review(tmp_path, mode):
+    body = "if (Flags.Secure()) { app.UseHsts(); }\napp.UseHttpsRedirection();"
+    hits = _of(_scan(tmp_path, mode, body), "DNL-CFG-011")
+    assert [f.confidence for f in hits] == ["REVIEW"]
+
+
+def test_custom_middleware_may_set_hsts_is_review(tmp_path, mode):
+    body = "app.UseMiddleware<SecurityHeaders>();\napp.UseHttpsRedirection();"
+    hits = _of(_scan(tmp_path, mode, body), "DNL-CFG-011")
+    assert [f.confidence for f in hits] == ["REVIEW"] and "SecurityHeaders" in hits[0].description
+
+
+def test_redirect_rewrite_rule_counts_as_redirection(tmp_path, mode):
+    body = "app.UseRewriter(new RewriteOptions().AddRedirectToHttps());\napp.UseHsts();"
+    assert not _of(_scan(tmp_path, mode, body), "DNL-CFG-010")
+
+
+def test_library_project_has_no_transport_findings(tmp_path, mode):
+    files = {"Thing.cs": "public class Thing { public int Value() => 1; }\n",
+             "appsettings.json": '{"AllowedHosts": "*"}'}
+    found = scan(tmp_path, files, mode, sdk="Microsoft.NET.Sdk")
+    assert not [f for f in found if f.check_id in ("DNL-CFG-010", "DNL-CFG-011", "DNL-CFG-013", "DNL-CFG-014")]
+
+
+def test_worker_host_has_no_transport_findings(tmp_path, mode):
+    prog = "var host = Host.CreateApplicationBuilder(args).Build();\nhost.Run();\n"
+    found = scan(tmp_path, {"Program.cs": prog}, mode, sdk="Microsoft.NET.Sdk.Worker")
+    assert not [f for f in found if f.check_id in ("DNL-CFG-010", "DNL-CFG-011")]
+
+
+HTTP_ONLY = "builder.WebHost.ConfigureKestrel(o => o.ListenAnyIP(8080));"
+
+
+def test_kestrel_http_only(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseRouting();", services=HTTP_ONLY)
+    hits = _of(found, "DNL-CFG-013")
+    assert ("DNL-CFG-013", "low", None) in ids(found)
+    assert [(f.file, f.line) for f in hits] == [("Program.cs", 2)]
+
+
+def test_kestrel_with_https_listener_is_clean(tmp_path, mode):
+    services = ("builder.WebHost.ConfigureKestrel(o => { o.ListenAnyIP(8080); "
+                "o.ListenAnyIP(8443, l => l.UseHttps()); });")
+    assert not _of(_scan(tmp_path, mode, "app.UseRouting();", services=services), "DNL-CFG-013")
+
+
+def test_kestrel_https_in_another_lambda_clears(tmp_path, mode):
+    services = HTTP_ONLY + "\nbuilder.WebHost.ConfigureKestrel(o => o.ListenAnyIP(8443, l => l.UseHttps()));"
+    assert not _of(_scan(tmp_path, mode, "app.UseRouting();", services=services), "DNL-CFG-013")
+
+
+def test_kestrel_https_defaults_clear(tmp_path, mode):
+    services = "builder.WebHost.ConfigureKestrel(o => { o.ConfigureHttpsDefaults(h => { }); o.ListenAnyIP(8080); });"
+    assert not _of(_scan(tmp_path, mode, "app.UseRouting();", services=services), "DNL-CFG-013")
+
+
+def test_kestrel_listen_variants_http_only(tmp_path, mode):
+    services = "builder.WebHost.ConfigureKestrel(o => { o.Listen(IPAddress.Any, 5000); });"
+    assert ("DNL-CFG-013", "low", None) in ids(_scan(tmp_path, mode, "app.UseRouting();", services=services))
+
+
+def test_use_urls_http_only(tmp_path, mode):
+    services = 'builder.WebHost.UseUrls("http://*:5000");'
+    assert ("DNL-CFG-013", "low", None) in ids(_scan(tmp_path, mode, "app.UseRouting();", services=services))
+
+
+def test_use_urls_with_https_is_clean(tmp_path, mode):
+    services = 'builder.WebHost.UseUrls("http://*:5000", "https://*:5001");'
+    assert not _of(_scan(tmp_path, mode, "app.UseRouting();", services=services), "DNL-CFG-013")
+
+
+def test_use_urls_semicolon_list_with_https_is_clean(tmp_path, mode):
+    services = 'builder.WebHost.UseUrls("http://*:5000;https://*:5001");'
+    assert not _of(_scan(tmp_path, mode, "app.UseRouting();", services=services), "DNL-CFG-013")
+
+
+def test_use_urls_loopback_is_clean(tmp_path, mode):
+    services = 'builder.WebHost.UseUrls("http://localhost:5000");'
+    assert not _of(_scan(tmp_path, mode, "app.UseRouting();", services=services), "DNL-CFG-013")
+
+
+def test_use_urls_in_development_only_is_clean(tmp_path, mode):
+    prog = ('var builder = WebApplication.CreateBuilder(args);\n'
+            'if (builder.Environment.IsDevelopment()) { builder.WebHost.UseUrls("http://*:5000"); }\n'
+            'var app = builder.Build();\napp.UseRouting();\napp.Run();\n')
+    assert not _of(scan(tmp_path, {"Program.cs": prog}, mode), "DNL-CFG-013")
+
+
+def test_use_urls_unreadable_value_next_to_http_listener_is_review(tmp_path, mode):
+    services = HTTP_ONLY + "\nbuilder.WebHost.UseUrls(Settings.Urls());"
+    assert ("DNL-CFG-013", "low", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseRouting();", services=services))
+
+
+def test_kestrel_endpoint_http_in_settings(tmp_path, mode):
+    cfg = '{\n  "Kestrel": {\n    "Endpoints": {\n      "Http": { "Url": "http://0.0.0.0:80" }\n    }\n  }\n}\n'
+    found = _scan(tmp_path, mode, "app.UseRouting();", extra={"appsettings.json": cfg})
+    hits = _of(found, "DNL-CFG-013")
+    assert [(f.file, f.line, f.confidence) for f in hits] == [("appsettings.json", 4, None)]
+
+
+def test_kestrel_endpoint_loopback_in_settings_is_clean(tmp_path, mode):
+    cfg = '{"Kestrel": {"Endpoints": {"Http": {"Url": "http://localhost:5000"}}}}'
+    assert not _of(_scan(tmp_path, mode, "app.UseRouting();", extra={"appsettings.json": cfg}), "DNL-CFG-013")
+
+
+def test_kestrel_endpoint_with_https_sibling_is_clean(tmp_path, mode):
+    cfg = ('{"Kestrel": {"Endpoints": {"Http": {"Url": "http://0.0.0.0:80"}, '
+           '"Https": {"Url": "https://0.0.0.0:443"}}}}')
+    assert not _of(_scan(tmp_path, mode, "app.UseRouting();", extra={"appsettings.json": cfg}), "DNL-CFG-013")
+
+
+def test_urls_setting_http_only(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseRouting();", extra={"appsettings.json": '{"Urls": "http://*:5000"}'})
+    assert ("DNL-CFG-013", "low", None) in ids(found)
+
+
+def test_urls_setting_fixed_by_production_override(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseRouting();",
+                  extra={"appsettings.json": '{"Urls": "http://*:5000"}',
+                         "appsettings.Production.json": '{"Urls": "https://*:5001"}'})
+    assert not _of(found, "DNL-CFG-013")
+
+
+def test_settings_https_clears_code_http_listener(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseRouting();", services=HTTP_ONLY,
+                  extra={"appsettings.json": '{"Urls": "https://*:5001"}'})
+    assert not _of(found, "DNL-CFG-013")
+
+
+def test_allowed_hosts_wildcard(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseRouting();",
+                  extra={"appsettings.json": '{\n  "AllowedHosts": "*"\n}\n'})
+    hits = _of(found, "DNL-CFG-014")
+    assert [(f.file, f.line, f.severity, f.confidence) for f in hits] == [("appsettings.json", 2, "low", None)]
+    assert ("DNL-CFG-014", "low", None) in ids(found)
+
+
+def test_allowed_hosts_wildcard_segment(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseRouting();", extra={"appsettings.json": '{"AllowedHosts": "*;x.test"}'})
+    assert ("DNL-CFG-014", "low", None) in ids(found)
+
+
+def test_allowed_hosts_specific_is_clean(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseRouting();", extra={"appsettings.json": '{"AllowedHosts": "example.test"}'})
+    assert not _of(found, "DNL-CFG-014")
+
+
+def test_allowed_hosts_subdomain_wildcard_is_clean(tmp_path, mode):
+    cfg = '{"AllowedHosts": "*.example.test;api.example.test"}'
+    assert not _of(_scan(tmp_path, mode, "app.UseRouting();", extra={"appsettings.json": cfg}), "DNL-CFG-014")
+
+
+def test_allowed_hosts_fixed_by_production_override(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseRouting();",
+                  extra={"appsettings.json": '{"AllowedHosts": "*"}',
+                         "appsettings.Production.json": '{"AllowedHosts": "example.test"}'})
+    assert not _of(found, "DNL-CFG-014")
+
+
+def test_allowed_hosts_wildcard_only_in_development_file_is_clean(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseRouting();",
+                  extra={"appsettings.Development.json": '{"AllowedHosts": "*"}'})
+    assert not _of(found, "DNL-CFG-014")
+
+
+HTTPS_LISTENER = "builder.WebHost.ConfigureKestrel(o => o.ListenAnyIP(8443, l => l.UseHttps()));"
+
+
+def test_https_listener_under_unparsed_guard_is_review(tmp_path, mode):
+    services = HTTP_ONLY + "\nif (Flags.Check()) { " + HTTPS_LISTENER + " }"
+    hits = _of(_scan(tmp_path, mode, "app.UseRouting();", services=services), "DNL-CFG-013")
+    assert [(f.severity, f.confidence) for f in hits] == [("low", "REVIEW")]
+    assert "could not be parsed" in hits[0].description
+
+
+def test_https_listener_unguarded_clears(tmp_path, mode):
+    services = HTTP_ONLY + "\n" + HTTPS_LISTENER
+    assert not _of(_scan(tmp_path, mode, "app.UseRouting();", services=services), "DNL-CFG-013")
+
+
+def test_https_listener_in_development_only_does_not_clear(tmp_path, mode):
+    services = HTTP_ONLY + "\nif (builder.Environment.IsDevelopment()) { " + HTTPS_LISTENER + " }"
+    assert ("DNL-CFG-013", "low", None) in ids(_scan(tmp_path, mode, "app.UseRouting();", services=services))
+
+
+# -- guards inside lambda bodies (Task 4b) -------------------------------------------------------------
+
+def test_https_listener_under_in_lambda_development_guard_is_review(tmp_path, mode):
+    services = ("builder.WebHost.ConfigureKestrel(o => { if (builder.Environment.IsDevelopment()) "
+                "o.ListenAnyIP(8443, l => l.UseHttps()); o.ListenAnyIP(8080); });")
+    assert ("DNL-CFG-013", "low", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseRouting();", services=services))
+
+
+def test_https_listener_under_in_lambda_flag_is_review(tmp_path, mode):
+    services = ("builder.WebHost.ConfigureKestrel(o => { o.ListenAnyIP(8080); "
+                "if (Flags.Tls()) { o.ListenAnyIP(8443, l => l.UseHttps()); } });")
+    assert ("DNL-CFG-013", "low", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseRouting();", services=services))
+
+
+def test_unconditional_https_listener_in_lambda_still_clears(tmp_path, mode):
+    services = "builder.WebHost.ConfigureKestrel(o => { o.ListenAnyIP(8080); o.ListenAnyIP(8443, l => l.UseHttps()); });"
+    assert not _of(_scan(tmp_path, mode, "app.UseRouting();", services=services), "DNL-CFG-013")
+
+
+def test_conditional_http_listener_is_review(tmp_path, mode):
+    services = "builder.WebHost.ConfigureKestrel(o => { if (Flags.Plain()) { o.ListenAnyIP(8080); } });"
+    assert ("DNL-CFG-013", "low", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseRouting();", services=services))
+
+
+def test_conditional_bad_detailed_errors_is_review(tmp_path, mode):
+    services = ("builder.Services.AddServerSideBlazor(o => { if (Flags.Debug()) { o.DetailedErrors = true; } });")
+    assert ("DNL-CFG-008", "medium", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseExceptionHandler(\"/e\");", services))
+
+
+def test_conditional_good_value_does_not_clear_bad_detailed_errors(tmp_path, mode):
+    services = ("builder.Services.AddServerSideBlazor(o => { o.DetailedErrors = true; "
+                "if (Flags.Safe()) { o.DetailedErrors = false; } });")
+    assert ("DNL-CFG-008", "medium", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseExceptionHandler(\"/e\");", services))
+
+
+def test_unconditional_bad_detailed_errors_stays_firm(tmp_path, mode):
+    services = "builder.Services.AddServerSideBlazor(o => { o.DetailedErrors = true; });"
+    assert ("DNL-CFG-008", "medium", None) in ids(_scan(tmp_path, mode, "app.UseExceptionHandler(\"/e\");", services))
+
+
+# -- early exits inside lambda bodies; conditional problem-details customization ---------------------
+
+def test_guarded_return_before_https_listener_is_review(tmp_path, mode):
+    services = ("builder.WebHost.ConfigureKestrel(o => { o.ListenAnyIP(8080); "
+                "if (builder.Environment.IsDevelopment()) return; o.ListenAnyIP(8443, l => l.UseHttps()); });")
+    assert ("DNL-CFG-013", "low", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseRouting();", services=services))
+
+
+def test_guarded_return_before_http_listener_is_review(tmp_path, mode):
+    services = "builder.WebHost.ConfigureKestrel(o => { if (Flags.Skip()) return; o.ListenAnyIP(8080); });"
+    assert ("DNL-CFG-013", "low", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseRouting();", services=services))
+
+
+def test_guarded_return_before_false_does_not_clear_detailed_errors(tmp_path, mode):
+    # Bad value set unconditionally, the fix sits after a guarded return: REVIEW (the fix may not run).
+    services = ("builder.Services.AddServerSideBlazor(o => { o.DetailedErrors = true; "
+                "if (Flags.Skip()) return; o.DetailedErrors = false; });")
+    assert ("DNL-CFG-008", "medium", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseExceptionHandler(\"/e\");", services))
+
+
+LEAKY_CUSTOMIZE = "c.ProblemDetails.Detail = c.Exception.Message;"
+
+
+def test_conditional_customize_problem_details_leak_is_review(tmp_path, mode):
+    services = ("builder.Services.AddProblemDetails(o => { if (Flags.Detail()) { o.CustomizeProblemDetails = c => "
+                "{ " + LEAKY_CUSTOMIZE + " }; } });")
+    assert ("DNL-ERR-002", "medium", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseExceptionHandler();", services))
+
+
+def test_unconditional_customize_problem_details_leak_stays_firm(tmp_path, mode):
+    services = ("builder.Services.AddProblemDetails(o => { o.CustomizeProblemDetails = c => "
+                "{ " + LEAKY_CUSTOMIZE + " }; });")
+    assert ("DNL-ERR-002", "medium", None) in ids(_scan(tmp_path, mode, "app.UseExceptionHandler();", services))
+
+
+def test_conditional_customize_does_not_suppress_missing_handler(tmp_path, mode):
+    # CFG-009 looks only at UseExceptionHandler / status-code pages, never at problem-details options.
+    services = ("builder.Services.AddProblemDetails(o => { if (Flags.Detail()) { o.CustomizeProblemDetails = c => "
+                "{ c.ProblemDetails.Detail = \"x\"; }; } });")
+    assert ("DNL-CFG-009", "low", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseRouting();", services=services))
+
+
+# -- CORS (DNL-CFG-007, DNL-CFG-015) -----------------------------------------------------------------
+
+def _cors(tmp_path, mode, policy, body="app.UseRouting();", extra=None, services_extra=""):
+    services = f"builder.Services.AddCors(o => {{ {policy} }});\n{services_extra}"
+    return _scan(tmp_path, mode, body, services, extra)
+
+
+def _add_policy(chain, name="p"):
+    return f'o.AddPolicy("{name}", b => {chain});'
+
+
+def test_cors_any_origin_is_medium(tmp_path, mode):
+    found = _cors(tmp_path, mode, _add_policy("b.AllowAnyOrigin().AllowAnyHeader()"))
+    assert ("DNL-CFG-007", "medium", None) in ids(found)
+
+
+def test_cors_any_origin_with_credentials_is_high_once(tmp_path, mode):
+    found = _cors(tmp_path, mode, _add_policy("b.AllowAnyOrigin().AllowCredentials()"))
+    hits = _of(found, "DNL-CFG-007")
+    assert [(f.severity, f.confidence) for f in hits] == [("high", None)]
+    assert "throws" in hits[0].description
+
+
+def test_cors_always_true_origin_callback_with_credentials_is_high(tmp_path, mode):
+    found = _cors(tmp_path, mode, _add_policy("b.SetIsOriginAllowed(_ => true).AllowCredentials()"))
+    assert ("DNL-CFG-007", "high", None) in ids(found)
+
+
+def test_cors_with_origins_star_is_medium(tmp_path, mode):
+    found = _cors(tmp_path, mode, _add_policy('b.WithOrigins("*")'))
+    assert ("DNL-CFG-007", "medium", None) in ids(found)
+
+
+def test_cors_wildcard_subdomains_with_bare_star_is_flagged(tmp_path, mode):
+    found = _cors(tmp_path, mode, _add_policy('b.WithOrigins("*").SetIsOriginAllowedToAllowWildcardSubdomains()'))
+    assert ("DNL-CFG-007", "medium", None) in ids(found)
+
+
+def test_cors_wildcard_subdomains_of_real_origin_is_clean(tmp_path, mode):
+    found = _cors(tmp_path, mode,
+                  _add_policy('b.WithOrigins("https://*.example.test").SetIsOriginAllowedToAllowWildcardSubdomains()'))
+    assert not _of(found, "DNL-CFG-007")
+
+
+def test_cors_restrictive_callback_is_clean(tmp_path, mode):
+    found = _cors(tmp_path, mode, _add_policy('b.SetIsOriginAllowed(o => o.EndsWith(".example.test"))'))
+    assert not _of(found, "DNL-CFG-007")
+
+
+def test_cors_listed_origin_is_clean(tmp_path, mode):
+    found = _cors(tmp_path, mode, _add_policy('b.WithOrigins("https://a.example.test").AllowCredentials()'))
+    assert not _of(found, "DNL-CFG-007")
+
+
+def test_cors_policy_under_development_guard_is_clean(tmp_path, mode):
+    services = ("if (builder.Environment.IsDevelopment())\n{\n"
+                "    builder.Services.AddCors(o => { o.AddPolicy(\"p\", b => b.AllowAnyOrigin()); });\n}")
+    assert not _of(_scan(tmp_path, mode, "app.UseRouting();", services), "DNL-CFG-007")
+
+
+def test_cors_policy_under_unparseable_guard_is_review(tmp_path, mode):
+    services = ("if (Flags.Open())\n{\n"
+                "    builder.Services.AddCors(o => { o.AddPolicy(\"p\", b => b.AllowAnyOrigin()); });\n}")
+    assert ("DNL-CFG-007", "medium", "REVIEW") in ids(_scan(tmp_path, mode, "app.UseRouting();", services))
+
+
+def test_cors_default_policy_any_origin(tmp_path, mode):
+    found = _cors(tmp_path, mode, "o.AddDefaultPolicy(b => b.AllowAnyOrigin());")
+    assert ("DNL-CFG-007", "medium", None) in ids(found)
+
+
+def test_cors_inline_use_cors_policy(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseCors(b => b.AllowAnyOrigin());")
+    assert ("DNL-CFG-007", "medium", None) in ids(found)
+
+
+def test_cors_policy_built_by_helper_is_review(tmp_path, mode):
+    helper_cs = ("public static class CorsHelper { public static void Open(object b) { } }\n")
+    found = _cors(tmp_path, mode, _add_policy("CorsHelper.Open(b)"), extra={"CorsHelper.cs": helper_cs})
+    assert ("DNL-CFG-007", "medium", "REVIEW") in ids(found)
+
+
+def test_cors_policy_method_group_is_review(tmp_path, mode):
+    found = _cors(tmp_path, mode, 'o.AddPolicy("p", Configure);',
+                  extra={"X.cs": "public static class X { public static void Configure(object b) {} }\n"})
+    assert ("DNL-CFG-007", "medium", "REVIEW") in ids(found)
+
+
+def test_cors_named_policy_used_but_not_defined_is_review(tmp_path, mode):
+    found = _scan(tmp_path, mode, 'app.UseCors("ghost");')
+    assert ("DNL-CFG-007", "medium", "REVIEW") in ids(found)
+
+
+def test_cors_named_policy_used_and_defined_is_clean(tmp_path, mode):
+    found = _cors(tmp_path, mode, _add_policy('b.WithOrigins("https://a.example.test")', "tight"),
+                  body='app.UseCors("tight");')
+    assert not _of(found, "DNL-CFG-007")
+
+
+def test_cors_conditional_wildcard_is_review(tmp_path, mode):
+    chain = "{ if (Flags.Open()) { b.AllowAnyOrigin(); } else { b.WithOrigins(\"https://a.example.test\"); } }"
+    found = _cors(tmp_path, mode, f'o.AddPolicy("p", b => {chain});')
+    assert ("DNL-CFG-007", "medium", "REVIEW") in ids(found)
+
+
+def test_cors_conditional_good_origin_does_not_clear_wildcard(tmp_path, mode):
+    chain = "{ b.AllowAnyOrigin(); if (Flags.Tight()) { b.WithOrigins(\"https://a.example.test\"); } }"
+    found = _cors(tmp_path, mode, f'o.AddPolicy("p", b => {chain});')
+    assert ("DNL-CFG-007", "medium", None) in ids(found)
+
+
+def test_cors_origins_from_configuration_are_review(tmp_path, mode):
+    found = _cors(tmp_path, mode, _add_policy('b.WithOrigins(builder.Configuration["Cors:Origin"])'))
+    assert ("DNL-CFG-007", "medium", "REVIEW") in ids(found)
+
+
+ADMIN = """
+using Microsoft.AspNetCore.Cors;
+using Microsoft.AspNetCore.Mvc;
+public class AdminController : Controller
+{
+    [EnableCors("%s")]
+    public IActionResult Reset() => Ok();
+}
+"""
+MVC = "builder.Services.AddControllers();\n"
+TIGHT = _add_policy('b.WithOrigins("https://a.example.test")', "tight")
+
+
+def _admin(tmp_path, mode, policy, attr_name="tight", controller=None):
+    ctl = controller or ADMIN % attr_name
+    return _cors(tmp_path, mode, policy, body="app.MapControllers();", extra={"AdminController.cs": ctl},
+                 services_extra=MVC)
+
+
+def test_enable_cors_on_sensitive_route(tmp_path, mode):
+    found = _admin(tmp_path, mode, TIGHT)
+    hits = _of(found, "DNL-CFG-015")
+    assert ("DNL-CFG-015", "low", "REVIEW") in ids(found) and hits[0].route is not None
+    assert not _of(found, "DNL-CFG-007")
+
+
+def test_enable_cors_under_wildcard_policy_is_cfg007_only(tmp_path, mode):
+    found = _admin(tmp_path, mode, _add_policy("b.AllowAnyOrigin()", "tight"))
+    assert not _of(found, "DNL-CFG-015") and ("DNL-CFG-007", "medium", None) in ids(found)
+
+
+def test_enable_cors_with_undefined_policy_is_still_reported(tmp_path, mode):
+    found = _admin(tmp_path, mode, _add_policy('b.WithOrigins("https://a.example.test")', "other"))
+    assert ("DNL-CFG-015", "low", "REVIEW") in ids(found)
+
+
+def test_enable_cors_on_class_and_mutating_action(tmp_path, mode):
+    ctl = ('using Microsoft.AspNetCore.Cors;\nusing Microsoft.AspNetCore.Mvc;\n[EnableCors("tight")]\n'
+           'public class ItemsController : Controller\n{\n    [HttpPost]\n    public IActionResult Save() => Ok();\n}\n')
+    assert ("DNL-CFG-015", "low", "REVIEW") in ids(_admin(tmp_path, mode, TIGHT, controller=ctl))
+
+
+def test_enable_cors_on_harmless_read_is_not_reported(tmp_path, mode):
+    ctl = ('using Microsoft.AspNetCore.Cors;\nusing Microsoft.AspNetCore.Mvc;\npublic class ItemsController : Controller\n'
+           '{\n    [EnableCors("tight")]\n    [HttpGet]\n    public IActionResult List() => Ok();\n}\n')
+    assert not _of(_admin(tmp_path, mode, TIGHT, controller=ctl), "DNL-CFG-015")
+
+
+def test_disable_cors_is_ignored(tmp_path, mode):
+    ctl = ('using Microsoft.AspNetCore.Cors;\nusing Microsoft.AspNetCore.Mvc;\npublic class AdminController : Controller\n'
+           '{\n    [DisableCors]\n    public IActionResult Reset() => Ok();\n}\n')
+    assert not _of(_admin(tmp_path, mode, TIGHT, controller=ctl), "DNL-CFG-015")
+
+
+def test_require_cors_on_sensitive_minimal_route(tmp_path, mode):
+    body = 'app.MapPost("/admin/reset", () => "ok").RequireCors("tight");'
+    assert ("DNL-CFG-015", "low", "REVIEW") in ids(_cors(tmp_path, mode, TIGHT, body=body))
+
+
+def test_require_cors_through_group_under_wildcard_is_cfg007_only(tmp_path, mode):
+    body = 'var g = app.MapGroup("/admin").RequireCors("tight");\ng.MapPost("/reset", () => "ok");'
+    found = _cors(tmp_path, mode, _add_policy("b.AllowAnyOrigin()", "tight"), body=body)
+    assert not _of(found, "DNL-CFG-015") and ("DNL-CFG-007", "medium", None) in ids(found)
+
+
+# -- CORS fix round: attribute names are resolved for every route; non-literal-named policies -------------
+
+GET_CTL = ('using Microsoft.AspNetCore.Cors;\nusing Microsoft.AspNetCore.Mvc;\npublic class ItemsController : Controller\n'
+           '{\n    [EnableCors("x")]\n    [HttpGet]\n    public IActionResult List() => Ok();\n}\n')
+HELPER_CS = "public static class CorsHelper { public static void Open(object b) { } }\n"
+
+
+def test_enable_cors_on_get_with_unreadable_policy_is_review(tmp_path, mode):
+    found = _admin(tmp_path, mode, _add_policy("CorsHelper.Open(b)", "x"), controller=GET_CTL)
+    assert not _of(found, "DNL-CFG-015")
+    uses = [f for f in _of(found, "DNL-CFG-007") if f.file == "AdminController.cs"]
+    assert [(f.severity, f.confidence) for f in uses] == [("medium", "REVIEW")]
+
+
+def test_enable_cors_on_get_with_undefined_policy_is_review(tmp_path, mode):
+    found = _admin(tmp_path, mode, _add_policy('b.WithOrigins("https://a.example.test")', "other"), controller=GET_CTL)
+    assert ("DNL-CFG-007", "medium", "REVIEW") in ids(found)
+
+
+def test_enable_cors_on_get_with_benign_policy_is_clean(tmp_path, mode):
+    found = _admin(tmp_path, mode, _add_policy('b.WithOrigins("https://a.example.test")', "x"), controller=GET_CTL)
+    assert not _of(found, "DNL-CFG-007") and not _of(found, "DNL-CFG-015")
+
+
+def test_used_ghost_name_with_const_named_policy_is_review(tmp_path, mode):
+    policy = ('o.AddPolicy(Names.Tight, b => b.WithOrigins("https://a.example.test"));')
+    extra = {"Names.cs": 'public static class Names { public const string Tight = "tight"; }\n'}
+    found = _cors(tmp_path, mode, policy, body='app.UseCors("ghost");', extra=extra)
+    hits = _of(found, "DNL-CFG-007")
+    assert [(f.severity, f.confidence) for f in hits] == [("medium", "REVIEW")]
+    assert "name is not a literal" in hits[0].description
+
+
+# -- inventory (DNL-INV-003, DNL-INV-004) ----------------------------------------------------------------
+
+def _ctl(route, cls="OrdersController", attrs="", action="[HttpGet]", base="ControllerBase"):
+    return ("using Microsoft.AspNetCore.Mvc;\n[ApiController]\n" + attrs + f'[Route("{route}")]\n'
+            f"public class {cls} : {base}\n{{\n    {action}\n    public IActionResult List() => Ok();\n}}\n")
+
+
+def _inv(tmp_path, mode, controllers, services=MVC, body="app.MapControllers();"):
+    extra = {f"C{i}.cs": text for i, text in enumerate(controllers)}
+    return _scan(tmp_path, mode, body, services, extra)
+
+
+def test_swagger_calls_in_production(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.UseSwagger();\napp.UseSwaggerUI();")
+    hits = _of(found, "DNL-INV-003")
+    assert len(hits) == 2 and {(f.severity, f.confidence) for f in hits} == {("low", None)}
+    assert len({f.line for f in hits}) == 2
+
+
+def test_swagger_under_development_guard_is_clean(tmp_path, mode):
+    body = "if (app.Environment.IsDevelopment())\n{\n    app.UseSwagger();\n    app.UseSwaggerUI();\n    app.MapOpenApi();\n}"
+    assert not _of(_scan(tmp_path, mode, body), "DNL-INV-003")
+
+
+def test_map_open_api_is_reported(tmp_path, mode):
+    assert ("DNL-INV-003", "low", None) in ids(_scan(tmp_path, mode, "app.MapOpenApi();"))
+
+
+def test_other_documentation_endpoints_are_reported(tmp_path, mode):
+    body = "app.UseReDoc();\napp.MapScalarApiReference();\napp.UseOpenApi();\napp.MapSwagger();"
+    assert len(_of(_scan(tmp_path, mode, body), "DNL-INV-003")) == 4
+
+
+def test_swagger_under_unparseable_guard_is_review(tmp_path, mode):
+    found = _scan(tmp_path, mode, "if (Flag.Check())\n{\n    app.UseSwagger();\n}")
+    assert [(f.severity, f.confidence) for f in _of(found, "DNL-INV-003")] == [("low", "REVIEW")]
+
+
+def test_open_api_behind_authorization_is_still_reported(tmp_path, mode):
+    found = _scan(tmp_path, mode, "app.MapOpenApi().RequireAuthorization();")
+    hits = _of(found, "DNL-INV-003")
+    assert len(hits) == 1 and "RequireAuthorization" in hits[0].description
+    plain = _of(_scan(tmp_path / "p", mode, "app.MapOpenApi();"), "DNL-INV-003")
+    assert "RequireAuthorization" not in plain[0].description
+
+
+def test_library_project_has_no_inventory_findings(tmp_path, mode):
+    files = {"Thing.cs": "public class Thing { public void Go(IApplicationBuilder app) { app.UseSwagger(); } }\n"}
+    assert scan(tmp_path, files, mode, sdk="Microsoft.NET.Sdk") == []
+
+
+def test_two_api_versions_in_paths_report_the_older(tmp_path, mode):
+    found = _inv(tmp_path, mode, [_ctl("api/v1/orders"), _ctl("api/v2/orders", "OrdersV2Controller")])
+    hits = _of(found, "DNL-INV-004")
+    assert [(f.severity, f.confidence) for f in hits] == [("low", "REVIEW")]
+    assert hits[0].route is not None and hits[0].route.path.endswith("/v1/orders") and "1.0" in hits[0].description
+
+
+def test_one_finding_per_older_version_at_its_first_route(tmp_path, mode):
+    found = _inv(tmp_path, mode, [_ctl("api/v1/orders"), _ctl("api/v1/items", "ItemsController"),
+                                  _ctl("api/v2/orders", "OrdersV2Controller"),
+                                  _ctl("api/v3/orders", "OrdersV3Controller")])
+    hits = _of(found, "DNL-INV-004")
+    assert sorted(f.route.path for f in hits) == ["/api/v1/orders", "/api/v2/orders"]
+
+
+def test_single_api_version_is_clean(tmp_path, mode):
+    found = _inv(tmp_path, mode, [_ctl("api/v1/orders"), _ctl("api/v1/items", "ItemsController")])
+    assert not _of(found, "DNL-INV-004")
+
+
+def test_deprecated_api_version_is_not_reported(tmp_path, mode):
+    old = _ctl("api/v1/orders", attrs='[ApiVersion("1.0", Deprecated = true)]\n')
+    new = _ctl("api/v2/orders", "OrdersV2Controller")
+    assert not _of(_inv(tmp_path, mode, [old, new]), "DNL-INV-004")
+
+
+def test_api_version_attributes_without_version_paths(tmp_path, mode):
+    old = _ctl("api/orders", attrs='[ApiVersion("1.0")]\n')
+    new = _ctl("api/orders2", "OrdersV2Controller", attrs='[ApiVersion("2.0")]\n')
+    hits = _of(_inv(tmp_path, mode, [old, new]), "DNL-INV-004")
+    assert [f.route.path for f in hits] == ["/api/orders"]
+
+
+def test_action_level_and_inherited_api_versions(tmp_path, mode):
+    base = 'using Microsoft.AspNetCore.Mvc;\n[ApiVersion("2.0")]\npublic abstract class BaseController : ControllerBase { }\n'
+    old = _ctl("api/orders", action='[HttpGet]\n    [ApiVersion("1.0")]', base="BaseController")
+    new = _ctl("api/orders2", "OrdersV2Controller", base="BaseController")
+    hits = _of(_inv(tmp_path, mode, [base, old, new]), "DNL-INV-004")
+    assert [f.route.path for f in hits] == ["/api/orders"] and hits[0].confidence == "REVIEW"
+
+
+def test_has_deprecated_api_version_suppresses(tmp_path, mode):
+    services = MVC + ("builder.Services.AddApiVersioning(o => "
+                      "o.Conventions.Controller<OrdersController>().HasDeprecatedApiVersion(1, 0));\n")
+    found = _inv(tmp_path, mode, [_ctl("api/v1/orders"), _ctl("api/v2/orders", "OrdersV2Controller")], services=services)
+    assert not _of(found, "DNL-INV-004")
+
+
+def test_non_literal_api_version_is_review(tmp_path, mode):
+    ctl = _ctl("api/orders", attrs="[ApiVersion(Versions.Old)]\n")
+    hits = _of(_inv(tmp_path, mode, [ctl]), "DNL-INV-004")
+    assert [(f.severity, f.confidence) for f in hits] == [("low", "REVIEW")]
+    assert hits[0].route is not None
+
+
+def test_swagger_paths_are_not_api_versions(tmp_path, mode):
+    found = _inv(tmp_path, mode, [_ctl("api/v1/orders")], body="app.UseSwagger();\napp.MapControllers();")
+    assert not _of(found, "DNL-INV-004")
+
+
+# -- data protection (DNL-CRY-009) -----------------------------------------------------------------------
+
+FS = 'builder.Services.AddDataProtection().PersistKeysToFileSystem(new DirectoryInfo("/keys"))'
+
+
+def _dp(tmp_path, mode, services, extra=None):
+    return _scan(tmp_path, mode, "app.UseRouting();", services, extra)
+
+
+def test_keys_on_file_system_without_protection(tmp_path, mode):
+    hits = _of(_dp(tmp_path, mode, FS + ";"), "DNL-CRY-009")
+    assert [(f.severity, f.confidence) for f in hits] == [("low", None)]
+    assert hits[0].route is None
+
+
+def test_keys_with_certificate_protection_are_clean(tmp_path, mode):
+    assert not _of(_dp(tmp_path, mode, FS + ".ProtectKeysWithCertificate(cert);"), "DNL-CRY-009")
+
+
+def test_keys_with_set_application_name_only_are_reported(tmp_path, mode):
+    assert ("DNL-CRY-009", "low", None) in ids(_dp(tmp_path, mode, FS + '.SetApplicationName("a");'))
+
+
+def test_protection_elsewhere_in_the_pipeline_counts(tmp_path, mode):
+    services = FS + ";\nbuilder.Services.AddDataProtection().ProtectKeysWithAzureKeyVault(uri, cred);"
+    assert not _of(_dp(tmp_path, mode, services), "DNL-CRY-009")
+
+
+def test_other_key_stores_are_reported(tmp_path, mode):
+    services = ("builder.Services.AddDataProtection().PersistKeysToStackExchangeRedis(mux);\n"
+                "builder.Services.AddDataProtection().PersistKeysToAzureBlobStorage(blob);\n"
+                "builder.Services.AddDataProtection().PersistKeysToDbContext<Db>();")
+    assert len(_of(_dp(tmp_path, mode, services), "DNL-CRY-009")) == 3
+
+
+def test_default_key_storage_is_clean(tmp_path, mode):
+    services = 'builder.Services.AddDataProtection().SetApplicationName("a");'
+    assert not _of(_dp(tmp_path, mode, services), "DNL-CRY-009")
+
+
+def test_keys_persisted_only_in_development_are_clean(tmp_path, mode):
+    services = "if (builder.Environment.IsDevelopment())\n{\n    " + FS + ";\n}"
+    assert not _of(_dp(tmp_path, mode, services), "DNL-CRY-009")
+
+
+def test_keys_under_unparseable_guard_are_review(tmp_path, mode):
+    found = _dp(tmp_path, mode, "if (Flag.Check())\n{\n    " + FS + ";\n}")
+    assert [(f.severity, f.confidence) for f in _of(found, "DNL-CRY-009")] == [("low", "REVIEW")]
+
+
+def test_conditional_protection_never_counts(tmp_path, mode):
+    services = FS + ";\nif (Flag.Check())\n{\n    builder.Services.AddDataProtection().ProtectKeysWithDpapi();\n}"
+    found = _dp(tmp_path, mode, services)
+    assert [(f.severity, f.confidence) for f in _of(found, "DNL-CRY-009")] == [("low", "REVIEW")]
+
+
+def test_unresolved_services_call_makes_it_review(tmp_path, mode):
+    found = _dp(tmp_path, mode, FS + ";\nbuilder.Services.AddCompanyDefaults();")
+    hits = _of(found, "DNL-CRY-009")
+    assert [(f.severity, f.confidence) for f in hits] == [("low", "REVIEW")]
+    assert "AddCompanyDefaults" in hits[0].description
+
+
+def test_builder_stored_and_handed_to_unknown_code_is_review(tmp_path, mode):
+    services = "var dp = builder.Services.AddDataProtection();\nKeyHelpers.Configure(dp);"
+    found = _dp(tmp_path, mode, services)
+    assert [(f.severity, f.confidence) for f in _of(found, "DNL-CRY-009")] == [("low", "REVIEW")]
+
+
+def test_builder_handed_to_a_followed_helper_is_read(tmp_path, mode):
+    services = "var dp = builder.Services.AddDataProtection();\nConfigureKeys(dp);"
+    helper = ('public static class K { public static void ConfigureKeys(IDataProtectionBuilder b) '
+              '{ b.PersistKeysToFileSystem(new DirectoryInfo("/keys")); } }\n')
+    found = _dp(tmp_path, mode, services, extra={"Keys.cs": helper})
+    assert [(f.severity, f.confidence) for f in _of(found, "DNL-CRY-009")] == [("low", None)]
+
+
+def test_builder_stored_and_configured_in_place_is_firm(tmp_path, mode):
+    services = 'var dp = builder.Services.AddDataProtection();\ndp.PersistKeysToFileSystem(new DirectoryInfo("/keys"));'
+    assert ("DNL-CRY-009", "low", None) in ids(_dp(tmp_path, mode, services))
+
+
+# -- INV-004 fix round: deprecation ties, path prefix, unread versioning ----------------------------------
+
+def _depr(controller_expr="o.Conventions.Controller<OrdersController>()", guard=False):
+    call = f"builder.Services.AddApiVersioning(o => {controller_expr}.HasDeprecatedApiVersion(1, 0));\n"
+    return MVC + (f"if (builder.Environment.IsDevelopment())\n{{\n    {call}}}\n" if guard else call)
+
+
+V1_V2 = [_ctl("api/v1/orders"), _ctl("api/v1/items", "ItemsController"), _ctl("api/v2/orders", "OrdersV2Controller")]
+
+
+def test_convention_deprecation_covers_only_its_controller(tmp_path, mode):
+    hits = _of(_inv(tmp_path, mode, V1_V2, services=_depr()), "DNL-INV-004")
+    assert [(f.route.path, f.confidence) for f in hits] == [("/api/v1/items", "REVIEW")]
+    assert "HasDeprecatedApiVersion" in hits[0].description and "Program.cs" in hits[0].description
+
+
+def test_convention_deprecation_of_every_v1_controller_suppresses(tmp_path, mode):
+    services = _depr() + _depr("o.Conventions.Controller<ItemsController>()")
+    assert not _of(_inv(tmp_path, mode, V1_V2, services=services), "DNL-INV-004")
+
+
+def test_deprecation_under_development_guard_does_not_suppress(tmp_path, mode):
+    found = _inv(tmp_path, mode, V1_V2[:1] + V1_V2[2:], services=_depr(guard=True))
+    hits = _of(found, "DNL-INV-004")
+    assert [(f.route.path, f.confidence) for f in hits] == [("/api/v1/orders", "REVIEW")]
+    assert "could not be tied" in hits[0].description
+
+
+def test_untied_deprecation_receiver_does_not_suppress(tmp_path, mode):
+    found = _inv(tmp_path, mode, V1_V2[:1] + V1_V2[2:], services=_depr("o.Conventions"))
+    hits = _of(found, "DNL-INV-004")
+    assert [f.route.path for f in hits] == ["/api/v1/orders"] and "could not be tied" in hits[0].description
+
+
+def test_attribute_deprecation_covers_only_its_controller(tmp_path, mode):
+    old = _ctl("api/v1/orders", attrs='[ApiVersion("1.0", Deprecated = true)]\n')
+    found = _inv(tmp_path, mode, [old, _ctl("api/v1/items", "ItemsController"), _ctl("api/v2/orders", "OrdersV2Controller")])
+    assert [f.route.path for f in _of(found, "DNL-INV-004")] == ["/api/v1/items"]
+
+
+def test_version_must_prefix_the_path(tmp_path, mode):
+    found = _inv(tmp_path, mode, [_ctl("api/orders/v1"), _ctl("api/orders/v2", "OrdersV2Controller")])
+    assert not _of(found, "DNL-INV-004")
+    found = _inv(tmp_path / "b", mode, [_ctl("v1/orders"), _ctl("v2/orders", "OrdersV2Controller")])
+    assert [f.route.path for f in _of(found, "DNL-INV-004")] == ["/v1/orders"]
+
+
+def test_minimal_api_version_set_is_reported_as_unread(tmp_path, mode):
+    body = "var set = app.NewApiVersionSet().HasApiVersion(new ApiVersion(1, 0)).Build();\napp.MapGet(\"/x\", () => 1);"
+    hits = _of(_scan(tmp_path, mode, body), "DNL-INV-004")
+    assert [(f.severity, f.confidence, f.route) for f in hits] == [("low", "REVIEW", None)]
+    assert "not read" in hits[0].description or "could not be compared" in hits[0].description
+
+
+# -- final fix wave ------------------------------------------------------------------------------------------
+
+
+def _two_projects(tmp_path, extra: dict):
+    prog = PROGRAM.format(body="app.UseDeveloperExceptionPage();")
+    csproj = make_app(tmp_path / "tmpl", {}) / "App.csproj"
+    for d in ("A", "B"):
+        sub = tmp_path / d
+        sub.mkdir(parents=True, exist_ok=True)
+        (sub / f"{d}.csproj").write_text(csproj.read_text(), encoding="utf-8")
+        (sub / "Program.cs").write_text(prog, encoding="utf-8")
+    (tmp_path / "tmpl" / "App.csproj").unlink()
+    for rel, text in extra.items():
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+
+
+def test_appsettings_in_unclaimed_directory_adds_one_note(tmp_path, mode):
+    cfg = '{"AllowedHosts": "*", "DetailedErrors": true}'
+    # `lib` is a project that has no web entry point; `A/conf` sits under A but is not A's own directory
+    lib = make_app(tmp_path / "tmpl2", {}, sdk="Microsoft.NET.Sdk") / "App.csproj"
+    _two_projects(tmp_path, {"A/appsettings.json": cfg, "lib/Lib.csproj": lib.read_text(),
+                             "lib/appsettings.json": cfg, "lib/appsettings.Production.json": cfg,
+                             "A/conf/appsettings.json": cfg})
+    (tmp_path / "tmpl2" / "App.csproj").unlink()
+    model, refs = prepare_model(tmp_path, degraded=(mode == "degraded"))
+    found = rules_pipeline.check(model, refs)
+    rules_pipeline.check(model, refs)          # a second run must not repeat the notes
+    notes = [n for n in model.notes if "is not read by the configuration rules" in n]
+    assert sorted(notes) == sorted(
+        f"appsettings in {d} is not read by the configuration rules: no web project claims it; secrets rules still scan it"
+        for d in ("A/conf", "lib"))
+    # A's own settings are still read (CFG-014 on A), the unclaimed ones are not
+    assert {f.file for f in found if f.check_id == "DNL-CFG-014"} == {"A/appsettings.json"}
+
+
+def test_all_claimed_directories_add_no_note(tmp_path, mode):
+    _two_projects(tmp_path, {"A/appsettings.json": "{}", "B/appsettings.json": "{}"})
+    model, refs = prepare_model(tmp_path, degraded=(mode == "degraded"))
+    rules_pipeline.check(model, refs)
+    assert not [n for n in model.notes if "is not read by the configuration rules" in n]
+
+
+def test_scope_of_is_defined_once():
+    from checks.dnl import rules_limits_core, rules_pipeline_auth
+    assert (rules_pipeline._scope_of is cfgctx._scope_of is rules_pipeline_auth._scope_of
+            is rules_limits_core._scope_of)
+
+
+def test_build_ctx_failure_still_runs_the_secrets_group(tmp_path, mode, monkeypatch):
+    files = {"Program.cs": PROGRAM.format(body="app.UseDeveloperExceptionPage();"),
+             "appsettings.json": '{"ConnectionStrings": {"Default": "Server=db;Password=Zx9kLm3pQ7"}}'}
+    model, refs = prepare_model(make_app(tmp_path, files), degraded=(mode == "degraded"))
+
+    def boom(*a, **k):
+        raise RuntimeError("synthetic pipeline failure")
+    monkeypatch.setattr(cfgctx, "pipeline_for", boom)
+    found = rules_pipeline.check(model, refs)
+    assert [f.check_id for f in found] == ["DNL-SEC-001"]
+    assert any("synthetic pipeline failure" in n for n in model.notes)
+
+
+def test_build_ctx_failure_in_settings_load_is_noted(tmp_path, mode, monkeypatch):
+    model, refs = prepare_model(make_app(tmp_path, {"Program.cs": PROGRAM.format(body="")}),
+                                degraded=(mode == "degraded"))
+
+    def boom(*a, **k):
+        raise RuntimeError("synthetic settings failure")
+    monkeypatch.setattr(cfgctx, "load_settings", boom)
+    assert rules_pipeline.check(model, refs) == []
+    assert any("synthetic settings failure" in n for n in model.notes)

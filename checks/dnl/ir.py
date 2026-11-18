@@ -1,4 +1,4 @@
-"""Python mirror of the roslyn-ir schema 1 plus small helpers for walking it.
+"""Python mirror of the roslyn-ir schema 2 plus small helpers for walking it.
 
 Types, methods and members are dataclasses; statements and expressions stay
 plain dicts (`{"k": kind, "line": n, ...}`) because they are deeply nested and
@@ -8,6 +8,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Iterator
+
+
+# Method name the helper gives the synthetic top-level-statements entry point.
+TOP_LEVEL_MAIN = "<Main>$"
+
+
+def is_top_level(m: "MethodIR") -> bool:
+    """True for the synthetic method holding a file's top-level statements."""
+    return m.name == TOP_LEVEL_MAIN
 
 
 @dataclass
@@ -80,6 +89,9 @@ class TypeIR:
     line: int
     end_line: int
     file: str = ""
+    # Member kinds the IR does not lower ("indexer", "operator", "event", "destructor"), presence only. None when
+    # the frontend does not report them (the VB lowering), so callers fall back to scanning the source text.
+    special_members: list[str] | None = None
 
     @property
     def full_name(self) -> str:
@@ -125,6 +137,7 @@ def _type(d: dict, path: str) -> TypeIR:
                     for p in d.get("properties") or []],
         methods=[_method(m) for m in d.get("methods") or []],
         line=d.get("line", 0), end_line=d.get("end_line", 0), file=path,
+        special_members=list(d["special_members"]) if isinstance(d.get("special_members"), list) else None,
     )
 
 
@@ -222,3 +235,24 @@ def has_attr(attrs: list[Attr], *names: str) -> Attr | None:
     namespace qualifier and `Attribute` suffix."""
     wanted = {attr_key(n) for n in names}
     return next((a for a in attrs if attr_key(a.name) in wanted), None)
+
+
+def call_chain(expr: dict) -> tuple[dict | None, list[dict]]:
+    """Split a fluent chain: `a.B(x).C().D(y)` -> (`name a` node, [call B, call C, call D]),
+    innermost first (execution order). The root is the innermost receiver, whatever its
+    kind (`builder.Services.AddX()` roots at the `builder.Services` member); a bare
+    `F()` call has root None. A non-call expression is returned as is with no calls."""
+    calls: list[dict] = []
+    node: Any = expr
+    while isinstance(node, dict) and node.get("k") == "call":
+        calls.append(node)
+        fn = node.get("fn")
+        if isinstance(fn, dict) and fn.get("k") == "member":
+            node = fn.get("obj")
+        else:
+            node = None
+            break
+    if not calls:
+        return expr, []
+    calls.reverse()
+    return node, calls

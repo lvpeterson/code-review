@@ -10,6 +10,7 @@ back to the receiver's declared simple type name, then to text patterns.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 
@@ -20,6 +21,7 @@ class Source:
     name: str
     sym: str            # regex over the full `sym` ("Type.Member")
     text: str | None    # regex over the receiver/member text when sym is absent
+    core_text: bool = False   # the text regex is an ASP.NET Core spelling: applied in Core projects only
 
 
 _REQ = r"System\.Web\.(HttpRequest|HttpRequestBase|HttpRequestWrapper)"
@@ -28,6 +30,25 @@ _REQ = r"System\.Web\.(HttpRequest|HttpRequestBase|HttpRequestWrapper)"
 REQUEST_TEXT = (r"(?i)^((this|me)\.)?(((system\.web\.)?httpcontext\.current|context|page)\.)?request"
                 r"(\.(querystring|form|params|cookies|headers|servervariables|rawurl|url|files|unvalidated|path|pathinfo|"
                 r"useragent|contenttype|apprelativecurrentexecutionfilepath|currentexecutionfilepath|filepath|inputstream))?$")
+
+# ASP.NET Core request type and the receiver spellings the text fallbacks accept: `Request`,
+# `HttpContext.Request`, `Context.Request`, `context.Request`, `ctx.Request`, `httpContext.Request`.
+_CORE_REQ = r"Microsoft\.AspNetCore\.Http\.HttpRequest"
+_CORE_CTX = r"((this|base)\.)?((http)?context\.|ctx\.)?"
+# Core request spelling used where only a shape check is needed (an indexed receiver without a sym).
+CORE_REQUEST_TEXT = (rf"(?i)^{_CORE_CTX}request"
+                     r"(\.(query|form|headers|cookies|routevalues|body|bodyreader|path|pathbase|querystring|host|"
+                     r"method|scheme|contenttype))?$")
+
+# Members of a Core `HttpRequest` (reached through a variable typed HttpRequest, no sym) -> origin name;
+# the same members and names as the Core rows of SOURCES.
+CORE_REQUEST_MEMBERS = {**{m: "Request" for m in ("query", "form", "headers", "cookies", "path", "pathbase",
+                                                   "querystring", "host", "method", "scheme", "contenttype",
+                                                   "readformasync", "protocol", "contentlength",
+                                                   "getdisplayurl", "getencodedurl", "getencodedpathandquery",
+                                                   "gettypedheaders")},
+                        "body": "Request.Body", "bodyreader": "Request.Body", "readfromjsonasync": "Request.Body",
+                        "routevalues": "RouteValues"}
 
 SOURCES: tuple[Source, ...] = (
     Source("Request", rf"^{_REQ}\.(QueryString|Form|Params|Cookies|Headers|ServerVariables|RawUrl|Url|"
@@ -39,6 +60,35 @@ SOURCES: tuple[Source, ...] = (
     Source("HiddenField.Value", r"^System\.Web\.UI\.WebControls\.HiddenField\.Value$", None),
     Source("ListControl.Selected", r"^System\.Web\.UI\.WebControls\.ListControl\.(SelectedValue|SelectedItem)$", None),
     Source("HtmlInputText.Value", r"^System\.Web\.UI\.HtmlControls\.HtmlInput(Text|Control|Hidden)\.Value$", None),
+    # -- ASP.NET Core. A resolved sym is authoritative (see taint.py `_source`), so every request member
+    # the helper can resolve needs a row here: a missing row would read as "not a source" (a false safe).
+    Source("Request", rf"^{_CORE_REQ}\.(Query|Form|Headers|Cookies|Path|PathBase|QueryString|Host|Method|"
+                      r"Scheme|ContentType|ReadFormAsync|Protocol|ContentLength)$",
+           rf"(?i)^{_CORE_CTX}request\.(query|form|headers|cookies|path|pathbase|querystring|host|method|"
+           r"scheme|contenttype|readformasync|protocol|contentlength)$", True),
+    # Extension methods that rebuild request data (the URL, typed headers). `GetTypedHeaders` serves
+    # both request and response, and the sym cannot tell them apart: it stays a source.
+    Source("Request", r"^Microsoft\.AspNetCore\.Http\.Extensions\.UriHelper\.(GetDisplayUrl|GetEncodedUrl|"
+                      r"GetEncodedPathAndQuery)$|^Microsoft\.AspNetCore\.Http\.HeaderDictionaryTypeExtensions\."
+                      r"GetTypedHeaders$",
+           rf"(?i)^{_CORE_CTX}request\.(getdisplayurl|getencodedurl|getencodedpathandquery|gettypedheaders)$", True),
+    Source("Request", r"^Microsoft\.AspNetCore\.Http\.IFormCollection\.Item$", None),
+    # Bare `HttpContext.Request` without a sym (sym-only members are above): text only, `(?!)` never matches.
+    Source("Request", r"(?!)", rf"(?i)^{_CORE_CTX}request$", True),
+    Source("Request.Body", rf"^{_CORE_REQ}\.(Body|BodyReader)$|"
+                           r"^Microsoft\.AspNetCore\.Http\.HttpRequestJsonExtensions\.ReadFromJsonAsync$",
+           rf"(?i)^{_CORE_CTX}request\.(body|bodyreader|readfromjsonasync)$", True),
+    # GetRouteValue lives in Microsoft.AspNetCore.Routing (the helper reports that namespace); Http kept too.
+    Source("RouteValues", rf"^{_CORE_REQ}\.RouteValues$|^Microsoft\.AspNetCore\.Routing\.RouteData\.Values$|"
+                          r"^Microsoft\.AspNetCore\.(Http|Routing)\.RoutingHttpContextExtensions\.GetRouteValue$",
+           rf"(?i)^{_CORE_CTX}request\.routevalues$|(^|\.)(http)?context\.getroutevalue$|"
+           r"(^|\.)ctx\.getroutevalue$", True),
+    # Zip slip: an entry name is attacker-controlled whatever opened the archive (an upload saved earlier and
+    # reopened from disk included), so it is a source on its own. Without a sym the receiver variable name decides.
+    Source("archive entry name", r"^System\.IO\.Compression\.ZipArchiveEntry\.(FullName|Name)$",
+           r"(?i)(^|\.)(entry|zipentry|ziparchiveentry|archiveentry|zentry)\.(fullname|name)$", True),
+    Source("IFormFile", r"^Microsoft\.AspNetCore\.Http\.IFormFile\.(FileName|Name|ContentType|OpenReadStream|"
+                                  r"Length|ContentDisposition|Headers)$", None),
 )
 
 # Fallback for the WebForms rows above when `sym` is missing: a `.Text` / `.Value`
@@ -70,6 +120,12 @@ class Sink:
     derives: tuple[str, ...] = ()    # bare `Member(..)` inside a class deriving from one of these
     unresolved_ok: bool = False      # sym absent + member name alone is enough (dynamic LINQ)
     all_args: bool = False           # format-style call: every argument is checked, not just `args`
+    msg_arg: bool = False            # log call: only the message-template argument is checked (taint.py)
+    ct_arg: int | None = None        # content result: counts only when this argument is HTML (or unknown)
+    recv_gate: bool = False          # `recv_text` / receiver type must match even when `sym` resolved
+    legacy_only: bool = False        # System.Web row: not applied in a project owned by "dotnet" (Core)
+    core_only: bool = False          # Core row whose receiver text also fits System.Web: Core projects only
+    ct_member: str | None = None     # assign row: the sibling member holding the content type (`ContentType`)
 
 
 _DB = "System.Data."
@@ -88,7 +144,60 @@ _RESP_TEXT = r"(?i)^((this|me)\.)?((httpcontext\.current|context|page)\.)?respon
 _CTRL = ("System.Web.Mvc.Controller", "System.Web.Mvc.ControllerBase")
 _API = ("System.Web.Http.ApiController",)
 _FILE = "System.IO.File"
+_ZIP = "System.IO.Compression."
 _LOG = ("log4net.ILog",)
+
+# -- ASP.NET Core rows. EF Core, Microsoft.Data.SqlClient, Npgsql, Microsoft.Data.Sqlite and MySql* come from
+# NuGet packages the Roslyn helper does not compile against, so their calls never carry a `sym`: those rows
+# fire by member name (`unresolved_ok`), declared-type simple name or receiver text. Framework types
+# (Microsoft.AspNetCore.*, Microsoft.Extensions.Logging, System.Text.Encodings.Web) do resolve; their `sym`
+# rows are authoritative and the text forms only run without it.
+_EFC_Q = ("Microsoft.EntityFrameworkCore.RelationalQueryableExtensions",)
+_EFC_DB = ("Microsoft.EntityFrameworkCore.RelationalDatabaseFacadeExtensions",
+           "Microsoft.EntityFrameworkCore.Infrastructure.DatabaseFacade")
+_CORE_CMD = ("Microsoft.Data.SqlClient.SqlCommand", "Npgsql.NpgsqlCommand", "Microsoft.Data.Sqlite.SqliteCommand",
+             "MySqlConnector.MySqlCommand", "MySql.Data.MySqlClient.MySqlCommand")
+_CORE_BASE = ("Microsoft.AspNetCore.Mvc.ControllerBase", "Microsoft.AspNetCore.Mvc.Controller",
+              "Microsoft.AspNetCore.Mvc.RazorPages.PageModel")
+_CORE_DERIVES = ("ControllerBase", "Controller", "PageModel")
+_RESULTS = ("Microsoft.AspNetCore.Http.Results", "Microsoft.AspNetCore.Http.TypedResults")
+_CORE_RESP = ("Microsoft.AspNetCore.Http.HttpResponse",)
+_CORE_RESP_TEXT = r"(?i)(^|\.)response$"
+_HEADERS = ("Microsoft.AspNetCore.Http.IHeaderDictionary", "Microsoft.AspNetCore.Http.HeaderDictionaryExtensions",
+            "System.Collections.Generic.IDictionary", "System.Collections.Generic.CollectionExtensions")
+_HEADERS_TEXT = r"(?i)(^|\.)(response\.headers|responseheaders)$"
+_COOKIES = ("Microsoft.AspNetCore.Http.IResponseCookies",)
+_COOKIES_TEXT = r"(?i)(^|\.)response\.cookies$"
+_ILOGGER = ("Microsoft.Extensions.Logging.LoggerExtensions", "Microsoft.Extensions.Logging.ILogger")
+_LOG_TEXT = r"(?i)(^|\.)_?(logger|log)$"
+_MEDIA_TYPE_NAMES = r"(?i)^(system\.net\.mime\.)?mediatypenames\."
+_C = {"core_only": True}
+
+
+# Content types a browser renders as a document that can run script: html, xml (xhtml) and svg.
+_RENDERABLE = re.compile(r"(?i)html|xml|svg")
+
+
+def html_content_type(arg) -> bool:
+    """Whether a `Content(.., contentType)` argument can make the browser render a script-capable document: a
+    constant containing `html`, `xml` or `svg`, or anything that is not a constant (conservative). No argument means text/plain, so `None` is
+    False. A `MediaTypeNames.X.Y` constant that does not say html is known and is not HTML."""
+    if arg is None:
+        return False
+    if isinstance(arg, dict):
+        if arg.get("k") == "lit":
+            v = arg.get("v")
+            return isinstance(v, str) and _RENDERABLE.search(v) is not None
+        if arg.get("k") in ("name", "member"):
+            node, parts = arg, []
+            while isinstance(node, dict) and node.get("k") == "member":
+                parts.append(node.get("name") or "")
+                node = node.get("obj")
+            if isinstance(node, dict) and node.get("k") == "name":
+                parts.append(node.get("id") or "")
+            if re.match(_MEDIA_TYPE_NAMES, ".".join(reversed(parts))):
+                return _RENDERABLE.search(".".join(parts)) is not None
+    return True
 _WEBCLIENT = ("System.Net.WebClient",)
 _HTTPCLIENT = ("System.Net.Http.HttpClient",)
 # Formatters that rebuild arbitrary object graphs from their input. Json.NET TypeNameHandling is a
@@ -109,7 +218,9 @@ SINKS: tuple[Sink, ...] = tuple(
     _each("sql", "SqlCommand", _CMD, ".ctor", args=(0,))
     + _each("sql", "SqlCommand", _CMD, "CommandText", assign=True)
     + _each("sql", "SqlDataAdapter", _ADAPTER, ".ctor", args=(0,))
-    + _each("sql", "Database", _EF_DB, "SqlQuery|ExecuteSqlCommand|ExecuteSqlCommandAsync", recv_text=_EF_TEXT)
+    + _each("sql", "Database", _EF_DB, "ExecuteSqlCommand|ExecuteSqlCommandAsync", recv_text=_EF_TEXT)
+    # EF Core 7+ has a parameterized `Database.SqlQuery<T>(FormattableString)`: EF6's string form is legacy only
+    + _each("sql", "Database", _EF_DB, "SqlQuery", recv_text=_EF_TEXT, legacy_only=True)
     + _each("sql", "DbSet", ("System.Data.Entity.DbSet", "System.Data.Entity.IDbSet",
                               "System.Data.Entity.Infrastructure.DbSqlQuery"), "SqlQuery")
     # linq (dynamic LINQ takes the expression as a string)
@@ -142,11 +253,28 @@ SINKS: tuple[Sink, ...] = tuple(
     + _each("xss", "HtmlString", ("System.Web.HtmlString",), ".ctor", args=(0,))
     + _each("xss", "MvcHtmlString", ("System.Web.Mvc.MvcHtmlString",), "Create", args=(0,))
     + _each("xss", "HtmlHelper", ("System.Web.Mvc.HtmlHelper",), "Raw", args=(0,))
-    + _each("xss", "Controller", _CTRL, "Content", args=(0,), derives=("Controller",))
+    + _each("xss", "Controller", _CTRL, "Content", args=(0,), derives=("Controller",), legacy_only=True)
     # path
     + _each("path", "File", (_FILE,), "ReadAllText|ReadAllBytes|ReadAllLines|WriteAllText|WriteAllBytes|"
                                       "AppendAllText|Open|OpenRead|OpenWrite|OpenText|Delete", args=(0,))
     + _each("path", "File", (_FILE,), "Copy|Move", args=(0, 1))
+    # the rest of System.IO.File / Directory and System.IO.Compression: framework types, so they resolve
+    + _each("path", "File", (_FILE,), "Create|CreateText|AppendText|AppendAllLines|AppendAllLinesAsync|ReadLines|"
+                                      "ReadAllTextAsync|ReadAllBytesAsync|ReadAllLinesAsync|WriteAllTextAsync|"
+                                      "WriteAllBytesAsync|WriteAllLinesAsync|AppendAllTextAsync", args=(0,))
+    + _each("path", "File", (_FILE,), "Replace", args=(0, 1, 2))
+    + _each("path", "Directory", ("System.IO.Directory",), "EnumerateFiles|EnumerateDirectories|"
+                                                           "EnumerateFileSystemEntries|GetDirectories|"
+                                                           "GetFileSystemEntries", args=(0,))
+    + _each("path", "Directory", ("System.IO.Directory",), "Move", args=(0, 1))
+    + _each("path", "ZipFile", (_ZIP + "ZipFile",), "ExtractToDirectory|CreateFromDirectory", args=(0, 1))
+    + _each("path", "ZipFile", (_ZIP + "ZipFile",), "Open|OpenRead", args=(0,))
+    # `entry.ExtractToFile(dest)` / `archive.ExtractToDirectory(dest)` extension forms; `ZipFileExtensions.X(entry, dest)`
+    # shifts the argument. The member names are distinctive enough to match without a resolved receiver type.
+    + _each("path", "ZipFileExtensions", (_ZIP + "ZipFileExtensions",), "ExtractToFile|ExtractToDirectory",
+            args=(0,), static_args=(1,), unresolved_ok=True)
+    + _each("path", "ZipFileExtensions", (_ZIP + "ZipFileExtensions",), "CreateEntryFromFile", args=(0,),
+            static_args=(1,), unresolved_ok=True)
     + _each("path", "FileStream", ("System.IO.FileStream", "System.IO.StreamReader", "System.IO.StreamWriter",
                                     "System.IO.FileInfo"), ".ctor", args=(0,))
     + _each("path", "HttpServerUtility", ("System.Web.HttpServerUtility", "System.Web.HttpServerUtilityBase"),
@@ -186,6 +314,70 @@ SINKS: tuple[Sink, ...] = tuple(
     + _each("log", "Trace", ("System.Diagnostics.Trace",), "Write|WriteLine", args=(0,))
     + _each("log", "Trace", ("System.Diagnostics.Trace",), "TraceInformation|TraceWarning|TraceError",
             all_args=True)
+    # -- ASP.NET Core ---------------------------------------------------------------------------
+    # sql: the raw forms only; FromSqlInterpolated / FromSql / ExecuteSqlInterpolated / ExecuteSql / SqlQuery
+    # parameterize their interpolation holes and are not sinks. `static_args` covers `Type.FromSqlRaw(src, sql)`.
+    # These rows stay ungated: EF Core and the SQL providers are NuGet types the helper never resolves, and a
+    # legacy project can use them too. Every other row below is Core-only (`_C`): it must add nothing to a
+    # System.Web project's findings.
+    + _each("sql", "EfCore.FromSqlRaw", _EFC_Q, "FromSqlRaw", args=(0,), static_args=(1,), unresolved_ok=True)
+    + _each("sql", "EfCore.Database", _EFC_DB, "ExecuteSqlRaw|ExecuteSqlRawAsync|SqlQueryRaw", args=(0,),
+            static_args=(1,), unresolved_ok=True)
+    + _each("sql", "SqlCommand", _CORE_CMD, ".ctor", args=(0,))
+    + _each("sql", "SqlCommand", _CORE_CMD, "CommandText", assign=True)
+    # redirect: LocalRedirect* never leaves the site and is not a sink
+    + _each("redirect", "ControllerBase", _CORE_BASE,
+            "Redirect|RedirectPermanent|RedirectPreserveMethod|RedirectPermanentPreserveMethod", args=(0,),
+            derives=_CORE_DERIVES, **_C)
+    + _each("redirect", "Results", _RESULTS, "Redirect", args=(0,), **_C)
+    + _each("redirect", "HttpResponse", _CORE_RESP, "Redirect", args=(0,), recv_text=_CORE_RESP_TEXT, **_C)
+    + _each("redirect", "RedirectResult", ("Microsoft.AspNetCore.Mvc.RedirectResult",), ".ctor", args=(0,), **_C)
+    # `Response.Headers.Location = url` and `Response.GetTypedHeaders().Location = uri` start a redirect too
+    + _each("redirect", "Headers", _HEADERS, "Location", assign=True, recv_text=_HEADERS_TEXT, recv_gate=True, **_C)
+    + _each("redirect", "ResponseHeaders", ("Microsoft.AspNetCore.Http.Headers.ResponseHeaders",), "Location",
+            assign=True, recv_text=r"(?i)gettypedheaders|responseheaders", **_C)
+    # path (a `string` path argument; `_arg_ok` skips streams and byte arrays whose type is known)
+    + _each("path", "ControllerBase", _CORE_BASE, "PhysicalFile|File|VirtualFile", args=(0,),
+            derives=_CORE_DERIVES, **_C)
+    + _each("path", "Results", ("Microsoft.AspNetCore.Http.Results",), "File|PhysicalFile|VirtualFile",
+            args=(0,), **_C)
+    + _each("path", "Results", ("Microsoft.AspNetCore.Http.TypedResults",), "PhysicalFile|VirtualFile",
+            args=(0,), **_C)
+    + _each("path", "FileResult", ("Microsoft.AspNetCore.Mvc.PhysicalFileResult",
+                                   "Microsoft.AspNetCore.Mvc.VirtualFileResult"), ".ctor", args=(0,), **_C)
+    + _each("path", "SendFileAsync", ("Microsoft.AspNetCore.Http.SendFileResponseExtensions",
+                                      "Microsoft.AspNetCore.Http.HttpResponse"), "SendFileAsync", args=(0,),
+            recv_text=_CORE_RESP_TEXT, **_C)
+    # header / cookie: the value argument; `recv_gate` keeps a generic `IDictionary.Add` on some other
+    # dictionary from counting as a response header write
+    + _each("header", "Headers", _HEADERS, "Item", assign=True, recv_text=_HEADERS_TEXT, recv_gate=True, **_C)
+    + _each("header", "Headers", _HEADERS, "Append|Add|TryAdd", args=(1,), recv_text=_HEADERS_TEXT, recv_gate=True,
+            **_C)
+    + _each("header", "Cookies", _COOKIES, "Append", args=(1,), recv_text=_COOKIES_TEXT, **_C)
+    # ssrf: HttpRequestMessage(HttpMethod, uri) and its RequestUri; the legacy HttpClient rows take the call itself
+    + _each("ssrf", "HttpRequestMessage", ("System.Net.Http.HttpRequestMessage",), ".ctor", args=(1,), **_C)
+    + _each("ssrf", "HttpRequestMessage", ("System.Net.Http.HttpRequestMessage",), "RequestUri", assign=True, **_C)
+    + _each("ssrf", "HttpClient", _HTTPCLIENT + ("System.Net.Http.Json.HttpClientJsonExtensions",),
+            "PatchAsync|Send|GetFromJsonAsync|PostAsJsonAsync|PutAsJsonAsync|PatchAsJsonAsync|DeleteFromJsonAsync",
+            args=(0,), **_C)
+    # xss
+    + _each("xss", "IHtmlHelper", ("Microsoft.AspNetCore.Mvc.Rendering.IHtmlHelper",), "Raw", args=(0,),
+            recv_text=r"(?i)(^|\.)(html|htmlhelper)$", **_C)
+    + _each("xss", "HtmlString", ("Microsoft.AspNetCore.Html.HtmlString",), ".ctor", args=(0,), **_C)
+    + _each("xss", "MarkupString", ("Microsoft.AspNetCore.Components.MarkupString",), ".ctor|.cast", args=(0,), **_C)
+    # Content(content, contentType): text/plain without a content type, so only a renderable or unknown one counts
+    + _each("xss", "ControllerBase", _CORE_BASE, "Content", args=(0,), derives=_CORE_DERIVES, ct_arg=1, **_C)
+    + _each("xss", "Results", _RESULTS, "Content|Text", args=(0,), ct_arg=1, **_C)
+    # `new ContentResult { Content = s, ContentType = ".." }`: the condition reads the initializer's ContentType
+    + _each("xss", "ContentResult", ("Microsoft.AspNetCore.Mvc.ContentResult",), "Content", assign=True,
+            ct_member="ContentType", **_C)
+    # WriteAsync sets no content type and browsers may sniff: always a sink
+    + _each("xss", "HttpResponse", ("Microsoft.AspNetCore.Http.HttpResponseWritingExtensions",
+                                    "Microsoft.AspNetCore.Http.HttpResponse"), "WriteAsync", args=(0,),
+            recv_text=_CORE_RESP_TEXT, **_C)
+    # log: the message template only (taint.py `_log_message_index`), never the placeholder arguments
+    + _each("log", "ILogger", _ILOGGER, "Log|LogTrace|LogDebug|LogInformation|LogWarning|LogError|LogCritical|"
+                                          "BeginScope", args=(0,), msg_arg=True, recv_text=_LOG_TEXT, **_C)
 )
 
 
@@ -199,6 +391,8 @@ class Sanitizer:
     member: str                      # regex over the member / function name
     crlf: bool = False               # `Replace` call that removes CR / LF (tracked per value)
     bare_ok: bool = False            # a receiver-less call by this name matches when `sym` is absent (VB `Val`)
+    recv_text: str | None = None     # receiver-text regex accepted when `sym` is absent (`HtmlEncoder.Default`)
+    recv_exclude: str | None = None  # receiver-text regex that disables the row (`UnsafeRelaxedJsonEscaping`)
 
 
 _NUM = ("System.Int16", "System.Int32", "System.Int64", "System.Decimal", "System.Double", "System.Boolean",
@@ -218,6 +412,13 @@ SANITIZERS: tuple[Sanitizer, ...] = (
                "System.Web.Security.AntiXss.Encoder", "Microsoft.Security.Application.Encoder",
                "System.Web.Util.HttpEncoder"),
               r"(?i)^(Html(Attribute)?Encode|JavaScript(String)?Encode)$"),
+    # `HtmlEncoder.Default.Encode` resolves to the TextEncoder base type; the receiver text is the fallback.
+    Sanitizer("TextEncoder.Encode", _XSS,
+              ("System.Text.Encodings.Web.HtmlEncoder", "System.Text.Encodings.Web.JavaScriptEncoder",
+               "System.Text.Encodings.Web.UrlEncoder", "System.Text.Encodings.Web.TextEncoder"),
+              r"(?i)^Encode$",
+              recv_text=r"(?i)(^|\.)_?(html|javascript|js|url|text)?encoder(\.default)?$",
+              recv_exclude=r"(?i)unsaferelaxed"),
     Sanitizer("Path.GetFileName", frozenset({"path"}), ("System.IO.Path",), r"(?i)^GetFileName$"),
     Sanitizer("ldap-escape", frozenset({"ldap"}), (), r"(?i)^[A-Za-z0-9_]*ldap.*(escape|encode)"),
     # Removing CR/LF: handled specially (needs both removed; see taint.py), kinds come from the markers.
@@ -320,8 +521,10 @@ PARSER_TYPES = frozenset({"jobject", "jarray", "jtoken", "xdocument", "xelement"
 
 # Receivers that are the INCOMING request, not an outbound response: `Request.Content.ReadAsStringAsync()` in a
 # Web API action reads what the client sent, so it is never an `external` source.
-INCOMING_REQUEST_TEXT = (r"(?i)^((this|base)\.)?((actioncontext|controllercontext)\.|httpcontext\.current\.)?"
+INCOMING_REQUEST_TEXT = (r"(?i)^((this|base)\.)?((actioncontext|controllercontext)\.|httpcontext\.current\.|"
+                         r"(http)?context\.|ctx\.)?"
                          r"request(\.(content|inputstream))?$")
 # Reading the incoming Web API request body is request input (a taint source), not an outbound response.
 INCOMING_BODY_READS = frozenset({"readasstringasync", "readasasync", "readasformdataasync", "readasbytearrayasync",
-                                 "readasstreamasync", "readasmultipartasync"})
+                                 "readasstreamasync", "readasmultipartasync",
+                                 "readfromjsonasync", "readformasync"})

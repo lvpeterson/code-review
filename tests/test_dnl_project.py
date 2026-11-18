@@ -81,10 +81,12 @@ def test_ir_helpers():
     assert ir.load_file_ir({"path": "a.cs", "error": "boom"}) is None
 
 
-def test_sdk_style_project_owns_its_sources_but_is_not_parsed(model):
+def test_sdk_style_project_owns_its_sources_and_is_hidden_from_legacy_view(model):
     core = next(p for p in model.projects if p.name == "CoreSide")
     assert not core.is_legacy and any(f.name == "Program.cs" for f in core.compile_files)
-    assert "CoreSide/Program.cs" not in model.files
+    # Task 4: SDK sources are parsed into the full model but the legacy package never sees them.
+    assert "CoreSide/Program.cs" in model.files
+    assert "CoreSide/Program.cs" not in model.view("dotnet_legacy").files
     loose = [f.name for p in model.projects if p.name == "(loose)" for f in p.compile_files]
     assert "Program.cs" not in loose and "Loose.cs" in loose
     assert model.project_of("CoreSide/Program.cs").name == "CoreSide"

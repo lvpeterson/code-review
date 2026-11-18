@@ -264,12 +264,194 @@ def test_switch_sections_and_local_function(tmp_path):
     assert loc["k"] == "local" and loc["name"] == "Loc" and loc["init"]["k"] == "lambda" and loc["init"]["params"] == ["p"]
 
 
+def test_switch_expression_lowers_to_nested_cond(tmp_path):
+    init = body(tmp_path, "var s = k switch { 1 => p, 2 when z => q, _ => r };")[0]["init"]
+    assert init["k"] == "cond" and init["c"]["id"] == "k" and init["t"]["id"] == "p"
+    assert init["f"]["k"] == "cond" and init["f"]["t"]["id"] == "q" and init["f"]["f"]["id"] == "r"
+
+
 def test_deconstruction_and_unknown_nodes_keep_text(tmp_path):
-    out = body(tmp_path, "var (u, v) = z; goto L; var s = x switch { 1 => 2, _ => 3 }; var t = typeof(int);")
+    out = body(tmp_path, "var (u, v) = z; goto L; var s = default(int); var t = typeof(int);")
     assert out[0]["k"] == "assign" and out[0]["target"]["k"] == "unknown" and out[0]["value"]["id"] == "z"
     assert out[1] == {"k": "other", "line": 1, "text": "goto L;"}
-    assert out[2]["init"]["k"] == "unknown" and "switch" in out[2]["init"]["text"]
+    assert out[2]["init"] == {"k": "unknown", "line": 1, "text": "default(int)"}
     assert out[3]["init"] == {"k": "unknown", "line": 1, "text": "typeof(int)"}
+
+
+# -- modern C# lowering parity (mirrors the helper tests in test_dnl_helper_ir.py, minus `sym`) --
+
+TOP_SRC = ('var b = WebApplication.CreateBuilder(args);\nvar app = b.Build();\n'
+           'app.MapGet("/", () => "x");\napp.Run();\nstatic int Helper() => 1;\n')
+
+
+def walk_nodes(o):
+    if isinstance(o, dict):
+        yield o
+        for v in o.values():
+            yield from walk_nodes(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from walk_nodes(v)
+
+
+def test_top_level_statements_lowered(tmp_path):
+    rec = lower(tmp_path, TOP_SRC)
+    t = rec["types"][0]
+    assert (t["name"], t["namespace"], t["kind"], t["modifiers"]) == ("Program", "", "class", ["static", "partial"])
+    assert [m["name"] for m in t["methods"]] == ["<Main>$"]
+    m = t["methods"][0]
+    assert (m["modifiers"], m["return_type"], m["params"]) == (["static"], "void", [])
+    assert (m["line"], m["end_line"], t["line"], t["end_line"]) == (1, 5, 1, 5)
+    stmts = m["body"]
+    assert [s["k"] for s in stmts] == ["local", "local", "expr", "expr", "local"]
+    assert stmts[4]["name"] == "Helper" and stmts[4]["init"]["k"] == "lambda"
+    assert not any("sym" in n for n in walk_nodes(rec))
+
+
+def test_top_level_with_partial_program(tmp_path):
+    rec = lower(tmp_path, TOP_SRC + "public partial class Program { }\n")
+    assert [t["name"] for t in rec["types"]] == ["Program", "Program"]
+    assert [m["name"] for m in rec["types"][0]["methods"]] == ["<Main>$"]
+    assert rec["types"][1]["methods"] == []
+
+
+def test_no_top_level_statements_no_synthetic_program(tmp_path):
+    rec = lower(tmp_path, "class C { void M() { a(); } }")
+    assert [t["name"] for t in rec["types"]] == ["C"]
+
+
+def test_top_level_if_directive_branches(tmp_path):
+    rec = lower(tmp_path, "#if DEBUG\nvar a = new Dbg();\n#else\nvar b = new Rel();\n#endif\nGo();\n")
+    t = rec["types"][0]
+    assert t["name"] == "Program" and [m["name"] for m in t["methods"]] == ["<Main>$"]
+    assert {n["type"] for n in walk_nodes(t) if n.get("k") == "new"} == {"Dbg", "Rel"}
+    assert [s["k"] for s in t["methods"][0]["body"]][-1] == "expr"
+
+
+def test_top_level_statement_crash_is_contained(tmp_path, monkeypatch):
+    real = frontend_ts._Lowering._stmt
+
+    def flaky(self, s):
+        if self.text(s).startswith("Bad"):
+            raise RuntimeError("boom")
+        return real(self, s)
+    monkeypatch.setattr(frontend_ts._Lowering, "_stmt", flaky)
+    # stmt() isolates a crashing statement into an `other` node; the file survives.
+    rec = lower(tmp_path, "Good();\nBad();\nAlso();\n")
+    assert "error" not in rec
+    kinds = [s["k"] for s in rec["types"][0]["methods"][0]["body"]]
+    assert kinds == ["expr", "other", "expr"]
+
+
+def test_lambda_param_info_and_end_line(tmp_path):
+    src = ('app.MapGet("/o/{id}", ([FromRoute] int id, [FromServices] IStore s) =>\n{\n'
+           ' return s.Get(id);\n});\n')
+    rec = lower(tmp_path, src)
+    lam = next(n for n in walk_nodes(rec) if n.get("k") == "lambda")
+    info = lam["param_info"]
+    assert [p["name"] for p in info] == ["id", "s"]
+    assert [p["type"] for p in info] == ["int", "IStore"]
+    assert [[a["name"] for a in p["attributes"]] for p in info] == [["FromRoute"], ["FromServices"]]
+    assert [p["modifiers"] for p in info] == [[], []]
+    assert lam["params"] == ["id", "s"] and lam["end_line"] == 4
+
+
+def test_lambda_param_info_untyped_and_modifiers(tmp_path):
+    lam = expr(tmp_path, "(a, b) => a")
+    assert [(p["name"], p["type"], p["attributes"], p["modifiers"]) for p in lam["param_info"]] == [
+        ("a", None, [], []), ("b", None, [], [])]
+    lam = expr(tmp_path, "x => x")
+    assert [p["name"] for p in lam["param_info"]] == ["x"] and lam["param_info"][0]["type"] is None
+    lam = expr(tmp_path, "(ref int r) => r")
+    assert lam["param_info"][0]["modifiers"] == ["ref"]
+    lam = expr(tmp_path, "delegate (int q) { return q; }")
+    assert lam["param_info"][0]["type"] == "int"
+    loc = body(tmp_path, "int Loc(int p) { return p; }")[0]["init"]
+    assert loc["param_info"][0]["type"] == "int" and loc["end_line"] == 1
+
+
+def test_lambda_without_params_omits_param_info(tmp_path):
+    lam = expr(tmp_path, '() => "x"')
+    assert "param_info" not in lam and "params" not in lam and lam["end_line"] == 1
+
+
+def test_primary_constructor_and_record(tmp_path):
+    src = ("public class Svc(ILogger<Svc> log, IStore store) : Base(store) { }\n"
+           "public record OrderDto([property: Required] string Name, int Qty);\n")
+    svc, dto = lower(tmp_path, src)["types"]
+    assert svc["bases"] == ["Base"]
+    ctor = next(m for m in svc["methods"] if m["name"] == ".ctor")
+    assert [p["name"] for p in ctor["params"]] == ["log", "store"]
+    assert [p["type"] for p in ctor["params"]] == ["ILogger<Svc>", "IStore"]
+    first = ctor["body"][0]
+    assert first["k"] == "expr" and first["expr"]["k"] == "call" and first["expr"]["fn"]["id"] == "base"
+    assert [a["id"] for a in first["expr"]["args"]] == ["store"]
+    assert (ctor["modifiers"], ctor["return_type"], ctor["attributes"]) == ([], None, [])
+    assert [p["name"] for p in dto["properties"]] == ["Name", "Qty"]
+    assert [p["type"] for p in dto["properties"]] == ["string", "int"]
+    assert [a["name"] for a in dto["properties"][0]["attributes"]] == ["Required"]
+    assert any(m["name"] == ".ctor" for m in dto["methods"])
+
+
+def test_primary_constructor_variants(tmp_path):
+    rec = lower(tmp_path, "public struct P(int x);\n"
+                          "public record struct RS(int A);\n"
+                          "public class Plain { }\n"
+                          "public record R(int Name) { public int Name { get; init; } public int Other { get; } }\n"
+                          "public class E() { void M() { } }\n")
+    p, rs, plain, r, e = rec["types"]
+    assert [m["name"] for m in p["methods"]] == [".ctor"] and p["properties"] == []
+    assert rs["kind"] == "struct" and [q["name"] for q in rs["properties"]] == ["A"]
+    assert plain["methods"] == []
+    # A positional parameter the body redeclares adds no second property.
+    assert [q["name"] for q in r["properties"]] == ["Name", "Other"]
+    assert [m["name"] for m in e["methods"]] == [".ctor", "M"] and e["methods"][0]["params"] == []
+
+
+def test_collection_switch_is_with(tmp_path):
+    src = ("class C { void M(object o, R r) {\n int[] a = [x, ..ys];\n var s = k switch { 1 => p, _ => q };\n"
+           " if (o is string t) {}\n var r2 = r with { Name = n };\n } }\n")
+    b = lower(tmp_path, src)["types"][0]["methods"][0]["body"]
+    coll, sw, ifs, wth = b[0]["init"], b[1]["init"], b[2], b[3]["init"]
+    ids = lambda e: {n["id"] for n in walk_nodes(e) if n.get("k") == "name"}
+
+    assert coll["k"] == "new" and coll["type"] is None and coll["args"] == []
+    assert [e["value"]["id"] for e in coll["init"]] == ["x", "ys"]
+
+    assert sw["k"] == "cond" and sw["c"]["id"] == "k" and sw["t"]["id"] == "p"
+    assert sw["f"]["id"] == "q"
+
+    isx = ifs["cond"]
+    assert isx["k"] == "bin" and isx["op"] == "is" and isx["l"]["id"] == "o"
+    assert isx["r"]["k"] == "unknown" and "string t" in isx["r"]["text"]
+
+    assert wth["k"] == "new" and wth["type"] is None and [a["id"] for a in wth["args"]] == ["r"]
+    assert [(e["name"], e["value"]["id"]) for e in wth["init"]] == [("Name", "n")]
+    assert ids(coll) | ids(sw) | ids(isx) | ids(wth) >= {"x", "ys", "p", "q", "o", "r", "n"}
+
+
+def test_is_pattern_forms_lower_to_bin_is(tmp_path):
+    for pat in ("null", "not null", "{ Length: > 0 }", "string t"):
+        e = expr(tmp_path, f"o is {pat}")
+        assert e["k"] == "bin" and e["op"] == "is" and e["l"]["id"] == "o", pat
+    assert expr(tmp_path, "o is null")["r"] == {"k": "unknown", "line": 1, "text": "null"}
+    assert expr(tmp_path, "o is not null")["r"]["text"] == "not null"
+
+
+def test_empty_collection_and_nested_spread(tmp_path):
+    e = expr(tmp_path, "[]")
+    assert e["k"] == "new" and e["init"] == []
+    e = expr(tmp_path, "[..a, [b]]")
+    assert [i["value"].get("id") or i["value"]["k"] for i in e["init"]] == ["a", "new"]
+
+
+def test_raw_string_literal(tmp_path):
+    src = 'class C { void M() { var q = """SELECT 1"""; var m = """\n    a\n     b\n    """; } }'
+    f = tmp_path / "R.cs"
+    f.write_bytes(src.encode("utf-8"))      # LF kept: the value carries the file's own newlines
+    b = frontend_ts.lower_file(f, "R.cs", "P")["types"][0]["methods"][0]["body"]
+    assert b[0]["init"]["k"] == "lit" and b[0]["init"]["v"] == "SELECT 1"
+    assert b[1]["init"]["k"] == "lit" and b[1]["init"]["v"] == "a\n b"
 
 
 def test_deep_nesting_degrades_instead_of_raising(tmp_path):
@@ -606,6 +788,44 @@ def test_lowered_ir_equals_helper_ir_minus_semantic_keys(roslyn_helper, name):
     assert checked or name in ("webapi_global", "wcf_app")
 
 
+MODERN_SRC = """var b = WebApplication.CreateBuilder(args);
+var app = b.Build();
+app.MapGet("/o/{id}", ([FromRoute] int id, IStore st) =>
+{
+    return st.Get(id);
+});
+object o = app;
+if (o is string t && o is not null) { Go(t); }
+var r2 = rec with { Name = "n" };
+int[] arr = [1, ..more, 3];
+var sw = k switch { 1 => "a", 2 => "b", _ => "c" };
+var raw = \"\"\"
+    select 1
+      from t
+    \"\"\";
+int Local(int a) => a;
+app.Run();
+public class Svc(ILogger<Svc> log, IStore store) : Base(store)
+{
+    public void Do() { log.Info("x"); }
+}
+public record OrderDto([property: Required] string Name, int Qty);
+public partial class Program { }
+"""
+
+
+# `#if` regions are left out of this source on purpose: Roslyn lowers only the active branch, the
+# tree-sitter frontend lowers every branch (covered by test_top_level_if_directive_branches).
+def test_modern_csharp_ir_equals_helper_ir_minus_semantic_keys(roslyn_helper, tmp_path):
+    (tmp_path / "Modern.cs").write_bytes(MODERN_SRC.encode("utf-8"))
+    projects = project.load_projects(tmp_path, [])
+    objs = [o for o in helper.parse_projects(Path(roslyn_helper), tmp_path, project._request(projects))
+            if o.get("language") == "cs" and "types" in o]
+    assert len(objs) == 1
+    ts = frontend_ts.lower_file(tmp_path / "Modern.cs", objs[0]["path"], objs[0]["project"])
+    assert ts == _strip(objs[0])
+
+
 # -- fix round 1: preprocessor regions, syntax errors, VB forms --------------------------------
 
 def _sinks(rec) -> list[str]:
@@ -760,3 +980,27 @@ def test_variant_merge_keeps_same_signature_member_with_different_body(tmp_path)
 def test_brace_count_ignores_braces_in_strings_with_letter_n(tmp_path):
     assert frontend_ts._NOISE.sub(b"", b'x = "need {"; y = \'{\';') == b"x = ; y = ;"
     assert frontend_ts._NOISE.sub(b"", b'x = "a\\"{";') == b"x = ;"
+
+
+def test_generic_names_carry_targs(tmp_path):
+    rec = lower(tmp_path, 'var app = b.Build();\napp.MapHub<ChatHub>("/c");\nMapOf<A.B, int>();\n'
+                          'var x = Outer.Make<Dict<string, int>>();\n')
+    body = rec["types"][0]["methods"][0]["body"]
+    fn = body[1]["expr"]["fn"]
+    assert (fn["k"], fn["name"], fn["targs"]) == ("member", "MapHub", ["ChatHub"])
+    bare = body[2]["expr"]["fn"]
+    assert (bare["k"], bare["id"], bare["targs"]) == ("name", "MapOf", ["A.B", "int"])
+    assert body[3]["init"]["fn"]["targs"] == ["Dict<string, int>"]
+    assert "targs" not in body[0]["init"]["fn"]
+
+
+def test_lambda_and_local_function_attributes(tmp_path):
+    src = ('app.MapGet("/a", [Authorize] () => 1);\n'
+           'app.MapGet("/b", [AllowAnonymous] static (int id) => id);\n'
+           '[Authorize(Roles = "x")] static int Loc(int p) => p;\n'
+           'app.MapGet("/c", () => 2);\n')
+    lams = [n for n in walk_nodes(lower(tmp_path, src)) if n.get("k") == "lambda"]
+    assert [[a["name"] for a in l.get("attributes", [])] for l in lams] == [
+        ["Authorize"], ["AllowAnonymous"], ["Authorize"], []]
+    assert "attributes" not in lams[3]
+    assert lams[2]["attributes"][0]["named"]["Roles"]["v"] == "x"

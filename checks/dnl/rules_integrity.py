@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from checks.dnl.files import iter_dnl_files, read_source
+from checks.dnl.files import read_source
 from checks.dnl.findings import dnl_finding
 from checks.dnl.routes import _DIRECTIVE_ATTR
 from checks.dnl.templates import _RAZOR_COMMENT, _blank
@@ -86,7 +86,7 @@ def _viewstate(text: str) -> list[tuple[int, str, str]]:
 def check(model, refs=()) -> list[Finding]:
     pages = {r.route.file: r.route for r in refs or [] if r.route.meta.get("kind") == "webforms"}
     out: list[Finding] = []
-    for f in iter_dnl_files(model.root, EXTS):
+    for f in model.iter_files(EXTS):
         rel = model.rel(f)
         route = pages.get(rel) if f.suffix.lower() == ".aspx" else None
         api = bool(route.meta.get("api_surface")) if route else False

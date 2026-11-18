@@ -1,0 +1,20 @@
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddAuthentication().AddJwtBearer();
+builder.Services.AddAuthorization(o => o.AddPolicy("AdminOnly", p => p.RequireRole("Admin")));
+builder.Services.AddSignalR();
+builder.Services.AddHealthChecks();
+var app = builder.Build();
+if (app.Environment.IsDevelopment()) { app.MapGet("/debug/env", () => "dev"); app.UseSwagger(); }
+app.MapGet("/", () => "hello");
+var api = app.MapGroup("/api").RequireAuthorization();
+api.MapGet("/orders/{id:int}", (int id, OrderStore store) => store.Find(id));
+api.MapPost("/orders", CreateOrder);
+api.MapGet("/status", () => "ok").AllowAnonymous();
+var admin = api.MapGroup("/admin").RequireAuthorization("AdminOnly");
+admin.MapDelete("/users/{id}", (int id) => Results.NoContent());
+app.MapGroup("/v2").MapUserEndpoints();
+app.MapAuditEndpoints().RequireAuthorization();
+app.MapHub<ChatHub>("/chat");
+app.MapHealthChecks("/healthz");
+app.Run();
+static IResult CreateOrder(Order o) => Results.Ok(o);

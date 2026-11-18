@@ -86,6 +86,47 @@ def _target_name(target) -> str:
     return _tail(target)
 
 
+_LOWER_SEV = {"high": "medium", "medium": "low", "low": "info", "info": "info"}
+# A literal that names a thing rather than being a secret: `accessToken`, `user_token`, `id_token`,
+# `__RequestVerificationToken` (an identifier with a word boundary and no digits), or a plain sentence.
+_KEY_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]*$")
+_WORD_BOUNDARY = re.compile(r"[_.:-]|[a-z][A-Z]")
+_WORD_SPLIT = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
+# Words that make a name-shaped literal plausibly the name of a key, header, claim or field.
+_KEY_WORDS = {"token", "key", "id", "name", "header", "claim", "scope", "cookie", "verification", "bearer",
+              "grant", "type"}
+# Qualifiers that commonly prefix a key / header / claim name (`access_token`, `__RequestVerificationToken`).
+_FIELD_WORDS = {"access", "refresh", "request", "response", "session", "client", "user", "api", "auth",
+                "csrf", "xsrf", "antiforgery", "forgery", "content", "authorization", "identity"}
+# Short connector words allowed inside a key name (no length rule: `prod_key`, `root_key` are not names).
+_CONNECTORS = {"id", "the", "of", "for", "to", "by", "on", "in", "x", "my", "app", "api", "auth", "user", "web"}
+# A word like these means the literal may be a real secret, never a key name.
+_SECRETISH_WORD = re.compile(r"^(?:pass|pwd|secret|live|prod|master|admin|root|priv)|^sk$")
+_SECRET_NAMED = re.compile(r"(?i)pass(word|wd)?|pwd|secret|credential")
+
+
+def _looks_like_name(text: str) -> bool:
+    if any(c.isdigit() for c in text):
+        return False
+    if " " in text.strip():
+        return len(text.split()) >= 2
+    return bool(_KEY_NAME.match(text) and _WORD_BOUNDARY.search(text))
+
+
+def _names_a_key(text: str, var: str) -> bool:
+    """A name-shaped literal that is safe to drop: short, with a key / header / claim word, held by a
+    variable that is not itself password / secret / credential-like. Any other name-shaped literal
+    is reported low / REVIEW rather than dropped."""
+    if len(text) > 40 or _SECRET_NAMED.search(var or ""):
+        return False
+    words = [w.lower() for w in _WORD_SPLIT.findall(text)]
+    # Every word must be a key / field word or a known connector word, and at least one a key word:
+    # `ProductionKey_Abcdefghijklmnop` or `Bearer_tokenvalueabcdef` carry a key word AND real-looking content.
+    return (any(w in _KEY_WORDS for w in words)
+            and not any(_SECRETISH_WORD.match(w) for w in words)
+            and all(w in _KEY_WORDS or w in _FIELD_WORDS or w in _CONNECTORS for w in words))
+
+
 def _in_crypto_ns(*syms: str | None) -> bool:
     """False only when a symbol resolved to something outside System.Security.Cryptography."""
     known = [s for s in syms if s]
@@ -361,6 +402,9 @@ class _Scan:
         key = (rule, t.file, line, text)
         if key in self.found:
             return
+        if rule == "DNL-SEC-003" and self.model.is_core_test_file(t.file):
+            # A literal in a test project is rarely a deployed secret: one severity lower, REVIEW.
+            severity, confidence = _LOWER_SEV.get(severity, severity), "REVIEW"
         route = self.routes.route(t.file, line)
         api = bool(route.meta.get("api_surface")) if route else False
         self.found[key] = dnl_finding(rule, severity, title, f"{text} (in {t.name}.{where}).", t.file, line,
@@ -422,6 +466,9 @@ class _Scan:
                             hit = ("hash", want)
                         elif recv == "symmetricalgorithm" and want in _WEAK_CIPHER_NAMES:
                             hit = ("cipher", want)
+                elif name in ("hashdata", "hashdataasync", "tryhashdata") and _in_crypto_ns(sym)                         and recv in ("md5", "sha1", "hmacmd5"):
+                    # Static one-shot helpers (`MD5.HashData(bytes)`) are the same primitive as Create().
+                    hit = ("hash", recv)
                 elif name == "createfromname" and recv == "cryptoconfig" and args and const_str(args[0]) is not None:
                     want = const_str(args[0]).lower()
                     if want in _WEAK_HASH_NAMES:
@@ -727,6 +774,9 @@ class _Scan:
         text = val.strip()
         if _PLACEHOLDER.match(text) or _BRACE_INDEX.match(text):
             return
+        shaped = self.model.is_core_file(t.file) and _looks_like_name(text)
+        if shaped and _names_a_key(text, name):
+            return
         if not _SECRET_KEY.search(name) or _is_setting_key(name):
             return
         # `PasswordKey = "Password"`: the literal just names the thing -- it equals the name minus
@@ -735,10 +785,10 @@ class _Scan:
         norm_v, norm_n = _STR_NORMAL.sub("", text.lower()), _STR_NORMAL.sub("", name.lower())
         if norm_v and any(norm_n.endswith(sfx) and norm_n[: -len(sfx)] == norm_v for sfx in _NAME_SUFFIXES):
             return
-        self.add("DNL-SEC-003", "high", "Hardcoded credential in code",
+        self.add("DNL-SEC-003", "low" if shaped else "high", "Hardcoded credential in code",
                  f"'{name}' is assigned a string literal; credentials in source end up in every build, repository "
                  f"clone and decompiled assembly. Read the secret from protected configuration or a vault",
-                 t, where, line)
+                 t, where, line, confidence="REVIEW" if shaped else None)
 
     def _secret_conn(self, t, where, value, line, what) -> None:
         s = const_str(value)
@@ -774,10 +824,14 @@ class _Scan:
                     idx = _CRED_CTORS.get(ty)
                     if idx is not None and len(args) > idx:
                         v = const_str(args[idx])
-                        if v is not None and len(v) >= 4 and not _PLACEHOLDER.match(v.strip()) and not _BRACE_INDEX.match(v.strip()):
-                            self.add("DNL-SEC-003", "high", "Hardcoded credential in code",
+                        if v is not None and len(v) >= 4 and not _PLACEHOLDER.match(v.strip())                                 and not _BRACE_INDEX.match(v.strip()):
+                            # The password parameter is credential-like, so a name-shaped literal is
+                            # demoted, never dropped.
+                            shaped = self.model.is_core_file(t.file) and _looks_like_name(v.strip())
+                            self.add("DNL-SEC-003", "low" if shaped else "high", "Hardcoded credential in code",
                                      f"The password passed to {n.get('type') or ty} is a string literal; read it "
-                                     f"from protected configuration or a vault", t, where, line)
+                                     f"from protected configuration or a vault", t, where, line,
+                                     confidence="REVIEW" if shaped else None)
                     elif _CONNECTION_T.search(ty) and args:
                         self._secret_conn(t, where, args[0], line, f"The {n.get('type') or ty} connection string")
 

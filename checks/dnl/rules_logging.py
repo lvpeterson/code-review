@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import re
 
-from checks.dnl.files import iter_dnl_files, read_source
+from checks.dnl.files import read_source
 from checks.dnl.findings import dnl_finding
 from checks.dnl.flowutil import Ctx, all_lists, login_by_context, own_level, stmt_exprs, terminates, tokens, uncond_nodes
 from checks.dnl.ir import call_name, receiver_text, walk
@@ -47,7 +47,7 @@ def logging_evidence(model) -> str | None:
         for ref in p.references:
             if _PKG_RE.match(ref):
                 return f"reference {ref}"
-    for f in iter_dnl_files(model.root, (".csproj", ".vbproj", ".config", ".json", ".cs", ".vb")):
+    for f in model.iter_files((".csproj", ".vbproj", ".config", ".json", ".cs", ".vb")):
         suffix = f.suffix.lower()
         if suffix == ".json" and not f.name.lower().startswith(("appsettings", "serilog", "nlog")):
             continue

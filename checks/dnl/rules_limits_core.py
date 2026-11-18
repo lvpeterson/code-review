@@ -1,0 +1,1001 @@
+"""Resource-limit rules of the ASP.NET Core configuration pass: request-body size limits (DNL-RES-001, the id
+the web.config rules already use), login / token / password-reset endpoints with no rate limiting
+(DNL-RES-004) and a page-size parameter that reaches `Take` with no upper bound (DNL-RES-005).
+
+Like the other rules_pipeline* modules it must not import rules_auth_core (static inventory test); shared
+helpers live in auth_core.py and the sibling rule modules.
+
+Known limits. RES-005 reads one handler body: a parameter handed to another method (`repo.List(pageSize)`)
+is not followed, and a bound written there is not seen (not reported either way); a comparison against a
+literal of 0 or 1 is a lower-bound check, not a cap. A cap is a comparison of the value against a constant
+(literal, folded expression or `const` field; a `static readonly` field is not read) with `>` / `>=` in an
+`if` the handler always reaches (not nested under another `if`), the condition being that comparison or an `||`
+chain including it (an `&&` conjunct is not a cap; the `<` / `<=` forms mirror this), guarding a branch that
+returns, throws or assigns the value, ignoring returns inside lambdas; a ternary or a Min / Clamp with a
+constant operand counts when its result is used; the guard must come before the Take in source order, a ternary must hand the constant to the "too big" arm, and parameters and locals shadow class constants. Any other mention of the value is REVIEW. RES-004 counts a
+route-level `RequireRateLimiting` / `[EnableRateLimiting]` only when a limiter middleware certainly runs in
+Production (the policy is unenforced without it). Scanned text is never evaluated: page directives are folded
+by a small bounded parser (no `**`, shifts <= 64, capped magnitudes), anything else is UNKNOWN / REVIEW.
+"""
+from __future__ import annotations
+
+import json
+import re
+
+from checks.dnl.cfgctx import Ctx, _scope_of
+from checks.dnl.ir import attr_key, call_name, receiver_text, walk
+from checks.dnl.options import UNKNOWN, lambda_args, opaque_reason, options_of, verdict
+from checks.dnl.pipeline import Pipeline
+from checks.dnl.routes_core import CoreRouteRef, _chain_types
+from checks.dnl.rules_pipeline_auth import _env_state
+
+_MIB = 1024 * 1024
+_LIMIT = 100 * _MIB                     # a request body above this is reported
+_MUTATING = {"POST", "PUT", "DELETE", "PATCH"}
+
+_MAXES = {"int.maxvalue": 2**31 - 1, "int32.maxvalue": 2**31 - 1, "long.maxvalue": 2**63 - 1,
+          "int64.maxvalue": 2**63 - 1, "uint.maxvalue": 2**32 - 1, "uint32.maxvalue": 2**32 - 1,
+          "ulong.maxvalue": 2**64 - 1, "uint64.maxvalue": 2**64 - 1, "short.maxvalue": 2**15 - 1,
+          "ushort.maxvalue": 2**16 - 1, "int16.maxvalue": 2**15 - 1, "uint16.maxvalue": 2**16 - 1}
+_OPS = {"*": lambda a, b: a * b, "+": lambda a, b: a + b, "-": lambda a, b: a - b,
+        "/": lambda a, b: a // b if b else UNKNOWN, "<<": lambda a, b: a << b if 0 <= b < 64 else UNKNOWN}
+
+
+_UNEXPECTED: list[str] = []       # errors the folding did not expect; check() turns them into model notes
+
+
+class _Stop(Exception):
+    """The text is not a constant this folder reads (or it is too big or too deep): UNKNOWN."""
+
+
+def _note_unexpected(exc: Exception) -> None:
+    """Folding is total, but only the expected failures are silent: anything else is a programming error and
+    must stay visible (a model note), while the value still reads as UNKNOWN."""
+    if not isinstance(exc, (_Stop, ArithmeticError, ValueError, RecursionError, IndexError)):
+        _UNEXPECTED.append(f"{type(exc).__name__}: {exc}")
+
+
+_CAP = 2**80                      # intermediate results above this abort the folding (UNKNOWN)
+
+
+def _apply(op: str, a, b):
+    """One folded operation, UNKNOWN when it is not safe or not defined (shift count outside 0..64, division by
+    zero, a float shifted, a result above _CAP)."""
+    if op == "<<" and not (isinstance(a, int) and isinstance(b, int) and 0 <= b <= 64):
+        return UNKNOWN
+    if op == "/" and not b:
+        return UNKNOWN
+    v = _OPS[op](a, b)
+    return v if v is not UNKNOWN and abs(v) <= _CAP else UNKNOWN
+
+
+def _num(e, consts: dict | None = None):
+    """A compile-time number, None for a literal null, else UNKNOWN: literals, `long.MaxValue` style
+    members, casts, names found in `consts` (const fields), and `* + - / <<` over those
+    (`2000L * 1024 * 1024`). Total: whatever goes wrong while folding (a very deep expression, an overflow)
+    reads as UNKNOWN."""
+    try:
+        return _num_of(e, consts)
+    except Exception as exc:  # noqa: BLE001
+        _note_unexpected(exc)
+        return UNKNOWN
+
+
+def _num_of(e, consts: dict | None):
+    if not isinstance(e, dict):
+        return UNKNOWN
+    k = e.get("k")
+    if k == "lit":
+        v = e.get("v")
+        if v is None and e.get("t") == "null":
+            return None
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else UNKNOWN
+    if k == "name":
+        return (consts or {}).get(e.get("id"), UNKNOWN)
+    if k == "member":
+        text = receiver_text(e).lower()
+        return _MAXES.get(text[len("system."):] if text.startswith("system.") else text, UNKNOWN)
+    if k == "cast":
+        return _num_of(e.get("e"), consts)
+    if k == "bin" and e.get("op") in _OPS:
+        a, b = _num_of(e.get("l"), consts), _num_of(e.get("r"), consts)
+        if a is UNKNOWN or b is UNKNOWN or a is None or b is None:
+            return UNKNOWN
+        return _apply(e["op"], a, b)
+    return UNKNOWN
+
+
+def _size_kind(e) -> str:
+    """"bad" (no limit, or above 100 MiB), "good" or "unknown" for a size value."""
+    v = _num(e)
+    if v is UNKNOWN:
+        return "unknown"
+    return "bad" if v is None or v > _LIMIT else "good"
+
+
+def _size_text(e) -> str:
+    v = _num(e)
+    if v is None:
+        return "null (no limit)"
+    return f"{v} bytes ({v / _MIB:.0f} MiB)" if v is not UNKNOWN else "a value that is not a compile-time constant"
+
+
+def _env_review(c) -> str | None:
+    """None when a pipeline call certainly runs in Production, "skip" when it never does, "REVIEW" under an
+    environment condition that could not be parsed."""
+    run = c.runs_in("Production")
+    return "skip" if run is False else None if run else "REVIEW"
+
+
+# -- RES-001: request size limits ----------------------------------------------------------------------
+
+# Option types the body-size rule reads -> the option path that holds the limit.
+_KESTREL_PATH, _SERVER_PATH, _FORM_PATH = "limits.maxrequestbodysize", "maxrequestbodysize", "multipartbodylengthlimit"
+_TYPE_PATHS = {"kestrelserveroptions": _KESTREL_PATH, "iisserveroptions": _SERVER_PATH,
+               "httpsysoptions": _SERVER_PATH, "formoptions": _FORM_PATH}
+_CALL_PATHS = {"configurekestrel": _KESTREL_PATH, "usekestrel": _KESTREL_PATH, "usehttpsys": _SERVER_PATH}
+_LABEL = {_KESTREL_PATH: "MaxRequestBodySize", _SERVER_PATH: "MaxRequestBodySize",
+          _FORM_PATH: "MultipartBodyLengthLimit"}
+
+
+def _limit_path(n: dict) -> str | None:
+    """The option path a call's lambda sets the body limit through, None for any other call."""
+    name = (call_name(n) or "").lower()
+    if name in _CALL_PATHS:
+        return _CALL_PATHS[name]
+    if name in ("configure", "postconfigure"):
+        for t in (n.get("fn") or {}).get("targs") or []:
+            p = _TYPE_PATHS.get(str(t).split("<")[0].split(".")[-1].lower())
+            if p:
+                return p
+    return None
+
+
+def _options_param_names(n: dict) -> set | None:
+    """The options parameter of each lambda argument (the last one: `(ctx, o) => ...`), None without lambdas."""
+    names = {p for lam in lambda_args(n) for p in (lam.get("params") or [])[-1:] if isinstance(p, str)}
+    return names or None
+
+
+def _code_limits(ctx: Ctx, pipe: Pipeline, seen: set) -> None:
+    for c in pipe.calls:
+        state = _env_review(c)
+        if state == "skip":
+            continue
+        for n in walk(c.node):
+            if n.get("k") != "call" or id(n) in seen:
+                continue
+            path = _limit_path(n)
+            if path is None:
+                continue
+            seen.add(id(n))
+            line = n.get("line") or c.line
+            why = opaque_reason(n, _options_param_names(n))
+            if why:
+                ctx.add("DNL-RES-001", "low", "Request size limit could not be read",
+                        f"The options of {call_name(n)} at {c.file}:{line} could not be read ({why}), so "
+                        f"{_LABEL[path]} may be removed or very large there. Confirm it is 100 MiB or less.",
+                        c.file, line, confidence="REVIEW")
+            eff, uncertain = verdict(options_of(n), path, bad=lambda o: _size_kind(o.value) == "bad")
+            if eff is None:
+                continue
+            kind = _size_kind(eff.value)
+            if kind == "good":
+                continue
+            firm = kind == "bad" and not uncertain and state is None
+            if kind == "bad":
+                desc = (f"{_LABEL[path]} is {_size_text(eff.value)} in {call_name(n)}, above the 100 MiB limit, so a "
+                        "single request can exhaust memory, disk or bandwidth. Set a limit that fits the largest "
+                        "legitimate upload and stream larger files.")
+                if uncertain:
+                    desc += " The assignment sits under a condition inside the options lambda, so it may not apply."
+                if state:
+                    desc += " The call sits under an environment condition that could not be parsed."
+            else:
+                desc = (f"{_LABEL[path]} in {call_name(n)} is not a compile-time value, so the limit may be removed "
+                        "or above 100 MiB. Confirm it is 100 MiB or less.")
+            ctx.add("DNL-RES-001", "low", "Request size limit removed or very large", desc,
+                    c.file, eff.line or line, confidence=None if firm else "REVIEW")
+
+
+def _settings_limit(ctx: Ctx, pipe: Pipeline, seen: set) -> None:
+    """`Kestrel:Limits:MaxRequestBodySize` in the effective Production settings of the pipeline's project."""
+    scope = _scope_of(ctx, pipe)
+    if scope is None:
+        return
+    e = ctx.settings.effective("Production", scope).get("kestrel:limits:maxrequestbodysize")
+    if e is None or (e.file, e.line) in seen:
+        return
+    seen.add((e.file, e.line))
+    v = e.value
+    if isinstance(v, str) and re.fullmatch(r"\d+", v.strip()):
+        v = int(v.strip())
+    if v is None or (isinstance(v, (int, float)) and not isinstance(v, bool) and v > _LIMIT):
+        what = "null (no limit)" if v is None else f"{v} bytes ({v / _MIB:.0f} MiB)"
+        ctx.add("DNL-RES-001", "low", "Request size limit removed or very large",
+                f"{e.key} is {what} in the Production configuration, above the 100 MiB limit, so a single request "
+                "can exhaust memory, disk or bandwidth. Set a limit that fits the largest legitimate upload.",
+                e.file, e.line)
+    elif not isinstance(v, (int, float)) or isinstance(v, bool):
+        ctx.add("DNL-RES-001", "low", "Request size limit could not be read",
+                f"{e.key} is {v!r} in the Production configuration, which could not be read as a number; confirm "
+                "the limit is 100 MiB or less.", e.file, e.line, confidence="REVIEW")
+
+
+def _attr_groups(ctx: Ctx, ref: CoreRouteRef) -> list[list]:
+    """Attribute lists of a route, most specific first: the action, then the class and its base classes (an
+    action-level attribute overrides the class-level one, so the first list that names a wanted attribute wins)."""
+    groups = [list(ref.method.attributes)] if ref.method is not None else []
+    if ref.type is not None and ref.style in ("controller", "razorpage"):
+        groups += [list(t.attributes) for t in _chain_types(ctx.model, ref.type)]
+    return groups
+
+
+def _fluent_calls(ref: CoreRouteRef) -> list[list[dict]]:
+    """Fluent convention call lists of a route, most specific first: the endpoint, its groups (innermost
+    first), then the conventions on MapControllers() / MapRazorPages()."""
+    out = [list(ref.endpoint_calls)]
+    out += [list(g.calls) for g in reversed(ref.groups)]
+    out.append(list(ref.convention_calls))
+    return [[c for c in lst if isinstance(c, dict)] for lst in out]
+
+
+_DIRECTIVE = re.compile(r"(?<![A-Za-z0-9_])(DisableRequestSizeLimit|RequestSizeLimit|RequestFormLimits)"
+                        r"(?:Attribute)?\b")
+_FORM_ARG = re.compile(r"MultipartBodyLengthLimit\s*=\s*([^,]+)")
+
+
+_FOLD_TOKEN = re.compile(r"\s*(?:(\d[\d_]*)[lLuU]*|(<<|[-+*/()])|([A-Za-z_][\w.]*))")
+_MAX_TOKENS, _MAX_DEPTH = 200, 40
+
+
+def _fold(text: str):
+    """`_fold_text`, made total: whatever goes wrong (a malformed expression, a recursion limit, an overflow)
+    reads as UNKNOWN, so one odd directive can never take the rest of the rules down with it."""
+    try:
+        return _fold_text(text)
+    except Exception as exc:  # noqa: BLE001
+        _note_unexpected(exc)
+        return UNKNOWN
+
+
+def _fold_text(text: str):
+    """The value of a constant expression written as text in a page directive, with the same folding as code
+    (`100 * 1024 * 1024`, `2000L * 1024 * 1024`, `1L << 40`, `long.MaxValue`): a number, None for `null`,
+    else UNKNOWN. A small recursive parser over `+ - * / << ( )`, integer literals and `*.MaxValue`: it never
+    evaluates the text, `**` is a syntax error, shifts, magnitudes, token count and nesting are capped."""
+    t = text.strip()
+    if t == "null":
+        return None
+    if len(t) > 500:
+        return UNKNOWN
+    toks: list[tuple[str, str]] = []
+    i = 0
+    while i < len(t):
+        m = _FOLD_TOKEN.match(t, i)
+        if not m or m.end() == i or len(toks) > _MAX_TOKENS:
+            return UNKNOWN
+        i = m.end()
+        if m.group(1):
+            if len(m.group(1)) > 30:
+                return UNKNOWN
+            toks.append(("n", m.group(1).replace("_", "")))
+        elif m.group(2):
+            toks.append(("o", m.group(2)))
+        else:
+            name = m.group(3).lower()
+            name = name[len("system."):] if name.startswith("system.") else name
+            if name not in _MAXES:
+                return UNKNOWN
+            toks.append(("n", str(_MAXES[name])))
+    pos = 0
+
+    def peek():
+        return toks[pos] if pos < len(toks) else (None, None)
+
+    def take():
+        nonlocal pos
+        if pos >= len(toks):
+            raise _Stop
+        pos += 1
+        return toks[pos - 1]
+
+    def primary(depth: int):
+        if depth > _MAX_DEPTH or pos >= len(toks):
+            raise _Stop
+        kind, val = take()
+        if kind == "n":
+            return int(val)
+        if val == "-":
+            v = primary(depth + 1)
+            return -v
+        if val == "(":
+            v = shift(depth + 1)
+            if take() != ("o", ")"):
+                raise _Stop
+            return v
+        raise _Stop
+
+    def level(ops, nxt):
+        def parse(depth: int):
+            v = nxt(depth)
+            while peek()[0] == "o" and peek()[1] in ops:
+                op = take()[1]
+                v = _apply(op, v, nxt(depth))
+                if v is UNKNOWN:
+                    raise _Stop
+            return v
+        return parse
+
+    def mul(depth):
+        return level(("*", "/"), primary)(depth)
+
+    def add(depth):
+        return level(("+", "-"), mul)(depth)
+
+    def shift(depth):
+        return level(("<<",), add)(depth)
+
+    try:
+        v = shift(0)
+        if pos != len(toks):
+            return UNKNOWN
+    except _Stop:
+        return UNKNOWN
+    return v
+
+
+def _args_after(text: str, i: int):
+    """The text between the parentheses that follow position i (balanced, any depth up to 100), "" when no
+    parenthesis follows, None when they are not balanced."""
+    j = i
+    while j < len(text) and text[j].isspace():
+        j += 1
+    if j >= len(text) or text[j] != "(":
+        return ""
+    depth = 0
+    for k in range(j, min(len(text), j + 2000)):
+        depth += (text[k] == "(") - (text[k] == ")")
+        if depth > 100:
+            return None
+        if depth == 0:
+            return text[j + 1:k]
+    return None
+
+
+def _directive_issues(text: str) -> list[tuple[str, bool]]:
+    """[(what, certain)] for one `@attribute [...]` directive: the size attributes it carries, each once
+    (`[DisableRequestSizeLimit()]` and `[DisableRequestSizeLimit]` are the same attribute)."""
+    out: list[tuple[str, bool]] = []
+    for m in _DIRECTIVE.finditer(text):
+        name, args = m.group(1), _args_after(text, m.end())
+        if name == "DisableRequestSizeLimit":
+            out.append(("@attribute [DisableRequestSizeLimit]", True))
+            continue
+        if args is None:
+            val = UNKNOWN
+            label = f"@attribute [{name}(...)]"
+        elif name == "RequestFormLimits":
+            fm = _FORM_ARG.search(args)
+            val = _fold(fm.group(1)) if fm else 0
+            label = "@attribute [RequestFormLimits(MultipartBodyLengthLimit = ...)]"
+        else:
+            val = _fold(args) if args.strip() else 0
+            label = "@attribute [RequestSizeLimit(...)]"
+        if val is UNKNOWN:
+            out.append((label + " with a value that is not a compile-time constant", False))
+        elif val is None or val > _LIMIT:
+            out.append((label.replace("...", "null" if val is None else str(val)), True))
+    return out
+
+
+def _size_issues(ctx: Ctx, ref: CoreRouteRef) -> list[tuple[str, int, bool]]:
+    """[(what, line, certain)] a route does to the request size limit: a `[DisableRequestSizeLimit]`,
+    `[RequestSizeLimit(n)]` or `[RequestFormLimits(MultipartBodyLengthLimit = n)]` over 100 MiB, from the
+    action or class (an `@attribute` directive of a page too), or `WithMetadata(new ...Attribute())`."""
+    out: list[tuple[str, int, bool]] = []
+    r = ref.route
+
+    def sized(name: str, args: list, named: dict, line: int) -> None:
+        if name == "disablerequestsizelimit":
+            out.append(("[DisableRequestSizeLimit]", line, True))
+        elif name == "requestsizelimit":
+            kind = _size_kind(args[0] if args else named.get("bytes"))
+            if kind != "good":
+                out.append((f"[RequestSizeLimit({_size_text(args[0] if args else named.get('bytes'))})]", line,
+                            kind == "bad"))
+        elif name == "requestformlimits":
+            val = next((v for k, v in named.items() if k.lower() == "multipartbodylengthlimit"), None)
+            if val is not None and _size_kind(val) != "good":
+                out.append((f"[RequestFormLimits(MultipartBodyLengthLimit = {_size_text(val)})]", line,
+                            _size_kind(val) == "bad"))
+
+    for family in (("disablerequestsizelimit", "requestsizelimit"), ("requestformlimits",)):
+        for attrs in _attr_groups(ctx, ref):
+            hit = [a for a in attrs if attr_key(a.name) in family]
+            if hit:
+                for a in hit:
+                    sized(attr_key(a.name), list(a.args), dict(a.named), a.line or r.line)
+                break
+    for raw in r.meta.get("page_attributes") or []:
+        out += [(w, r.line, c) for w, c in _directive_issues(str(raw))]
+    for lst in _fluent_calls(ref):
+        for c in lst:
+            if call_name(c) != "WithMetadata":
+                continue
+            for a in c.get("args") or []:
+                for x in walk(a):
+                    if x.get("k") == "new":
+                        name = attr_key((x.get("type") or "").split(".")[-1])
+                        sized(name, list(x.get("args") or []), {}, x.get("line") or c.get("line") or r.line)
+    return out
+
+
+def _route_limits(ctx: Ctx) -> None:
+    seen: set = set()
+    for ref in ctx.refs:
+        r = ref.route
+        env = _env_state(r.meta.get("env"))
+        if env == "skip":
+            continue
+        for what, line, certain in _size_issues(ctx, ref):
+            key = (r.file, r.line, r.handler_name, r.path, what)
+            if key in seen:
+                continue
+            seen.add(key)
+            conf = None if certain and env == "firm" else "REVIEW"
+            desc = (f"{r.handler_name} ({', '.join(r.methods)} {r.path}) sets {what}, so one request to it can be "
+                    "larger than 100 MiB and exhaust memory, disk or bandwidth. Keep the limit at or below what "
+                    "the largest legitimate upload needs and stream larger files.")
+            if not certain:
+                desc += " The limit is not a compile-time value."
+            if env == "review":
+                desc += " The route is mapped under an environment condition that is not plain Production."
+            ctx.add("DNL-RES-001", "low", f"Request size limit removed or very large on {r.handler_name}", desc,
+                    r.file, line, route=r, confidence=conf)
+
+
+# -- RES-004: rate limiting on login / token / reset endpoints -----------------------------------------
+
+_AUTH_ENDPOINT = re.compile(r"(?i)login|signin|token|authenticate|forgot|reset|password")
+_TOKEN = re.compile(r"(?i)token")
+_THIRD_PARTY = ("UseIpRateLimiting", "UseClientRateLimiting", "AddInMemoryRateLimiting", "UseRateLimitingMiddleware")
+_LIMITERS = ("UseRateLimiter",) + _THIRD_PARTY
+_RL = {"enableratelimiting": "enabled", "requireratelimiting": "enabled",
+       "disableratelimiting": "disabled"}
+
+
+def _auth_endpoint(ref: CoreRouteRef) -> bool:
+    """A login / token / password-reset route: the name or path says so, and it takes a mutating verb (a
+    token endpoint is reported for any verb)."""
+    r = ref.route
+    if r.meta.get("kind") in ("health", "openapi", "fallback", "hub"):
+        return False
+    text = f"{r.path} {r.handler_name}"
+    if not _AUTH_ENDPOINT.search(text):
+        return False
+    verbs = {v.upper() for v in r.methods}
+    return bool(_TOKEN.search(text) or verbs & _MUTATING or "ANY" in verbs)
+
+
+def _rate_state(ctx: Ctx, ref: CoreRouteRef) -> str | None:
+    """"enabled" | "disabled" | None for a route's own rate-limiting metadata. Within attributes the action
+    beats the class, within fluent calls the endpoint beats its group beats the convention (the last call
+    on one builder wins); a disable in either family wins over an enable."""
+    states: list[str] = []
+    for attrs in _attr_groups(ctx, ref):
+        hit = [_RL[attr_key(a.name)] for a in attrs if attr_key(a.name) in _RL]
+        if hit:
+            states.append("disabled" if "disabled" in hit else "enabled")
+            break
+    for raw in ref.route.meta.get("page_attributes") or []:
+        text = str(raw)
+        if "DisableRateLimiting" in text:
+            states.append("disabled")
+        elif "EnableRateLimiting" in text:
+            states.append("enabled")
+    for lst in _fluent_calls(ref):
+        names = [_RL[(call_name(c) or "").lower()] for c in lst if (call_name(c) or "").lower() in _RL]
+        if names:
+            states.append(names[-1])
+            break
+    return "disabled" if "disabled" in states else "enabled" if "enabled" in states else None
+
+
+def _owns(ctx: Ctx, pipe: Pipeline, ref: CoreRouteRef) -> bool:
+    return ref.project is pipe.project or (ref.project is None and len(ctx.pipes) == 1)
+
+
+def _global_limiter(ctx: Ctx, pipe: Pipeline) -> str:
+    """"yes" | "maybe" | "no": is a `GlobalLimiter` assigned in the rate limiter options, in AddRateLimiter,
+    `Configure<RateLimiterOptions>` or UseRateLimiter's own options? "maybe" for a conditional assignment or
+    options that cannot be read (a method group, a variable): not proven either way."""
+    verdicts: list[str] = []
+    calls = [c for c in ctx.prod_calls(pipe, "AddRateLimiter", "UseRateLimiter", "Configure", "PostConfigure")
+             + ctx.uncertain_calls(pipe, "AddRateLimiter", "UseRateLimiter", "Configure", "PostConfigure")]
+    for c in calls:
+        if c.name in ("Configure", "PostConfigure"):
+            targs = (c.node.get("fn") or {}).get("targs") or []
+            if not any(str(x).strip().split(".")[-1] == "RateLimiterOptions" for x in targs):
+                continue
+        if opaque_reason(c.node) is not None:
+            verdicts.append("maybe")
+        opt, uncertain = verdict(options_of(c.node), "GlobalLimiter")
+        if opt is not None:
+            verdicts.append("maybe" if uncertain else "yes")
+    return "yes" if "yes" in verdicts else "maybe" if verdicts else "no"
+
+
+def _rate_limiting(ctx: Ctx) -> None:
+    for pipe in ctx.pipes:
+        routes = [ref for ref in ctx.refs if _owns(ctx, pipe, ref) and _auth_endpoint(ref)
+                  and _env_state(ref.route.meta.get("env")) != "skip"]
+        identity = ctx.prod_calls(pipe, "MapIdentityApi") + ctx.uncertain_calls(pipe, "MapIdentityApi")
+        if not routes and not identity:
+            continue
+        firm_global = bool(pipe.named(*_LIMITERS))
+        # UseRateLimiter alone limits nothing: the framework middleware enforces a GlobalLimiter or a policy
+        # named on the route. Third-party limiters (IpRateLimit and friends) are trusted as before.
+        needs_global = firm_global and not pipe.named(*_THIRD_PARTY) and _global_limiter(ctx, pipe) != "yes"
+        no_global: list[CoreRouteRef] = []
+        maybe_global = bool(ctx.uncertain_calls(pipe, *_LIMITERS))
+        open_routes: list[CoreRouteRef] = []
+        unenforced: list[CoreRouteRef] = []
+        for ref in routes:
+            r = ref.route
+            state = _rate_state(ctx, ref)
+            env = _env_state(r.meta.get("env"))
+            if state == "disabled":
+                ctx.add("DNL-RES-004", "low", f"Rate limiting disabled on {r.handler_name}",
+                        f"{r.handler_name} ({', '.join(r.methods)} {r.path}) is a login, token or password-reset "
+                        "endpoint marked with DisableRateLimiting, so it is exempt from the app's rate limiter and "
+                        "open to credential stuffing and brute force." +
+                        (" The route is mapped under an environment condition that is not plain Production."
+                         if env == "review" else ""),
+                        r.file, r.line, route=r, confidence=None if env == "firm" else "REVIEW")
+            elif state is None and needs_global:
+                no_global.append(ref)
+            elif state is None or not firm_global:
+                # A route-level policy is metadata only: without a limiter middleware that certainly runs in
+                # Production (UseRateLimiter or a third-party one) nothing enforces it, so the route is open.
+                open_routes.append(ref)
+                if state == "enabled":
+                    unenforced.append(ref)
+        if no_global:
+            r = no_global[0].route
+            names = ", ".join(f"{x.route.handler_name} ({', '.join(x.route.methods)} {x.route.path})"
+                              for x in no_global[:5])
+            more = f" and {len(no_global) - 5} more" if len(no_global) > 5 else ""
+            ctx.add("DNL-RES-004", "low", "No rate limiting policy on login, token or password-reset endpoints",
+                    "The pipeline calls UseRateLimiter, but the middleware limits nothing without a GlobalLimiter "
+                    "or a policy on the route: there is no policy on the route and no GlobalLimiter visible in the "
+                    f"rate limiter options for {names}{more}. They may be open to credential stuffing, password "
+                    "guessing and reset-mail floods; confirm a GlobalLimiter or RequireRateLimiting / "
+                    "[EnableRateLimiting] covers them.",
+                    r.file, r.line, route=r, confidence="REVIEW")
+        if firm_global:
+            continue
+        conf, note = ctx.absent_confidence(pipe)
+        if maybe_global:
+            conf = "REVIEW"
+            note = (note + "; " if note else "") + "a rate limiter sits under an environment condition that could not be parsed"
+        if open_routes:
+            first = open_routes[0]
+            r = first.route
+            names = ", ".join(f"{x.route.handler_name} ({', '.join(x.route.methods)} {x.route.path})"
+                              for x in open_routes[:5])
+            more = f" and {len(open_routes) - 5} more" if len(open_routes) > 5 else ""
+            if _env_state(r.meta.get("env")) == "review":
+                conf = "REVIEW"
+            none = ("none certain in Production" if maybe_global else "no UseRateLimiter, no third-party limiter")
+            lead = ("The Production pipeline has no limiter that certainly runs in Production"
+                    + ("" if maybe_global else f" ({none})")
+                    if unenforced else
+                    f"The Production pipeline has no rate limiting ({none}, no RequireRateLimiting / "
+                    "[EnableRateLimiting] on the route or its group)")
+            desc = (f"{lead} while it serves login, token or password-reset endpoints: {names}{more}. They are "
+                    "open to credential stuffing, password guessing and reset-mail floods.")
+            if unenforced:
+                desc += (" A rate-limiting policy is named on "
+                         + ", ".join(f"{x.route.handler_name} ({x.route.path})" for x in unenforced[:5])
+                         + ", but no rate limiter middleware is certain in the Production pipeline, so the policy is unenforced.")
+            elif pipe.named("AddRateLimiter") and not pipe.named("UseRateLimiter"):
+                desc += " AddRateLimiter registers policies, but without UseRateLimiter nothing enforces them."
+            if note:
+                desc += f" Not certain: {note}."
+            ctx.add("DNL-RES-004", "low", "No rate limiting on login, token or password-reset endpoints", desc,
+                    r.file, r.line, route=r, confidence=conf)
+        if identity:
+            # MapIdentityApi registers /login, /refresh, /forgotPassword and /resetPassword endpoints that the
+            # route discovery cannot list; whether a group limiter covers them is not traced: always REVIEW.
+            c = identity[0]
+            ctx.add("DNL-RES-004", "low", "No rate limiting on the Identity API endpoints",
+                    "MapIdentityApi registers the /login, /refresh, /forgotPassword and /resetPassword endpoints, "
+                    "and the Production pipeline has no rate limiting ("
+                    + ("none certain in Production" if maybe_global else "no UseRateLimiter, no third-party limiter") + "). "
+                    "Confirm a limiter covers them." + (f" Not certain: {note}." if note else ""),
+                    c.file, c.line, confidence="REVIEW")
+
+
+# -- RES-005: page size reaches Take with no bound ----------------------------------------------------
+
+_PAGE_PARAM = re.compile(r"(?i)^(page_?size|limit|take|count|per_?page|top|max_?results)$")
+_INT_TYPES = {"int", "int32", "long", "int64", "short", "int16", "uint", "uint32", "ulong", "uint64",
+              "ushort", "uint16"}
+_CMP = {"<", ">", "<=", ">="}
+_BOUND_CALLS = {"min", "clamp"}
+_MAX_PAGE = 10000            # a [Range] maximum up to this is a bound
+
+
+def _integer(type_text: str | None) -> bool:
+    t = (type_text or "").strip().replace(" ", "").lower()
+    m = re.fullmatch(r"(?:system\.)?nullable<(.+)>", t)
+    t = (m.group(1) if m else t).rstrip("?")
+    return (t[len("system."):] if t.startswith("system.") else t) in _INT_TYPES
+
+
+def _mentions(e, names: set) -> bool:
+    return any(n.get("k") == "name" and n.get("id") in names for n in walk(e))
+
+
+def _lower_check(other) -> bool:
+    """A literal of 0 or 1 (or less): comparing against it checks for a positive size, not a cap."""
+    return isinstance(other, dict) and other.get("k") == "lit" and isinstance(other.get("v"), (int, float)) \
+        and not isinstance(other.get("v"), bool) and other["v"] <= 1
+
+
+def _cmp_nodes(e, names: set) -> list[dict]:
+    """Comparisons in an expression that read the parameter (or a carrier local) against anything but a 0 / 1
+    literal (those check for a positive size, not a cap)."""
+    out = []
+    for n in walk(e):
+        if n.get("k") == "bin" and n.get("op") in _CMP:
+            left, right = n.get("l"), n.get("r")
+            if (_mentions(left, names) and not _lower_check(right)) or (_mentions(right, names) and not _lower_check(left)):
+                out.append(n)
+    return out
+
+
+def _bound_calls(e, names: set, consts: dict, need_const: bool = False) -> list[dict]:
+    """`Math.Min` / `Math.Clamp` / `Clamp` calls over the parameter (or a carrier local) inside an expression;
+    with `need_const`, only those that also take a compile-time number (a cap, not a copy)."""
+    out = []
+    for n in walk(e):
+        if n.get("k") == "call" and (call_name(n) or "").lower() in _BOUND_CALLS:
+            fn = n.get("fn")
+            args = list(n.get("args") or [])
+            if ((any(_mentions(a, names) for a in args)
+                 or (isinstance(fn, dict) and fn.get("k") == "member" and _mentions(fn.get("obj"), names)))
+                    and (not need_const or any(isinstance(_num(a, consts), (int, float)) for a in args))):
+                out.append(n)
+    return out
+
+
+_STOP_KINDS = frozenset({"if", "loop", "cond", "lambda"})
+_OR, _AND = frozenset({"||", "or", "orelse"}), frozenset({"&&", "and", "andalso"})
+_SHORT = _OR | _AND | {"??"}      # the right operand of these may not run
+
+
+def _top(node, stop=_STOP_KINDS):
+    """Pre-order over the nodes that run whenever the code around them runs: it stops at (but yields) an `if`,
+    a loop, a ternary and a lambda or local function (their bodies may not run, or run elsewhere), and skips
+    `catch` handlers."""
+    if isinstance(node, list):
+        for x in node:
+            yield from _top(x, stop)
+    elif isinstance(node, dict):
+        yield node
+        if node.get("k") in stop:
+            return
+        for key, v in node.items():
+            if isinstance(v, (dict, list)) and not (node.get("k") == "try" and key == "catches") and not (
+                    node.get("k") == "bin" and key == "r" and str(node.get("op")).lower() in _SHORT):
+                yield from _top(v, stop)
+
+
+def _acts(stmts, names: set) -> bool:
+    """A branch that certainly leaves the handler (return / throw) or assigns the parameter or a carrier (a
+    clamp); a jump under a nested `if`, loop or lambda does not count."""
+    for n in _top(stmts):
+        if n.get("k") in ("return", "throw"):
+            return True
+        if (n.get("k") == "assign" and isinstance(n.get("target"), dict) and n["target"].get("k") == "name"
+                and n["target"].get("id") in names):
+            return True
+    return False
+
+
+def _tracked(e, names: set) -> bool:
+    """The parameter (or a carrier local) itself, its nullable `.Value`, or a cast of either."""
+    if not isinstance(e, dict):
+        return False
+    k = e.get("k")
+    if k == "name":
+        return e.get("id") in names
+    if k == "member" and e.get("name") == "Value":
+        return _tracked(e.get("obj"), names)
+    return k == "cast" and _tracked(e.get("e"), names)
+
+
+_FLIP = {"<": ">", ">": "<", "<=": ">=", ">=": "<="}
+
+
+def _cap_cmp(n: dict, names: set, consts: dict) -> str | None:
+    """"exceed" for `value > C` / `>= C`, "within" for `value < C` / `<= C` (either operand order) where C
+    is a compile-time number above 1 (a literal, a const field or a folded constant); None otherwise."""
+    op, left, right = n.get("op"), n.get("l"), n.get("r")
+    if n.get("k") != "bin" or op not in _CMP:
+        return None
+    if _tracked(left, names):
+        c = _num(right, consts)
+    elif _tracked(right, names):
+        c, op = _num(left, consts), _FLIP[op]
+    else:
+        return None
+    if not isinstance(c, (int, float)) or c <= 1:
+        return None
+    return "exceed" if op in (">", ">=") else "within"
+
+
+def _guards(cond, kind: str, names: set, consts: dict) -> bool:
+    """The condition is a cap comparison of that kind, or an `||` chain (exceed) / `&&` chain (within) that
+    includes one: only then does the branch it selects hold exactly the values past the cap."""
+    joins = _OR if kind == "exceed" else _AND
+    if isinstance(cond, dict) and cond.get("k") == "bin" and cond.get("op") in joins:
+        return _guards(cond.get("l"), kind, names, consts) or _guards(cond.get("r"), kind, names, consts)
+    return isinstance(cond, dict) and _cap_cmp(cond, names, consts) == kind
+
+
+def _inside(branch, takes: list[dict]) -> bool:
+    ids = {id(n) for n in walk(branch)}
+    return all(id(t) in ids for t in takes)
+
+
+def _hidden_assign(body, names: set) -> bool:
+    """An assignment to the value or a carrier that the IR keeps as unparsed text (`ok && (n = 5) > 0`,
+    `x ?? (n = 5)`): it may or may not run, so it cannot be read as a cap or ruled out."""
+    pat = re.compile(r"(?<![\w.])(?:" + "|".join(re.escape(n) for n in sorted(names)) + r")\s*=(?!=)")
+    return any(n.get("k") == "unknown" and pat.search(str(n.get("text") or "")) for n in walk(body))
+
+
+def _value_caps(val, names: set, consts: dict) -> bool:
+    """An expression that hands over a capped value: a ternary giving the constant to the "too big" arm and the
+    value to the other, or a Min / Clamp call with a constant operand."""
+    for n in walk(val):
+        if n.get("k") != "cond":
+            continue
+        big, small = (n.get("t"), n.get("f")) if _guards(n.get("c"), "exceed", names, consts) else (
+            (n.get("f"), n.get("t")) if _guards(n.get("c"), "within", names, consts) else (None, None))
+        if isinstance(_num(big, consts), (int, float)) and _tracked(small, names):
+            return True
+    return bool(_bound_calls(val, names, consts, need_const=True))
+
+
+def _bound_state(body: list, names: set, takes: list[dict], consts: dict) -> str | None:
+    """"bound" when the handler certainly caps the value, "weak" when a comparison or Min / Clamp mentions it
+    but nothing shows that it limits what reaches Take (REVIEW), None when nothing does. A cap is: a
+    comparison of the value against a constant in an `if` the handler always reaches (not nested under another
+    `if`) whose condition is that comparison, or an `||` chain including it (`&&` for the within-form), when
+    the branch it selects returns, throws or assigns the value (or every Take sits in the other branch); a
+    ternary with such a comparison, or a Min / Clamp with a constant operand, whose result is used (inside a
+    Take argument, or assigned to what Take reads)."""
+    reach = {n.get("id") for t in takes for a in t.get("args") or [] for n in walk(a) if n.get("k") == "name"}
+    order = {id(n): i for i, n in enumerate(walk(body))}        # source order: a guard must precede every Take
+    first_take = min(order.get(id(t), 0) for t in takes)
+    strong = False
+    for n in _top(body):
+        if n.get("k") != "if" or order.get(id(n), 1 << 30) > first_take:
+            continue
+        cond, then, other = n.get("cond"), n.get("then"), n.get("else")
+        if _guards(cond, "exceed", names, consts) and (_acts(then, names) or _inside(other, takes)):
+            strong = True
+        if _guards(cond, "within", names, consts) and (_acts(other, names) or _inside(then, takes)):
+            strong = True
+    # Carriers: a local or assignment that holds the (capped) value Take reads. Only a statement the handler
+    # always reaches counts (not under an if / else / loop / switch / try / lambda / ternary arm); the last such
+    # carrier before the Take wins, and a later conditional re-assignment from the raw value undoes it.
+    top = {id(n) for n in _top(body, _STOP_KINDS | {"try"})}
+    carriers: dict[str, list[tuple[object, bool]]] = {}
+    for n in walk(body):
+        if order.get(id(n), 1 << 30) >= first_take:
+            continue
+        if n.get("k") == "local" and n.get("name") in names:
+            carriers.setdefault(n["name"], []).append((n.get("init"), id(n) in top))
+        elif (n.get("k") == "assign" and n.get("op") == "=" and isinstance(n.get("target"), dict)
+              and n["target"].get("k") == "name" and n["target"].get("id") in names):
+            carriers.setdefault(n["target"]["id"], []).append((n.get("value"), id(n) in top))
+    for target, items in carriers.items():
+        state = False
+        for val, certain in items:
+            capped = _value_caps(val, names, consts)
+            if certain:
+                state = capped
+            elif not capped and _mentions(val, names):
+                state = False
+        if state and target in reach:
+            strong = True
+    if any(_value_caps(a, names, consts) for t in takes for a in t.get("args") or []):
+        strong = True
+    if strong:
+        return "bound"
+    if _cmp_nodes(body, names) or _bound_calls(body, names, consts) or _hidden_assign(body, names):
+        return "weak"
+    return None
+
+
+def _consts(ctx: Ctx, ref: CoreRouteRef) -> dict:
+    """Const fields of the handler's class chain whose initialiser folds to a number (`private const int
+    MaxPage = 100;`). A `static readonly` field is not read as a constant."""
+    out: dict = {}
+    if ref.type is None:
+        return out
+    for t in _chain_types(ctx.model, ref.type):
+        for f in t.fields:
+            if f.is_const and f.init is not None and f.name not in out:
+                v = _num(f.init, out)
+                if isinstance(v, (int, float)):
+                    out[f.name] = v
+    return out
+
+
+_IDENT = re.compile(r"[A-Za-z_]\w*")
+_CASE_PATTERN = re.compile(r"\bcase\s+[\w.<>\[\]?]+\s+([A-Za-z_]\w*)|\b([A-Za-z_]\w*)\s*(?:when\b|=>)")
+
+
+def _binders(ctx: Ctx, ref: CoreRouteRef, m) -> tuple[set, bool]:
+    """Every name the handler binds, which shadows a class constant of that name: parameters, locals, lambda and
+    local-function parameters, catch variables, names in a loop header (`foreach (var x in ..)`, `for (int x ..`),
+    and any identifier inside text the IR keeps unparsed (`out var x`, `is T x`, tuple deconstruction). A `case T x`
+    pattern is not in the IR, so the method's source lines are scanned for it as well (best effort)."""
+    out = {q.name for q in m.params}
+    for n in walk(m.body):
+        k = n.get("k")
+        if k == "local":
+            out.add(n.get("name"))
+        elif k == "lambda":
+            out |= {x for x in n.get("params") or [] if isinstance(x, str)}
+        elif k == "try":
+            out |= {c.get("name") for c in n.get("catches") or [] if isinstance(c, dict)}
+        elif k == "loop":
+            out |= {x.get("id") for x in walk(n.get("header")) if x.get("k") == "name"}
+        elif k == "unknown":
+            out |= set(_IDENT.findall(str(n.get("text") or "")))
+    ok = True
+    try:
+        from checks.dnl.files import read_source
+        if not ref.route.file or not m.end_line or m.end_line < m.line or m.end_line - m.line > 5000:
+            raise ValueError("no usable source range")
+        lines = read_source(ctx.model.root / ref.route.file).splitlines()[max(m.line - 1, 0):m.end_line]
+        for hit in _CASE_PATTERN.finditer("\n".join(lines)):
+            out |= {g for g in hit.groups() if g}
+    except Exception:  # noqa: BLE001 -- the scan is best effort, but a failure is reported by the caller
+        ok = False
+    return out, ok
+
+
+def _has_switch(body) -> bool:
+    """A switch (the IR lowers it to `if`s over the governing expression): a `break;` outside a loop, sibling
+    `if`s with the same condition, or a ternary over a bare name (a switch expression). Loose on purpose: it is
+    only used to decide whether an unreadable source could hide a `case T x` binder."""
+    def same(x, y):
+        return json.dumps(x, sort_keys=True, default=str) == json.dumps(y, sort_keys=True, default=str)
+    for n in walk(body):
+        if n.get("k") == "other" and re.match(r"\s*break[^A-Za-z0-9_]", str(n.get("text") or "")):
+            return True
+        if n.get("k") == "cond" and isinstance(n.get("c"), dict) and n["c"].get("k") in ("name", "member"):
+            return True
+    for stmts in [body] + [n.get("then") for n in walk(body) if n.get("k") == "if"]:
+        conds = [{k: v for k, v in n["cond"].items() if k != "line"} for n in stmts or []
+                 if isinstance(n, dict) and n.get("k") == "if" and isinstance(n.get("cond"), dict)]
+        if any(same(conds[i], conds[j]) for i in range(len(conds)) for j in range(i + 1, len(conds))):
+            return True
+    return False
+
+
+def _page_findings(ctx: Ctx, ref: CoreRouteRef) -> list[tuple[str, int, bool]]:
+    """[(parameter, line of the Take call, weak)] for page-size parameters reaching Take with no certain
+    bound; `weak` when some comparison or Min / Clamp mentions the value but does not visibly cap it."""
+    m = ref.method
+    if m is None:
+        return []
+    out = []
+    shadow, scanned = _binders(ctx, ref, m)    # what the handler binds shadows a class constant of that name
+    visible = {k: v for k, v in _consts(ctx, ref).items() if k not in shadow}
+    if not scanned and _has_switch(m.body):
+        # A `case T x` binder could hide behind the unreadable source: no class constant is trusted here, so a
+        # comparison against one stays REVIEW (literal caps still count).
+        visible = {}
+        note = (f"case-pattern binders of {ref.route.handler_name} could not be checked (its source could not be "
+                "read); class constants are not trusted as page-size caps there")
+        if note not in ctx.model.notes:
+            ctx.model.notes.append(note)
+    for p in m.params:
+        if not (_PAGE_PARAM.match(p.name) and _integer(p.type)):
+            continue
+        rng = next((a for a in p.attributes if attr_key(a.name) == "range"), None)
+        range_weak = False
+        if rng is not None:
+            # [Range(min, max)] is a bound when its maximum folds to a sane page size; a huge or unreadable
+            # maximum (int.MaxValue, a constant from elsewhere) is not proof, so the finding stays as REVIEW.
+            hi = rng.args[1] if len(rng.args) > 1 else next(
+                (v for k, v in dict(rng.named).items() if k.lower() == "maximum"), None)
+            top = _num(hi, visible) if hi is not None else UNKNOWN
+            if isinstance(top, (int, float)) and top <= _MAX_PAGE:
+                continue
+            range_weak = True
+        names = {p.name}
+        for n in walk(m.body):          # one local (or earlier-declared variable) carrying the parameter
+            if n.get("k") == "local" and _mentions(n.get("init"), {p.name}):
+                names.add(n.get("name") or "")
+            elif (n.get("k") == "assign" and n.get("op") == "=" and isinstance(n.get("target"), dict)
+                  and n["target"].get("k") == "name" and n["target"].get("id") != p.name
+                  and _mentions(n.get("value"), {p.name})):
+                names.add(n["target"]["id"])
+        takes = [n for n in walk(m.body) if call_name(n) == "Take"
+                 and any(_mentions(a, names) for a in n.get("args") or [])]
+        if not takes:
+            continue
+        state = _bound_state(m.body, names, takes, visible)
+        if state != "bound" and range_weak:
+            state = "weak"
+        if state != "bound":
+            out.append((p.name, takes[0].get("line") or m.line, state == "weak"))
+    return out
+
+
+def _page_sizes(ctx: Ctx) -> None:
+    seen: set = set()
+    for ref in ctx.refs:
+        r = ref.route
+        env = _env_state(r.meta.get("env"))
+        if env == "skip":
+            continue
+        for pname, line, weak in _page_findings(ctx, ref):
+            key = (r.file, r.line, r.handler_name, r.path, pname)
+            if key in seen:
+                continue
+            seen.add(key)
+            desc = (f"{r.handler_name} ({', '.join(r.methods)} {r.path}) passes the client-supplied \"{pname}\" to "
+                    f"Take at line {line} with no upper bound, so one request can ask for the whole table. Clamp it "
+                    "(Math.Min / Math.Clamp), reject large values, or add [Range(1, N)].")
+            if weak:
+                desc += (" A comparison or Min / Clamp mentions it, but nothing shows that it limits the value "
+                         "that reaches Take (the branch neither returns, throws nor assigns it); confirm it does.")
+            if env == "review":
+                desc += " The route is mapped under an environment condition that is not plain Production."
+            ctx.add("DNL-RES-005", "low", f"Unbounded page size on {r.handler_name}", desc, r.file, r.line,
+                    route=r, confidence=None if env == "firm" and not weak else "REVIEW")
+
+
+def _code_all(ctx: Ctx) -> None:
+    seen: set = set()
+    for pipe in ctx.pipes:
+        _code_limits(ctx, pipe, seen)
+
+
+def _settings_all(ctx: Ctx) -> None:
+    seen: set = set()
+    if ctx.settings is not None:
+        for pipe in ctx.pipes:
+            _settings_limit(ctx, pipe, seen)
+
+
+def check(ctx: Ctx) -> None:
+    """Each sub-rule runs on its own: one that crashes adds a model note naming it (its findings are missing)
+    and never hides the others. Looked up by name at call time, the aggregator's isolation stays the outer net."""
+    _UNEXPECTED.clear()
+    for name, fn_name in (("code_limits", "_code_all"), ("settings_limit", "_settings_all"),
+                          ("route_limits", "_route_limits"), ("rate_limiting", "_rate_limiting"),
+                          ("page_sizes", "_page_sizes")):
+        fn = globals()[fn_name]
+        try:
+            fn(ctx)
+        except Exception as exc:  # noqa: BLE001
+            note = f"limits.{name} failed ({type(exc).__name__}: {exc}); its findings are missing"
+            if note not in ctx.model.notes:
+                ctx.model.notes.append(note)
+    for msg in dict.fromkeys(_UNEXPECTED):
+        note = f"limits folding hit an unexpected error ({msg}); the value read as unknown (REVIEW)"
+        if note not in ctx.model.notes:
+            ctx.model.notes.append(note)
+    _UNEXPECTED.clear()

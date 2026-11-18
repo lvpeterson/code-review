@@ -188,25 +188,28 @@ namespace Demo {
 }
 '''
 
+# (language, framework, files, api_surface, expected tagged finding id, needs the Roslyn helper)
 CASES = [
-    ("python", "flask", {"app.py": FLASK}, False),
-    ("python", "fastapi", {"main.py": FASTAPI}, True),
-    ("java", "spring", {"src/main/java/demo/OrderController.java": SPRING}, True),
-    ("javascript", "express", {"app.js": EXPRESS}, False),
-    ("go", "gin", {"main.go": GIN}, True),
-    ("ruby", "sinatra", {"app.rb": SINATRA}, False),
-    ("dotnet", "aspnet", {"Controllers/OrdersController.cs": ASPNET}, True),
+    ("python", "flask", {"app.py": FLASK}, False, "IDOR-001", False),
+    ("python", "fastapi", {"main.py": FASTAPI}, True, "IDOR-001", False),
+    ("java", "spring", {"src/main/java/demo/OrderController.java": SPRING}, True, "IDOR-001", False),
+    ("javascript", "express", {"app.js": EXPRESS}, False, "IDOR-001", False),
+    ("go", "gin", {"main.go": GIN}, True, "IDOR-001", False),
+    ("ruby", "sinatra", {"app.rb": SINATRA}, False, "IDOR-001", False),
+    ("dotnet", "controllers", {"Controllers/OrdersController.cs": ASPNET}, True, "DNL-AUTHZ-001", True),
 ]
 
 
-@pytest.mark.parametrize("language,framework,files,api", CASES, ids=[c[1] for c in CASES])
-def test_app_findings_are_tagged_end_to_end(tmp_path, language, framework, files, api):
+@pytest.mark.parametrize("language,framework,files,api,rule,helper", CASES, ids=[c[1] for c in CASES])
+def test_app_findings_are_tagged_end_to_end(request, tmp_path, language, framework, files, api, rule, helper):
+    if helper:
+        request.getfixturevalue("roslyn_helper")   # skips without the .NET SDK
     results = _run(tmp_path, files, language, framework)
     found = _findings(results)
     assert found, f"{framework}: fixture produced no findings"
     untagged = [f.check_id for f in found if not f.owasp]
     assert not untagged, f"{framework}: findings without OWASP tags: {untagged}"
-    idor = next(f for f in found if f.check_id == "IDOR-001")
+    idor = next(f for f in found if f.check_id == rule)
     assert idor.owasp["2025"].startswith("A01:2025")
     assert ("api2023" in idor.owasp) is api, (framework, idor.owasp)
 

@@ -115,7 +115,7 @@ def _attr_template(a) -> str:
     return (const_str(a.args[0]) if a.args else None) or ""
 
 
-def _strip_constraints(path: str) -> str:
+def strip_constraints(path: str) -> str:
     return _CONSTRAINT.sub(lambda mo: "{" + mo.group(1) + mo.group(2) + "}", path)
 
 
@@ -132,7 +132,7 @@ def _attribute_paths(t: TypeIR, m: MethodIR) -> list[str]:
         out.append(parts)
     if not out:
         out = [[_attr_template(a).strip("/")] for a in class_routes[:1]]
-    return [_strip_constraints("/" + "/".join(p for p in parts if p)) for parts in out]
+    return [strip_constraints("/" + "/".join(p for p in parts if p)) for parts in out]
 
 
 def _conventional_path(template: str, t: TypeIR, m: MethodIR) -> str:
@@ -152,7 +152,7 @@ def _is_action_shape(m: MethodIR, is_vb: bool, allow_override: bool = False) -> 
     return allow_override or not mods & {"override", "overrides"}
 
 
-def _action_candidates(model: ProjectModel, t: TypeIR) -> list[tuple[MethodIR, TypeIR]]:
+def action_candidates(model: ProjectModel, t: TypeIR) -> list[tuple[MethodIR, TypeIR]]:
     """(method, declaring type) for each action of the controller, walking from the
     concrete type up through its project base types (nearest first), so actions
     inherited from an abstract / generic base controller are routed under the
@@ -199,7 +199,7 @@ def discover_mvc_webapi(model: ProjectModel) -> list[RouteRef]:
             tmpl = api_tmpl if is_api else mvc_tmpl
         proj = model.project_of(t.file)
         class_anon = has_attr(t.attributes, "AllowAnonymous")
-        for m, decl in _action_candidates(model, t):
+        for m, decl in action_candidates(model, t):
             for path in _attribute_paths(t, m) or [_conventional_path(tmpl, t, m)]:
                 route = Route(
                     path=path, methods=_verbs(m, is_api), handler_name=f"{simple}.{m.name}",
@@ -283,7 +283,7 @@ def _webform_pages(model: ProjectModel, exts: tuple[str, ...] = (".aspx", ".asmx
             if _owner(project_dirs, f) is proj:
                 pages.append((f, proj))
     sites: dict[Path, Project] = {}
-    for f in iter_dnl_files(model.root, exts):
+    for f in model.iter_files(exts):
         if _owner(project_dirs, f) is None:
             d = _site_dir(model.root, f)
             pages.append((f, sites.setdefault(d, Project(name=SITE, path=None, language="cs", dir=d))))
@@ -399,7 +399,7 @@ def _wcf_services(model: ProjectModel) -> list[tuple[str, str, str | None, str, 
     projects = [p for p in model.projects if p.path is not None]
     project_dirs = [(p, p.dir.resolve()) for p in projects]
     sites: dict[Path, Project] = {}
-    for cfg in load_configs(model.root):
+    for cfg in load_configs(model.root, model.owns):
         if cfg.root is None or cfg.is_views:
             continue
         proj = _owner(project_dirs, cfg.path)

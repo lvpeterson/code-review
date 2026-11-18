@@ -6,7 +6,7 @@ using Microsoft.CodeAnalysis.Text;
 namespace RoslynIr;
 
 /// <summary>
-/// Lowers one C# syntax tree to schema-1 FileIR. A CSharpSyntaxWalker finds
+/// Lowers one C# syntax tree to schema-2 FileIR. A CSharpSyntaxWalker finds
 /// the type declarations (nested ones flattened to "Outer.Inner"); members,
 /// statements and expressions are then lowered recursively. Anything without
 /// a mapping becomes other/unknown carrying its source text -- this class
@@ -36,8 +36,11 @@ internal sealed class CSharpLowering
         this.sem = sem;
     }
 
-    public static SyntaxTree Parse(string source, string path) =>
-        CSharpSyntaxTree.ParseText(SourceText.From(source), ParseOptions, path);
+    /// <summary>Parses with the request's preprocessor symbols (none when null), so `#if NETFRAMEWORK`
+    /// style branches follow the project's target framework. The compilation reuses each tree's options.</summary>
+    public static SyntaxTree Parse(string source, string path, IReadOnlyList<string>? defines = null) =>
+        CSharpSyntaxTree.ParseText(SourceText.From(source),
+            defines is { Count: > 0 } ? ParseOptions.WithPreprocessorSymbols(defines) : ParseOptions, path);
 
     public static void WriteFile(IrWriter w, string path, string project, SyntaxTree tree, Semantics? sem)
     {
@@ -50,6 +53,7 @@ internal sealed class CSharpLowering
 
         var lowering = new CSharpLowering(w, text, sem);
         w.BeginFile(path, "cs", project, errors);
+        lowering.TopLevel(root);
         foreach (var (node, ns, name) in collector.Found)
             lowering.Type(node, ns, name);
         w.EndFile();
@@ -86,6 +90,47 @@ internal sealed class CSharpLowering
     };
 
     // -- types and members --------------------------------------------------
+
+    /// <summary>Top-level statements become a synthetic "Program" class with
+    /// one static "&lt;Main&gt;$" method, written before the declared types
+    /// (the language requires global statements to precede them).</summary>
+    void TopLevel(CompilationUnitSyntax root)
+    {
+        var stmts = root.Members.OfType<GlobalStatementSyntax>().Select(g => g.Statement).ToList();
+        if (stmts.Count == 0) return;
+        var j = w.J;
+        int line = Line(stmts[0]);
+        int end = EndLine(stmts[stmts.Count - 1]);
+        j.WriteStartObject();
+        w.Str("name", "Program");
+        w.Str("namespace", "");
+        w.Str("kind", "class");
+        w.StrArray("modifiers", ["static", "partial"]);
+        w.StrArray("bases", []);
+        j.WriteStartArray("attributes"); j.WriteEndArray();
+        j.WriteStartArray("fields"); j.WriteEndArray();
+        j.WriteStartArray("properties"); j.WriteEndArray();
+        w.StrArray("special_members", []);
+        j.WriteStartArray("methods");
+        j.WriteStartObject();
+        w.Str("name", "<Main>$");
+        w.StrArray("modifiers", ["static"]);
+        w.Str("return_type", "void");
+        j.WriteStartArray("params"); j.WriteEndArray();
+        j.WriteStartArray("attributes"); j.WriteEndArray();
+        w.StrArray("handles", []);
+        w.StrArray("implements", []);
+        j.WriteStartArray("body");
+        Seq(stmts);
+        j.WriteEndArray();
+        j.WriteNumber("line", line);
+        j.WriteNumber("end_line", end);
+        j.WriteEndObject();
+        j.WriteEndArray();
+        j.WriteNumber("line", line);
+        j.WriteNumber("end_line", end);
+        j.WriteEndObject();
+    }
 
     void Type(BaseTypeDeclarationSyntax node, string ns, string name)
     {
@@ -152,9 +197,30 @@ internal sealed class CSharpLowering
             j.WriteNumber("line", DeclLine(p, p.AttributeLists));
             j.WriteEndObject();
         }
+        // Positional record parameters declare one property each, unless the
+        // body redeclares that property itself.
+        if (node is RecordDeclarationSyntax { ParameterList: { } rpl })
+        {
+            var declared = members.OfType<PropertyDeclarationSyntax>().Select(p => p.Identifier.ValueText).ToHashSet();
+            foreach (var p in rpl.Parameters)
+            {
+                if (declared.Contains(p.Identifier.ValueText)) continue;
+                j.WriteStartObject();
+                w.Str("name", p.Identifier.ValueText);
+                w.Str("type", p.Type?.ToString());
+                Attributes("attributes", p.AttributeLists);
+                j.WriteNumber("line", DeclLine(p, p.AttributeLists));
+                j.WriteEndObject();
+            }
+        }
         j.WriteEndArray();
 
         j.WriteStartArray("methods");
+        // Primary constructor (class/struct/record): a .ctor with those params;
+        // ": Base(x)" in the base list is its leading base(...) call.
+        if (node is TypeDeclarationSyntax { ParameterList: { } ppl } ptd)
+            Method(ptd, ".ctor", default, null, ppl, default, null, null, null, returnsValue: false,
+                primaryBase: ptd.BaseList?.Types.OfType<PrimaryConstructorBaseTypeSyntax>().FirstOrDefault());
         foreach (var m in members)
         {
             switch (m)
@@ -174,6 +240,22 @@ internal sealed class CSharpLowering
         }
         j.WriteEndArray();
 
+        // Members the IR does not lower; presence only, so convention analysis can fail closed on them.
+        var special = new List<string>();
+        foreach (var m in members)
+        {
+            var kind = m switch
+            {
+                IndexerDeclarationSyntax => "indexer",
+                OperatorDeclarationSyntax or ConversionOperatorDeclarationSyntax => "operator",
+                EventDeclarationSyntax or EventFieldDeclarationSyntax => "event",
+                DestructorDeclarationSyntax => "destructor",
+                _ => null,
+            };
+            if (kind is not null && !special.Contains(kind)) special.Add(kind);
+        }
+        w.StrArray("special_members", special);
+
         j.WriteNumber("line", DeclLine(node, node.AttributeLists));
         j.WriteNumber("end_line", EndLine(node));
         j.WriteEndObject();
@@ -182,7 +264,7 @@ internal sealed class CSharpLowering
     void Method(SyntaxNode node, string name, SyntaxTokenList modifiers, string? returnType,
         ParameterListSyntax parameters, SyntaxList<AttributeListSyntax> attrs, BlockSyntax? body,
         ArrowExpressionClauseSyntax? arrow, ConstructorInitializerSyntax? ctorInit, bool returnsValue,
-        IEnumerable<string>? implements = null)
+        IEnumerable<string>? implements = null, PrimaryConstructorBaseTypeSyntax? primaryBase = null)
     {
         var j = w.J;
         j.WriteStartObject();
@@ -217,6 +299,18 @@ internal sealed class CSharpLowering
             j.WritePropertyName("fn");
             w.Name(ctorInit.ThisOrBaseKeyword.IsKind(SyntaxKind.BaseKeyword) ? "base" : "this", l);
             Args(ctorInit.ArgumentList.Arguments);
+            w.End();
+            w.End();
+        }
+        if (primaryBase is not null)
+        {
+            int l = Line(primaryBase);
+            w.Begin("expr", l);
+            j.WritePropertyName("expr");
+            w.Begin("call", l);
+            j.WritePropertyName("fn");
+            w.Name("base", l);
+            Args(primaryBase.ArgumentList.Arguments);
             w.End();
             w.End();
         }
@@ -479,7 +573,7 @@ internal sealed class CSharpLowering
                 w.Str("type", lf.ReturnType.ToString());
                 j.WritePropertyName("init");
                 w.Begin("lambda", line);
-                LambdaParams(lf.ParameterList.Parameters.Select(p => p.Identifier.ValueText));
+                LambdaParams(lf.ParameterList.Parameters, lf, lf.AttributeLists);
                 j.WritePropertyName("body");
                 LambdaBody(lf.Body, lf.ExpressionBody?.Expression, lf);
                 w.End();
@@ -619,15 +713,20 @@ internal sealed class CSharpLowering
                 w.OptStr("sym", sem?.NameSym(id));
                 w.End();
                 break;
-            case GenericNameSyntax g: w.Name(g.Identifier.ValueText, line); break;
+            case GenericNameSyntax g:
+                w.Begin("name", line);
+                w.Str("id", g.Identifier.ValueText);
+                TypeArgs(g);
+                w.End();
+                break;
             case PredefinedTypeSyntax pt: w.Name(pt.Keyword.ValueText, line); break;
             case ThisExpressionSyntax: w.Name("this", line); break;
             case BaseExpressionSyntax: w.Name("base", line); break;
             case QualifiedNameSyntax q:
-                Member(q.Left, q.Right.Identifier.ValueText, line, q);
+                Member(q.Left, q.Right.Identifier.ValueText, line, q, q.Right);
                 break;
             case MemberAccessExpressionSyntax ma:
-                Member(ma.Expression, ma.Name.Identifier.ValueText, line, ma);
+                Member(ma.Expression, ma.Name.Identifier.ValueText, line, ma, ma.Name);
                 break;
 
             case ConditionalAccessExpressionSyntax ca:
@@ -636,7 +735,7 @@ internal sealed class CSharpLowering
                 finally { receivers.Pop(); }
                 break;
             case MemberBindingExpressionSyntax mb when receivers.Count > 0:
-                WithReceiver(recv => Member(recv, mb.Name.Identifier.ValueText, line, mb));
+                WithReceiver(recv => Member(recv, mb.Name.Identifier.ValueText, line, mb, mb.Name));
                 break;
             case ElementBindingExpressionSyntax eb when receivers.Count > 0:
                 WithReceiver(recv => Index(recv, eb.ArgumentList.Arguments, line, eb));
@@ -667,6 +766,42 @@ internal sealed class CSharpLowering
                 break;
             case InitializerExpressionSyntax ai when ai.IsKind(SyntaxKind.ArrayInitializerExpression):
                 New(ai, null, null, ai, line);
+                break;
+            case CollectionExpressionSyntax ce:
+                // [a, ..b]: an untyped new; a spread contributes its inner expression.
+                w.Begin("new", line);
+                w.Str("type", null);
+                j.WriteStartArray("args");
+                j.WriteEndArray();
+                InitEntries(ce.Elements.Select(el => el switch
+                {
+                    ExpressionElementSyntax ee => ee.Expression,
+                    SpreadElementSyntax sp => sp.Expression,
+                    _ => null,
+                }).OfType<ExpressionSyntax>());
+                w.OptStr("type_full", sem?.ExprType(ce));
+                w.End();
+                break;
+            case SwitchExpressionSyntax se when se.Arms.Count > 0:
+                SwitchArms(se, 0);
+                break;
+            case IsPatternExpressionSyntax ip:
+                w.Begin("bin", line);
+                w.Str("op", "is");
+                ExprProp("l", ip.Expression);
+                j.WritePropertyName("r");
+                w.Text("unknown", Line(ip.Pattern), ip.Pattern.ToString());
+                w.End();
+                break;
+            case WithExpressionSyntax we:
+                w.Begin("new", line);
+                w.Str("type", null);
+                j.WriteStartArray("args");
+                Expr(we.Expression);
+                j.WriteEndArray();
+                InitEntries(we.Initializer.Expressions);
+                w.OptStr("type_full", sem?.ExprType(we));
+                w.End();
                 break;
             case AnonymousObjectCreationExpressionSyntax an:
                 w.Begin("new", line);
@@ -720,11 +855,15 @@ internal sealed class CSharpLowering
                 w.Begin("lambda", line);
                 LambdaParams(fn switch
                 {
-                    SimpleLambdaExpressionSyntax sl => new[] { sl.Parameter.Identifier.ValueText },
-                    ParenthesizedLambdaExpressionSyntax pl => pl.ParameterList.Parameters.Select(p => p.Identifier.ValueText),
-                    AnonymousMethodExpressionSyntax am when am.ParameterList is not null =>
-                        am.ParameterList.Parameters.Select(p => p.Identifier.ValueText),
+                    SimpleLambdaExpressionSyntax sl => new[] { sl.Parameter },
+                    ParenthesizedLambdaExpressionSyntax pl => pl.ParameterList.Parameters,
+                    AnonymousMethodExpressionSyntax am when am.ParameterList is not null => am.ParameterList.Parameters,
                     _ => [],
+                }, fn, fn switch
+                {
+                    SimpleLambdaExpressionSyntax sl => sl.AttributeLists,
+                    ParenthesizedLambdaExpressionSyntax pl => pl.AttributeLists,
+                    _ => default,
                 });
                 j.WritePropertyName("body");
                 LambdaBody(fn.Block, fn.ExpressionBody, fn);
@@ -748,11 +887,19 @@ internal sealed class CSharpLowering
 
     /// <summary>member node; symNode is the syntax the symbol binds to (the
     /// access itself, or the ?. member binding).</summary>
-    void Member(ExpressionSyntax obj, string name, int line, ExpressionSyntax symNode)
+    /// <summary>Optional "targs": the type arguments of a generic name, as written.</summary>
+    void TypeArgs(SimpleNameSyntax? n)
+    {
+        if (n is GenericNameSyntax g && g.TypeArgumentList.Arguments.Count > 0)
+            w.StrArray("targs", g.TypeArgumentList.Arguments.Select(a => a.ToString()));
+    }
+
+    void Member(ExpressionSyntax obj, string name, int line, ExpressionSyntax symNode, SimpleNameSyntax? nameNode = null)
     {
         w.Begin("member", line);
         ExprProp("obj", obj);
         w.Str("name", name);
+        TypeArgs(nameNode);
         w.OptStr("sym", sem?.MemberSym(symNode));
         w.End();
     }
@@ -814,20 +961,42 @@ internal sealed class CSharpLowering
         if (args is { } list)
             foreach (var a in list) Expr(a.Expression);
         j.WriteEndArray();
-        j.WriteStartArray("init");
-        if (init is not null)
-        {
-            foreach (var e in init.Expressions)
-            {
-                // { A = 1 } carries a member name; collection/array elements do not.
-                if (e is AssignmentExpressionSyntax a && a.IsKind(SyntaxKind.SimpleAssignmentExpression))
-                    InitEntry(a.Left is IdentifierNameSyntax n ? n.Identifier.ValueText : a.Left.ToString(), a.Right);
-                else
-                    InitEntry(null, e);
-            }
-        }
-        j.WriteEndArray();
+        InitEntries(init?.Expressions);
         w.OptStr("type_full", sem?.ExprType(node));
+        w.End();
+    }
+
+    /// <summary>The "init" array: { A = 1 } entries carry a member name,
+    /// collection/array elements do not.</summary>
+    void InitEntries(IEnumerable<ExpressionSyntax>? exprs)
+    {
+        w.J.WriteStartArray("init");
+        foreach (var e in exprs ?? [])
+        {
+            if (e is AssignmentExpressionSyntax a && a.IsKind(SyntaxKind.SimpleAssignmentExpression))
+                InitEntry(a.Left is IdentifierNameSyntax n ? n.Identifier.ValueText : a.Left.ToString(), a.Right);
+            else
+                InitEntry(null, e);
+        }
+        w.J.WriteEndArray();
+    }
+
+    /// <summary>Switch expression arms i.. as nested cond: t = arm value, f = the
+    /// remaining arms; the last arm contributes just its value. Guards are dropped.</summary>
+    void SwitchArms(SwitchExpressionSyntax sw, int i)
+    {
+        var arm = sw.Arms[i];
+        if (i == sw.Arms.Count - 1) { Expr(arm.Expression); return; }
+        if (w.AtDepthCap)
+        {
+            w.Text("unknown", Line(arm), text.ToString(TextSpan.FromBounds(arm.SpanStart, sw.Arms[sw.Arms.Count - 1].Span.End)));
+            return;
+        }
+        w.Begin("cond", Line(arm));
+        ExprProp("c", sw.GoverningExpression);
+        ExprProp("t", arm.Expression);
+        w.J.WritePropertyName("f");
+        SwitchArms(sw, i + 1);
         w.End();
     }
 
@@ -846,14 +1015,34 @@ internal sealed class CSharpLowering
         _ => null,
     };
 
-    /// <summary>Lambda body: Stmt list for a block (or an assignment expression), else a single Expr.</summary>
-    /// <summary>Optional `params` key of a lambda: its parameter names, omitted when it has none.</summary>
-    void LambdaParams(IEnumerable<string> names)
+    /// <summary>Optional `params` key of a lambda: its parameter names, omitted when it has none,
+    /// plus "param_info" (type, attributes, modifiers per parameter), the lambda's own optional
+    /// "attributes" (`[Authorize] () => ..`, omitted when there are none) and the
+    /// lambda's "end_line".</summary>
+    void LambdaParams(IEnumerable<ParameterSyntax> ps, SyntaxNode node, SyntaxList<AttributeListSyntax> attrs)
     {
-        var list = names.ToList();
-        if (list.Count > 0) w.StrArray("params", list);
+        var list = ps.ToList();
+        if (list.Count > 0)
+        {
+            var j = w.J;
+            w.StrArray("params", list.Select(p => p.Identifier.ValueText));
+            j.WriteStartArray("param_info");
+            foreach (var p in list)
+            {
+                j.WriteStartObject();
+                w.Str("name", p.Identifier.ValueText);
+                w.Str("type", p.Type?.ToString());
+                Attributes("attributes", p.AttributeLists);
+                w.StrArray("modifiers", p.Modifiers.Select(m => m.ValueText.ToLowerInvariant()));
+                j.WriteEndObject();
+            }
+            j.WriteEndArray();
+        }
+        if (attrs.Count > 0) Attributes("attributes", attrs);
+        w.J.WriteNumber("end_line", EndLine(node));
     }
 
+    /// <summary>Lambda body: Stmt list for a block (or an assignment expression), else a single Expr.</summary>
     void LambdaBody(BlockSyntax? block, ExpressionSyntax? expr, SyntaxNode fallback)
     {
         if (block is null && expr is not null && expr is not AssignmentExpressionSyntax)

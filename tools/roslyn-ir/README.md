@@ -1,7 +1,7 @@
 # roslyn-ir
 
 A small .NET 8 console tool that parses C# and VB.NET sources with Roslyn and
-emits a JSON IR (schema 1) for the `dotnet_legacy` analyzer. The Python side
+emits a JSON IR (schema 2) for the `dotnet` and `dotnet_legacy` analyzers. The Python side
 (`checks/dnl/`) drives it as a subprocess; this is the only C# code in the repo.
 
 ## Build
@@ -35,10 +35,17 @@ data: its `v4.8/*.dll` and `v4.8/Facades/*.dll` are copied flat into
 them from `AppContext.BaseDirectory`, never from a Windows reference-assembly
 path or the GAC, so semantic resolution works the same on Linux.
 
+A second profile, `netcore`, serves SDK-style ASP.NET Core projects. The
+`Microsoft.NETCore.App.Ref` and `Microsoft.AspNetCore.App.Ref` packages (both
+pinned to `[8.0.11]`) are DotnetPlatform packages, so the csproj uses
+`PackageDownload` (a `PackageReference` fails with NU1213) and copies
+`ref/net8.0/*.dll` from the NuGet cache (lower-case package folders) flat into
+`refs/netcore/` next to the binary. The SDK's own `packs/` folder is never used.
+
 ## CLI contract
 
 - `roslyn-ir probe` -- parses, compiles and lowers one embedded C# and one
-  embedded VB snippet (no target files), then writes `{"ok":true,"schema":1}` and exits 0. Any failure exits non-zero, including a missing or empty `refs/net48` (stderr says to republish).
+  embedded VB snippet (no target files), plus one ASP.NET Core snippet compiled with the `netcore` profile, then writes `{"ok":true,"schema":2}` and exits 0. Any failure exits non-zero, including a missing or empty `refs/net48` or `refs/netcore` (stderr names the folder and says to republish).
 - `roslyn-ir parse --input <request.json>` -- request:
 
   ```json
@@ -50,10 +57,20 @@ path or the GAC, so semantic resolution works the same on Linux.
   only): extra global imports added to the template defaults, for namespaces a
   `.vbproj` imports project-wide. Invalid entries are skipped.
 
+  A project may also carry `"refs": "net48" | "netcore"` (default `"net48"`;
+  an unknown name falls back to `net48` with a stderr warning) choosing the
+  reference-assembly folder, and `"global_usings": ["Microsoft.AspNetCore.Http", ...]`
+  (C# only): namespaces compiled as `global using` directives, standing in for
+  an SDK project's implicit usings. `"defines": ["NET8_0", "TRACE", ...]` (C# only)
+  sets the preprocessor symbols of that entry's parse, so `#if` branches are
+  lowered the way the build sees them. A multi-targeted project is sent as two
+  entries over the same files (one per profile, each with its own `refs` and
+  `defines`); the Python model routes each IR back to the right package.
+
   Writes JSON Lines to stdout, one object per file, in input order. A file that
   cannot be read or lowered yields `{"path": rel, "error": "<message>"}` and the
   run continues. stdout carries only JSON; diagnostics go to stderr.
-  Each project is compiled once (its own files plus `refs/net48`); `references`
+  Each project is compiled once (its own files plus the selected `refs/net48` or `refs/netcore` profile); `references`
   (project-to-project) is accepted but ignored -- cross-project resolution is
   the Python model's job. If semantic lowering of a file throws, it is retried
   syntax-only before falling back to an error record.
@@ -61,13 +78,15 @@ path or the GAC, so semantic resolution works the same on Linux.
 Exit codes: 0 ok (even with per-file errors), 1 fatal (bad request, probe
 failure), 2 usage.
 
-## IR summary (schema 1)
+## IR summary (schema 2)
 
 - FileIR: `path` (relative to `root`, forward slashes), `language` (`cs`|`vb`),
   `project`, `parse_errors` (count of Roslyn error diagnostics), `types`.
 - Type: `name`, `namespace`, `kind` (`class`|`interface`|`struct`|`module`|`enum`),
   `modifiers`, `bases` (simple names), `attributes`, `fields`, `properties`,
-  `methods`, `line`, `end_line`. Nested types are flattened as `Outer.Inner`.
+  `methods`, `special_members`, `line`, `end_line`. `special_members` lists the
+  member kinds the IR does not lower (`indexer`, `operator`, `event`, `destructor`;
+  presence only, C# types), so convention analysis can fail closed on them. Nested types are flattened as `Outer.Inner`.
 - Attr: `name` (qualifier and `Attribute` suffix stripped), `args`, `named`, `line`.
 - Field: `name`, `type`, `line`, `init`, `is_const`. Enum members are const fields.
 - Prop: `name`, `type`, `attributes`, `line`, and optional `get` / `set` (Stmt
@@ -85,13 +104,39 @@ failure), 2 usage.
   `byval`, `paramarray`, `optional`),
   `attributes`, `handles` (VB `Handles`), `implements` (VB method-level `Implements` targets, or the C# explicit interface
   implementation, as `IFoo.Bar`), `body`, `line`, `end_line`.
+- Generic names: a `name` or `member` Expr built from a generic name (`MapHub<ChatHub>`,
+  `UseStartup<Startup>`) also carries `targs`, the type arguments as written
+  (`["ChatHub"]`); `name` / `id` stay the bare identifier. The key is absent for non-generic names.
+- Synthetic top-level type: a C# file with top-level statements gets one extra type
+  written before the declared ones: `Program` (namespace empty, modifiers `static`,
+  `partial`) with a single static method `<Main>$` (`void`, no params) whose `body` is
+  the lowered statements and whose `line` / `end_line` span them. A hand-written
+  `partial class Program` in the same file stays a separate type record.
+- Primary constructors: a class, struct or record with a parameter list gets a `.ctor`
+  method (first in `methods`, no modifiers, null `return_type`, those `params`); a
+  `: Base(args)` in the base list becomes its leading `base(args)` call statement.
+  Positional record parameters also become properties (`{name, type, attributes, line}`,
+  no accessors), except those the record body declares itself.
 - Stmt `k`: `local`, `assign` (`op` is `=`, `+=`, `-=` or `concat=`; other
   compound ops lower to `=` with a `bin` value), `expr`, `return`, `throw`,
   `if`, `loop`, `try`, `using`, `with`, `other {text}`.
 - Expr `k`: `lit`, `name`, `member`, `call`, `new`, `bin`, `interp`, `cond`,
   `index` (C# only), `cast`, `lambda`, `unary {op, e}`, `unknown {text}`.
-  `lambda {body, params?}`: `body` is an Expr or a Stmt list, `params` the lowered
-  parameter names (omitted when there are none).
+  `lambda {body, params?, param_info?, attributes?, end_line}`: `body` is an Expr or a Stmt list,
+  `params` the lowered parameter names and `param_info` one `{name, type, attributes,
+  modifiers}` per parameter (`type` null when implicit, `modifiers` lowercased, possibly
+  empty); both omitted when there are no parameters. `attributes` is the lambda's (or local
+  function's) own attribute list, `[Authorize] () => ..`, omitted when there is none. `end_line` is the lambda's last line
+  and is always present. A local function lowers as a `local` whose `init` is a lambda.
+  Modern C# shapes (all syntactic, so identical with or without a reference profile):
+  a collection expression `[a, ..b]` is an untyped `new` (`type` null, no `args`) whose
+  `init` entries are the elements (a spread contributes its inner expression); a switch
+  expression is nested `cond` (`c` the governing expression, `t` an arm value, `f` the
+  remaining arms, the last arm contributing just its value; guards are dropped); an
+  `is` pattern is `bin {op: "is"}` whose right side is `unknown {text}` holding the
+  pattern (a plain `x is Type` keeps the type as an Expr); `x with { A = 1 }` is an
+  untyped `new` whose `args` is `[x]` and whose `init` entries are the assignments. A raw
+  string literal is a `lit` with the indentation of its closing line removed.
   `unary` ops: C# `!`, `-`, `~`, `++`, `--` (prefix and postfix alike), VB `Not`, `-`;
   a negated numeric literal still folds to a `lit`.
 

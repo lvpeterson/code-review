@@ -161,7 +161,7 @@ def global_filters(model: ProjectModel) -> list[GlobalFilter]:
 def chain_for_model(model: ProjectModel) -> Callable[[RouteRef], list[ET.Element]]:
     """Config chain per route: MVC URLs are not physical paths, so the app
     root config (the project dir) is both app_dir and page_dir."""
-    configs = load_configs(model.root)
+    configs = load_configs(model.root, model.owns)
 
     def chain_for(ref: RouteRef) -> list[ET.Element]:
         if ref.project is None:

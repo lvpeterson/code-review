@@ -84,10 +84,11 @@ def parse_xml_with_lines(text: str, origin: str) -> ET.Element:
     return root[0]
 
 
-def load_configs(root: Path) -> list[WebConfig]:
+def load_configs(root: Path, owns=None) -> list[WebConfig]:
     """Load every web.config under root; sibling web.<Name>.config files are
-    parsed as XDT transforms for it. Malformed files are reported in .error."""
-    files = list(iter_dnl_files(root, (".config",)))
+    parsed as XDT transforms for it. Malformed files are reported in .error.
+    `owns` (ProjectModel.owns) drops files another package's project holds."""
+    files = [f for f in iter_dnl_files(root, (".config",)) if owns is None or owns(f)]
     out: list[WebConfig] = []
     for p in files:
         if p.name.lower() != "web.config":

@@ -82,8 +82,17 @@ def test_probe_nonzero_and_schema_mismatch(monkeypatch, tmp_path):
     with pytest.raises(helper.PreflightError, match="outdated"):
         helper.probe(tmp_path / "roslyn-ir")
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(
-        a, 0, '{"ok": true, "schema": 1}', ""))
+        a, 0, '{"ok": true, "schema": 2}', ""))
     helper.probe(tmp_path / "roslyn-ir")
+
+
+def test_probe_rejects_schema_1(monkeypatch, tmp_path):
+    # An old published helper (schema 1) lacks the netcore profile; refuse it.
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(
+        a, 0, '{"ok": true, "schema": 1}', ""))
+    with pytest.raises(helper.PreflightError) as e:
+        helper.probe(tmp_path / "roslyn-ir")
+    assert "schema 1" in str(e.value) and "expected 2" in str(e.value)
 
 
 def test_parse_projects_single_process(monkeypatch, tmp_path):

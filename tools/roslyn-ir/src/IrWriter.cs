@@ -6,13 +6,13 @@ namespace RoslynIr;
 
 /// <summary>
 /// Shared JSON emitter for both lowerers. Wraps a Utf8JsonWriter with the
-/// handful of shapes the schema-1 IR uses (Expr/Stmt objects carry "k" and
+/// handful of shapes the schema-2 IR uses (Expr/Stmt objects carry "k" and
 /// "line"), and owns the language-neutral normalizations (modifiers,
 /// attribute names) so C# and VB produce identical IR for identical intent.
 /// </summary>
 internal sealed class IrWriter
 {
-    public const int Schema = 1;
+    public const int Schema = 2;
 
     // Relaxed escaping keeps non-ASCII text readable; quotes and control
     // characters are still escaped, so each record stays a single line.

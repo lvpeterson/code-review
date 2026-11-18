@@ -63,3 +63,13 @@ def test_print_console_omits_entry_points_section_when_none(capsys):
     print_console([result])
     out = capsys.readouterr().out
     assert "entry points found" not in out
+
+
+def test_console_marks_unknown_auth_distinct_from_unprotected(capsys):
+    from core.models import Route
+    unk = Route("/u", ["GET"], "H.U", "a.cs", 1, meta={"auth": {"state": "unknown"}})
+    unp = Route("/p", ["GET"], "H.P", "a.cs", 2, meta={"auth": {"state": "unprotected"}})
+    print_console([ScanResult(language="dotnet", framework="controllers", routes=[unk, unp])])
+    out = capsys.readouterr().out
+    assert "/u -> H.U  (a.cs:1)  auth=?" in out
+    assert "/p -> H.P  (a.cs:2)  auth=-" in out

@@ -5,9 +5,11 @@ using Microsoft.CodeAnalysis;
 namespace RoslynIr;
 
 /// <summary>
-/// roslyn-ir CLI (IR schema 1).
-///   roslyn-ir probe                     -> {"ok": true, "schema": 1}
+/// roslyn-ir CLI (IR schema 2).
+///   roslyn-ir probe                     -> {"ok": true, "schema": 2}
 ///   roslyn-ir parse --input req.json    -> one FileIR JSON object per line on stdout
+/// Per-project request keys: refs ("net48" default | "netcore"), global_usings
+/// (C# namespaces), imports (VB global imports); "references" is ignored.
 /// stdout carries only JSON Lines; diagnostics go to stderr.
 /// </summary>
 internal static class Program
@@ -58,24 +60,33 @@ internal static class Program
 
         // A publish without refs/net48 would still "work" but resolve no
         // symbols, silently weakening every rule; make it loud instead.
-        if (Semantics.RefCount == 0)
-        {
-            Console.Error.WriteLine("roslyn-ir: probe failed: no reference assemblies loaded from "
-                + Path.Combine(AppContext.BaseDirectory, "refs", "net48")
-                + "; republish the helper (dotnet publish tools/roslyn-ir/src/RoslynIr.csproj -c Release -o tools/roslyn-ir/bin)");
-            return ExitFatal;
-        }
+        foreach (var prof in new[] { "net48", "netcore" })
+            if (Semantics.RefCount(prof) == 0)
+            {
+                Console.Error.WriteLine("roslyn-ir: probe failed: no reference assemblies loaded from "
+                    + Path.Combine(AppContext.BaseDirectory, "refs", prof)
+                    + "; republish the helper (dotnet publish tools/roslyn-ir/src/RoslynIr.csproj -c Release -o tools/roslyn-ir/bin)");
+                return ExitFatal;
+            }
+
+        const string csCore =
+            "using Microsoft.AspNetCore.Mvc; [ApiController] public class C : ControllerBase " +
+            "{ public IActionResult A() => Ok(); }\n";
 
         // Exercises the full semantic path (reference loading, compilation,
         // annotation) on the snippets; no target files are involved.
-        foreach (var (lang, src) in new[] { ("cs", cs), ("vb", vb) })
+        foreach (var (lang, src, prof) in new[] { ("cs", cs, "net48"), ("vb", vb, "net48"), ("cs", csCore, "netcore") })
         {
             var tree = ParseTree(lang, src, "probe");
-            var compilation = Semantics.Compile(lang, "probe", [tree]);
+            var compilation = Semantics.Compile(lang, "probe", [tree], null, prof);
             var bytes = LowerToBytes(lang, "probe", "probe", tree, Semantics.For(compilation, tree));
             using var doc = JsonDocument.Parse(bytes);
             if (doc.RootElement.GetProperty("types").GetArrayLength() != 1)
                 throw new InvalidOperationException($"probe: {lang} snippet lowered to an unexpected shape");
+            // A half-populated refs/netcore would compile but resolve nothing: require the symbol.
+            if (prof == "netcore" && !Encoding.UTF8.GetString(bytes).Contains("\"Microsoft.AspNetCore.Mvc.ControllerBase.Ok\""))
+                throw new InvalidOperationException("probe: netcore snippet did not resolve Microsoft.AspNetCore.Mvc.ControllerBase.Ok; "
+                    + "refs/netcore looks incomplete, republish the helper");
         }
 
         using var stdout = Console.OpenStandardOutput();
@@ -96,13 +107,29 @@ internal static class Program
             string name = project.GetProperty("name").GetString() ?? "";
             string language = project.GetProperty("language").GetString() ?? "";
             // "references" (project-to-project) is accepted but ignored: the
-            // compilation sees only this project's files plus refs/net48.
+            // compilation sees only this project's files plus the selected refs profile
+            // (refs/net48 or refs/netcore).
 
             // Optional extra VB global imports, added to the template defaults.
             var imports = new List<string>();
             if (project.TryGetProperty("imports", out var imps) && imps.ValueKind == JsonValueKind.Array)
                 foreach (var i in imps.EnumerateArray())
                     if (i.GetString() is { Length: > 0 } ns) imports.Add(ns);
+
+            // Optional reference profile ("net48" default, or "netcore") and
+            // C# global usings (namespaces) for SDK-style implicit usings.
+            string profile = project.TryGetProperty("refs", out var rf) && rf.ValueKind == JsonValueKind.String
+                ? rf.GetString() ?? "net48" : "net48";
+            var usings = new List<string>();
+            if (project.TryGetProperty("global_usings", out var gus) && gus.ValueKind == JsonValueKind.Array)
+                foreach (var g in gus.EnumerateArray())
+                    if (g.GetString() is { Length: > 0 } gns) usings.Add(gns);
+
+            // Optional C# preprocessor symbols (the target framework's, plus DefineConstants).
+            var defines = new List<string>();
+            if (project.TryGetProperty("defines", out var defs) && defs.ValueKind == JsonValueKind.Array)
+                foreach (var d in defs.EnumerateArray())
+                    if (d.GetString() is { Length: > 0 } dn) defines.Add(dn);
 
             // Pass 1: read and parse every file; a failure costs only that file.
             var files = new List<(string Rel, SyntaxTree? Tree, string? Error)>();
@@ -113,7 +140,7 @@ internal static class Program
                 try
                 {
                     string source = SourceDecoder.Decode(File.ReadAllBytes(Path.Combine(root, file)));
-                    files.Add((rel, ParseTree(language, source, rel), null));
+                    files.Add((rel, ParseTree(language, source, rel, defines), null));
                 }
                 catch (Exception ex)
                 {
@@ -124,7 +151,7 @@ internal static class Program
 
             // One compilation per project, one SemanticModel per tree.
             var trees = files.Where(x => x.Tree is not null).Select(x => x.Tree!).ToList();
-            var compilation = trees.Count > 0 ? Semantics.Compile(language, name, trees, imports) : null;
+            var compilation = trees.Count > 0 ? Semantics.Compile(language, name, trees, imports, profile, usings) : null;
 
             // Pass 2: lower in request order.
             foreach (var (rel, tree, error) in files)
@@ -166,9 +193,9 @@ internal static class Program
         }
     }
 
-    static SyntaxTree ParseTree(string language, string source, string path) => language switch
+    static SyntaxTree ParseTree(string language, string source, string path, IReadOnlyList<string>? defines = null) => language switch
     {
-        "cs" => CSharpLowering.Parse(source, path),
+        "cs" => CSharpLowering.Parse(source, path, defines),
         "vb" => VbLowering.Parse(source, path),
         _ => throw new NotSupportedException($"unsupported language '{language}' (expected cs or vb)"),
     };
