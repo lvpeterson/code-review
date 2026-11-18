@@ -1053,3 +1053,58 @@ def test_identity_options_via_add_options_and_configure_options(tmp_path, mode):
     assert ("DNL-SEC-005", "medium", None) in ids(f)
     f = scan(tmp_path / "b", prog("builder.Services.AddOptions<OtherOptions>().Configure(o => { o.Password.RequiredLength = 4; });"), mode)
     assert not sec(f, *IDS_ID)
+
+
+# -- final fix wave: byte[] signing key, cookie registrations -------------------------------------------
+
+LIT = "super-secret-signing-key-123456"
+
+
+def test_symmetric_key_byte_array_local(tmp_path, mode):
+    files = prog(f'var key = Encoding.UTF8.GetBytes("{LIT}");\nvar k = new SymmetricSecurityKey(key);')
+    assert tok(scan(tmp_path / "a", files, mode), "DNL-SEC-004") == {("DNL-SEC-004", "high", None)}
+    files = prog(f'var key = Convert.FromBase64String("c3VwZXItc2VjcmV0LXNpZ25pbmcta2V5");\n'
+                 "var k = new SymmetricSecurityKey(key);")
+    assert tok(scan(tmp_path / "b", files, mode), "DNL-SEC-004") == {("DNL-SEC-004", "high", None)}
+
+
+def test_symmetric_key_byte_array_field(tmp_path, mode):
+    files = {"Maker.cs": f'public class Maker {{ private static readonly byte[] K = Encoding.UTF8.GetBytes("{LIT}");\n'
+                         "public object Make() => new SymmetricSecurityKey(K); }\n"}
+    assert tok(scan(tmp_path, files, mode), "DNL-SEC-004") == {("DNL-SEC-004", "high", None)}
+
+
+def test_symmetric_key_byte_array_not_pure_literal_is_review(tmp_path, mode):
+    for i, src in enumerate((f'Encoding.UTF8.GetBytes("{LIT}" + suffix)',
+                             f'Encoding.UTF8.GetBytes($"{LIT}-{{suffix}}")')):
+        files = prog(f"var key = {src};\nvar k = new SymmetricSecurityKey(key);")
+        assert tok(scan(tmp_path / str(i), files, mode), "DNL-SEC-004") == {("DNL-SEC-004", "high", "REVIEW")}, src
+
+
+def test_symmetric_key_byte_array_from_config_is_silent(tmp_path, mode):
+    for i, src in enumerate(('Encoding.UTF8.GetBytes(config["Jwt:Key"])', "Encoding.UTF8.GetBytes(secret)",
+                             'Convert.FromBase64String(config["Jwt:Key"])')):
+        files = prog(f"var key = {src};\nvar k = new SymmetricSecurityKey(key);")
+        assert not tok(scan(tmp_path / str(i), files, mode), "DNL-SEC-004"), src
+
+
+def test_symmetric_key_byte_array_reassigned_is_review(tmp_path, mode):
+    files = prog(f'var key = Encoding.UTF8.GetBytes("{LIT}");\nkey = Convert.FromBase64String(config["Jwt:Key"]);\n'
+                 "var k = new SymmetricSecurityKey(key);")
+    assert tok(scan(tmp_path, files, mode), "DNL-SEC-004") == {("DNL-SEC-004", "high", "REVIEW")}
+
+
+def test_csrf001_microsoft_identity_web_app_is_cookie_auth(tmp_path, mode):
+    for i, svc in enumerate(('builder.Services.AddAuthentication(OpenIdConnectDefaults.AuthenticationScheme)'
+                             '.AddMicrosoftIdentityWebApp(builder.Configuration.GetSection("AzureAd"));\n',
+                             "builder.Services.AddIdentityApiEndpoints<IdentityUser>();\n")):
+        f = scan(tmp_path / str(i), mvc(ctl=SAVE, services=svc), mode)
+        assert ("DNL-CSRF-001", "medium", None) in af(f), svc
+
+
+def test_csrf001_open_id_connect_without_cookie_is_review(tmp_path, mode):
+    svc = 'builder.Services.AddAuthentication("oidc").AddOpenIdConnect("oidc", o => { o.Authority = "https://idp.example"; });\n'
+    f = scan(tmp_path / "a", mvc(ctl=SAVE, services=svc), mode)
+    assert af(f) == {("DNL-CSRF-001", "medium", "REVIEW")}
+    f = scan(tmp_path / "b", mvc(ctl=SAVE, services=svc.replace(");\n", ").AddCookie();\n")), mode)
+    assert ("DNL-CSRF-001", "medium", None) in af(f)

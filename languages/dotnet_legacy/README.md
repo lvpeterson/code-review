@@ -446,13 +446,16 @@ symmetric signing key (`DNL-SEC-004`).
   works from `[ApiVersion]` attributes and a leading `/v<N>` path segment and says so in one route-less
   REVIEW per pipeline. `HasDeprecatedApiVersion` is matched to a controller by its simple type name,
   without namespace or project scoping.
+- The path version of a route (INV-004) is only the first segment after an optional leading `api`
+  (`/v1/orders`, `/api/v2/orders`): `/internal/v2/orders` and `/orders/v1` carry no version.
 - RES-005 follows a size parameter through one local and the common clamps. A cap that is carried only
   through an unreadable source file, a truncated read, or a tuple / positional / property case pattern
   that shadows a class constant can still give a clean result (a low-severity heuristic; an unreadable
   source with a recognised `switch` already fails closed).
 - CORS: a policy name that is not a literal in `UseCors(name)` / `[EnableCors(Const)]` is not matched to
   its policy while any policy exists; a wildcard policy is reported at its definition either way.
-- SEC-004 reads a literal key through constants and fields; a field reassigned from another type is
+- SEC-004 reads a literal key through constants, fields and a `byte[]` local or field initialised from one
+  (`Encoding.*.GetBytes`, `Convert.From*String`); a field reassigned from another type is
   matched by name across the solution (over-REVIEW, not under).
 - Secrets: URL credentials (`https://user:pw@host`), `AccountKey` / `Passphrase` style keys and
   keyword-prefixed names such as `Data-Password` are not detected, and a whole-value `keyvault:..`

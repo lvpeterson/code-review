@@ -57,17 +57,54 @@ class Ctx:
                 if (not names or c.name in names) and (not kinds or c.kind in kinds)]
 
 
+def _scope_of(ctx: Ctx, pipe: Pipeline) -> str | None:
+    """The settings scope of a pipeline's project: its directory relative to the model root ("" = the
+    root), or None when no appsettings file sits there (effective() must never get an unknown scope)."""
+    if pipe.project is None or ctx.settings is None:
+        return None
+    rel = ctx.model.rel(pipe.project.dir)
+    scope = "" if rel in (".", "") else rel
+    return scope if scope in ctx.settings.scopes() else None
+
+
+def note_unclaimed_scopes(ctx: Ctx) -> None:
+    """One model note listing the appsettings directories that no web project claims: the configuration
+    rules (CFG-008/012/013/014, RES-001) read settings through a project's own scope, so they never see
+    these files. The secrets rules scan every file regardless."""
+    if ctx.settings is None:
+        return
+    claimed = {_scope_of(ctx, p) for p in ctx.pipes}
+    lost = [s or "." for s in ctx.settings.scopes() if s not in claimed]
+    for d in lost:
+        note = (f"appsettings in {d} is not read by the configuration rules: no web project claims it; "
+                "secrets rules still scan it")
+        if note not in ctx.model.notes:
+            ctx.model.notes.append(note)
+
+
+def load_settings_once(model: ProjectModel):
+    """One settings load per model: it appends a note per malformed file, so it must not repeat."""
+    settings = model.cache.get("appsettings")
+    if settings is None:
+        settings = model.cache["appsettings"] = load_settings(model)
+    return settings
+
+
 def build_ctx(model: ProjectModel, refs: list[CoreRouteRef]) -> Ctx:
-    """One pipeline per netcore project; a project with no entry point (a library) has none."""
+    """One pipeline per netcore project; a project with no entry point (a library) has none. A project whose
+    pipeline cannot be built is dropped with a model note: it must not take the other projects down."""
     pipes = []
     for proj in model.projects:
         if proj.owner != "dotnet":
             continue
-        pipe = pipeline_for(model, proj)
+        try:
+            pipe = pipeline_for(model, proj)
+        except Exception as exc:  # noqa: BLE001
+            note = (f"pipeline of {model.rel(proj.dir)} could not be built ({type(exc).__name__}: {exc}); "
+                    "the configuration rules skip it")
+            if note not in model.notes:
+                model.notes.append(note)
+            continue
         if pipe.style != "none":
             pipes.append(pipe)
-    # One settings load per model: it appends a note per malformed file, so it must not repeat.
-    settings = model.cache.get("appsettings")
-    if settings is None:
-        settings = model.cache["appsettings"] = load_settings(model)
-    return Ctx(model, refs, pipes, settings)
+    return Ctx(model, refs, pipes, load_settings_once(model))

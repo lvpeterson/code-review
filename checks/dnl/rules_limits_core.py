@@ -22,12 +22,12 @@ from __future__ import annotations
 import json
 import re
 
-from checks.dnl.cfgctx import Ctx
+from checks.dnl.cfgctx import Ctx, _scope_of
 from checks.dnl.ir import attr_key, call_name, receiver_text, walk
 from checks.dnl.options import UNKNOWN, lambda_args, opaque_reason, options_of, verdict
 from checks.dnl.pipeline import Pipeline
 from checks.dnl.routes_core import CoreRouteRef, _chain_types
-from checks.dnl.rules_pipeline_auth import _env_state, _scope_of
+from checks.dnl.rules_pipeline_auth import _env_state
 
 _MIB = 1024 * 1024
 _LIMIT = 100 * _MIB                     # a request body above this is reported
@@ -506,6 +506,26 @@ def _owns(ctx: Ctx, pipe: Pipeline, ref: CoreRouteRef) -> bool:
     return ref.project is pipe.project or (ref.project is None and len(ctx.pipes) == 1)
 
 
+def _global_limiter(ctx: Ctx, pipe: Pipeline) -> str:
+    """"yes" | "maybe" | "no": is a `GlobalLimiter` assigned in the rate limiter options, in AddRateLimiter,
+    `Configure<RateLimiterOptions>` or UseRateLimiter's own options? "maybe" for a conditional assignment or
+    options that cannot be read (a method group, a variable): not proven either way."""
+    verdicts: list[str] = []
+    calls = [c for c in ctx.prod_calls(pipe, "AddRateLimiter", "UseRateLimiter", "Configure", "PostConfigure")
+             + ctx.uncertain_calls(pipe, "AddRateLimiter", "UseRateLimiter", "Configure", "PostConfigure")]
+    for c in calls:
+        if c.name in ("Configure", "PostConfigure"):
+            targs = (c.node.get("fn") or {}).get("targs") or []
+            if not any(str(x).strip().split(".")[-1] == "RateLimiterOptions" for x in targs):
+                continue
+        if opaque_reason(c.node) is not None:
+            verdicts.append("maybe")
+        opt, uncertain = verdict(options_of(c.node), "GlobalLimiter")
+        if opt is not None:
+            verdicts.append("maybe" if uncertain else "yes")
+    return "yes" if "yes" in verdicts else "maybe" if verdicts else "no"
+
+
 def _rate_limiting(ctx: Ctx) -> None:
     for pipe in ctx.pipes:
         routes = [ref for ref in ctx.refs if _owns(ctx, pipe, ref) and _auth_endpoint(ref)
@@ -514,6 +534,10 @@ def _rate_limiting(ctx: Ctx) -> None:
         if not routes and not identity:
             continue
         firm_global = bool(pipe.named(*_LIMITERS))
+        # UseRateLimiter alone limits nothing: the framework middleware enforces a GlobalLimiter or a policy
+        # named on the route. Third-party limiters (IpRateLimit and friends) are trusted as before.
+        needs_global = firm_global and not pipe.named(*_THIRD_PARTY) and _global_limiter(ctx, pipe) != "yes"
+        no_global: list[CoreRouteRef] = []
         maybe_global = bool(ctx.uncertain_calls(pipe, *_LIMITERS))
         open_routes: list[CoreRouteRef] = []
         unenforced: list[CoreRouteRef] = []
@@ -529,12 +553,26 @@ def _rate_limiting(ctx: Ctx) -> None:
                         (" The route is mapped under an environment condition that is not plain Production."
                          if env == "review" else ""),
                         r.file, r.line, route=r, confidence=None if env == "firm" else "REVIEW")
+            elif state is None and needs_global:
+                no_global.append(ref)
             elif state is None or not firm_global:
                 # A route-level policy is metadata only: without a limiter middleware that certainly runs in
                 # Production (UseRateLimiter or a third-party one) nothing enforces it, so the route is open.
                 open_routes.append(ref)
                 if state == "enabled":
                     unenforced.append(ref)
+        if no_global:
+            r = no_global[0].route
+            names = ", ".join(f"{x.route.handler_name} ({', '.join(x.route.methods)} {x.route.path})"
+                              for x in no_global[:5])
+            more = f" and {len(no_global) - 5} more" if len(no_global) > 5 else ""
+            ctx.add("DNL-RES-004", "low", "No rate limiting policy on login, token or password-reset endpoints",
+                    "The pipeline calls UseRateLimiter, but the middleware limits nothing without a GlobalLimiter "
+                    "or a policy on the route: there is no policy on the route and no GlobalLimiter visible in the "
+                    f"rate limiter options for {names}{more}. They may be open to credential stuffing, password "
+                    "guessing and reset-mail floods; confirm a GlobalLimiter or RequireRateLimiting / "
+                    "[EnableRateLimiting] covers them.",
+                    r.file, r.line, route=r, confidence="REVIEW")
         if firm_global:
             continue
         conf, note = ctx.absent_confidence(pipe)
@@ -586,6 +624,7 @@ _INT_TYPES = {"int", "int32", "long", "int64", "short", "int16", "uint", "uint32
               "ushort", "uint16"}
 _CMP = {"<", ">", "<=", ">="}
 _BOUND_CALLS = {"min", "clamp"}
+_MAX_PAGE = 10000            # a [Range] maximum up to this is a bound
 
 
 def _integer(type_text: str | None) -> bool:
@@ -873,8 +912,17 @@ def _page_findings(ctx: Ctx, ref: CoreRouteRef) -> list[tuple[str, int, bool]]:
     for p in m.params:
         if not (_PAGE_PARAM.match(p.name) and _integer(p.type)):
             continue
-        if any(attr_key(a.name) == "range" for a in p.attributes):
-            continue
+        rng = next((a for a in p.attributes if attr_key(a.name) == "range"), None)
+        range_weak = False
+        if rng is not None:
+            # [Range(min, max)] is a bound when its maximum folds to a sane page size; a huge or unreadable
+            # maximum (int.MaxValue, a constant from elsewhere) is not proof, so the finding stays as REVIEW.
+            hi = rng.args[1] if len(rng.args) > 1 else next(
+                (v for k, v in dict(rng.named).items() if k.lower() == "maximum"), None)
+            top = _num(hi, visible) if hi is not None else UNKNOWN
+            if isinstance(top, (int, float)) and top <= _MAX_PAGE:
+                continue
+            range_weak = True
         names = {p.name}
         for n in walk(m.body):          # one local (or earlier-declared variable) carrying the parameter
             if n.get("k") == "local" and _mentions(n.get("init"), {p.name}):
@@ -888,6 +936,8 @@ def _page_findings(ctx: Ctx, ref: CoreRouteRef) -> list[tuple[str, int, bool]]:
         if not takes:
             continue
         state = _bound_state(m.body, names, takes, visible)
+        if state != "bound" and range_weak:
+            state = "weak"
         if state != "bound":
             out.append((p.name, takes[0].get("line") or m.line, state == "weak"))
     return out

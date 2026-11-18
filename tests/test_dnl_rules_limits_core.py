@@ -129,7 +129,10 @@ def test_res001_appsettings(tmp_path, mode):
 # -- RES-004 -----------------------------------------------------------------------------------------
 
 LOGIN = "[HttpPost(\"login\")] public IActionResult Login() => Ok();"
-LIMITER = "builder.Services.AddRateLimiter(o => { });\n"
+# UseRateLimiter limits nothing without a GlobalLimiter or a per-endpoint policy, so the shared fixture sets one.
+LIMITER = ("builder.Services.AddRateLimiter(o => { o.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>("
+           "c => RateLimitPartition.GetNoLimiter(\"all\")); });\n")
+POLICY_ONLY = "builder.Services.AddRateLimiter(o => { o.AddFixedWindowLimiter(\"auth\", w => { w.PermitLimit = 5; }); });\n"
 
 
 def test_res004_login_without_limiter(tmp_path, mode):
@@ -642,3 +645,57 @@ def test_res005_unreadable_source_with_a_switch_fails_closed(tmp_path, monkeypat
         assert got(found, "DNL-RES-005") == expect, name
         if expect:
             assert any("case-pattern binders" in n for n in model.notes), model.notes
+
+
+# -- final fix wave: UseRateLimiter needs a GlobalLimiter or a route policy ----------------------------------
+
+
+def test_res004_use_rate_limiter_without_global_limiter_is_review(tmp_path, mode):
+    f = scan(tmp_path / "a", mvc(LOGIN, POLICY_ONLY, "app.UseRateLimiter();"), mode)
+    assert got(f, "DNL-RES-004") == {("DNL-RES-004", "low", "REVIEW")}
+    assert "no GlobalLimiter visible" in of(f, "DNL-RES-004")[0].description
+    # no AddRateLimiter at all, or options that cannot be read: still not proven
+    f = scan(tmp_path / "b", mvc(LOGIN, "", "app.UseRateLimiter();"), mode)
+    assert got(f, "DNL-RES-004") == {("DNL-RES-004", "low", "REVIEW")}
+    f = scan(tmp_path / "c", mvc(LOGIN, "builder.Services.AddRateLimiter(Configure);\n", "app.UseRateLimiter();"), mode)
+    assert got(f, "DNL-RES-004") == {("DNL-RES-004", "low", "REVIEW")}
+
+
+def test_res004_global_limiter_or_route_policy_clears(tmp_path, mode):
+    glob = ("builder.Services.AddRateLimiter(o => { o.AddFixedWindowLimiter(\"auth\", w => { }); "
+            "o.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(c => RateLimitPartition.GetNoLimiter(\"x\")); });\n")
+    assert not got(scan(tmp_path / "a", mvc(LOGIN, glob, "app.UseRateLimiter();"), mode), "DNL-RES-004")
+    body = 'app.UseRateLimiter();\napp.MapPost("/login", () => Results.Ok()).RequireRateLimiting("auth");'
+    assert not got(scan(tmp_path / "b", prog(POLICY_ONLY, body), mode), "DNL-RES-004")
+    assert not got(scan(tmp_path / "c", mvc(ENABLED, POLICY_ONLY, "app.UseRateLimiter();"), mode), "DNL-RES-004")
+
+
+def test_res004_conditional_global_limiter_is_review(tmp_path, mode):
+    svc = ("builder.Services.AddRateLimiter(o => { if (Helper.Flag()) { o.GlobalLimiter = "
+           "PartitionedRateLimiter.Create<HttpContext, string>(c => RateLimitPartition.GetNoLimiter(\"x\")); } });\n")
+    f = scan(tmp_path, mvc(LOGIN, svc, "app.UseRateLimiter();"), mode)
+    assert got(f, "DNL-RES-004") == {("DNL-RES-004", "low", "REVIEW")}
+
+
+def test_res004_third_party_limiter_unchanged(tmp_path, mode):
+    assert not got(scan(tmp_path, mvc(LOGIN, "", "app.UseIpRateLimiting();"), mode), "DNL-RES-004")
+
+
+def _paged(attr: str) -> str:
+    return f"[HttpGet] public IActionResult List({attr} int pageSize) => Ok(db.Items.Take(pageSize).ToList());"
+
+
+def test_res005_range_maximum_is_a_bound_only_when_small(tmp_path, mode):
+    for i, attr in enumerate(("[Range(1, 100)]", "[Range(1, 10000)]", "[Range(1, 100 * 100)]",
+                              "[Range(minimum: 1, maximum: 50)]")):
+        assert not got(scan(tmp_path / f"ok{i}", mvc(_paged(attr)), mode), "DNL-RES-005"), attr
+    for i, attr in enumerate(("[Range(1, int.MaxValue)]", "[Range(1, 10001)]", "[Range(1, 1000000)]",
+                              "[Range(1, Limits.Max)]", "[Range(1, max)]", "[Range(1)]")):
+        assert got(scan(tmp_path / f"bad{i}", mvc(_paged(attr)), mode), "DNL-RES-005") == {
+            ("DNL-RES-005", "low", "REVIEW")}, attr
+
+
+def test_res005_huge_range_still_bound_by_code(tmp_path, mode):
+    ctl = ("[HttpGet] public IActionResult List([Range(1, int.MaxValue)] int pageSize) "
+           "{ pageSize = Math.Min(pageSize, 100); return Ok(db.Items.Take(pageSize).ToList()); }")
+    assert not got(scan(tmp_path, mvc(ctl), mode), "DNL-RES-005")

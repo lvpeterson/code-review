@@ -13,8 +13,8 @@ import re
 from dataclasses import dataclass, field
 
 from checks.dnl.auth_core import _NON_AUTHZ_EXTENSIONS, PLACEHOLDER
-from checks.dnl.cfgctx import Ctx
-from checks.dnl.ir import attr_key, call_name, const_str, receiver_text, walk
+from checks.dnl.cfgctx import Ctx, _scope_of
+from checks.dnl.ir import attr_key, call_name, const_str, literal_str, receiver_text, walk
 from checks.dnl.options import (Opt, assignments, const, lambda_args, opaque_reason, options_of, param_escapes,
                                 timespan_minutes, verdict, walk_conditional)
 from checks.dnl.pipeline import PipeCall, Pipeline, _Ctx, _eval, _pred
@@ -275,7 +275,9 @@ _VERB_ATTRS = {f"http{v}" for v in ("get", "post", "put", "delete", "patch", "he
 _MVC_CALLS = ("AddControllers", "AddControllersWithViews", "AddMvc", "AddMvcCore", "AddMvcOptions", "AddRazorPages",
               "AddRazorPagesOptions", "Configure")
 _MVC_OPTION_TYPES = ("MvcOptions", "RazorPagesOptions")
-_COOKIE_REGISTRATIONS = ("AddCookie", "AddIdentity", "AddDefaultIdentity")
+# AddMicrosoftIdentityWebApp and AddIdentityApiEndpoints register the application cookie themselves.
+_COOKIE_REGISTRATIONS = ("AddCookie", "AddIdentity", "AddDefaultIdentity", "AddMicrosoftIdentityWebApp",
+                         "AddIdentityApiEndpoints")
 _VALIDATE_NAMES = {"validateantiforgerytoken", "validateantiforgerytokenattribute",
                    "autovalidateantiforgerytoken", "autovalidateantiforgerytokenattribute"}
 _IGNORE_NAMES = {"ignoreantiforgerytoken", "ignoreantiforgerytokenattribute"}
@@ -374,7 +376,14 @@ def _af_state(ctx: Ctx, pipe: Pipeline) -> _Af:
     st = _Af()
     # -- is cookie authentication in play? A guess in either direction is REVIEW, never "no".
     present = maybe = False
-    for c, conf in _calls(ctx, pipe, *_COOKIE_REGISTRATIONS, "AddAuthentication"):
+    for c, conf in _calls(ctx, pipe, *_COOKIE_REGISTRATIONS, "AddAuthentication", "AddOpenIdConnect"):
+        if c.name == "AddOpenIdConnect":
+            # OpenID Connect signs the user in through a cookie scheme; with no AddCookie in sight, which
+            # cookie it uses is not visible, so this is a "maybe" (an AddCookie elsewhere makes it "yes").
+            maybe = True
+            st.cookie_why.append(f"AddOpenIdConnect at {c.file}:{c.line} signs in through a cookie scheme "
+                                 "that is not visible here")
+            continue
         if c.name == "AddAuthentication":
             reason = opaque_reason(c.node)
             if reason is not None:
@@ -627,16 +636,6 @@ _VALIDATE_FLAGS = (
 )
 _MAX_SKEW_MINUTES = 10
 _SEC004_TITLE = "Hardcoded symmetric signing key"
-
-
-def _scope_of(ctx: Ctx, pipe: Pipeline) -> str | None:
-    """The settings scope of a pipeline's project: its directory relative to the model root ("" = the
-    root), or None when no appsettings file sits there (effective() must never get an unknown scope)."""
-    if pipe.project is None or ctx.settings is None:
-        return None
-    rel = ctx.model.rel(pipe.project.dir)
-    scope = "" if rel in (".", "") else rel
-    return scope if scope in ctx.settings.scopes() else None
 
 
 def _env_branches(pred) -> tuple[bool | None, bool | None]:
@@ -1080,14 +1079,29 @@ def _literal_of(model, t, body, e) -> tuple[str | None, bool]:
     return None, False
 
 
-def _key_literal(model, t, body, new: dict) -> tuple[str | None, bool]:
-    """(literal, maybe-not-constant) behind `new SymmetricSecurityKey(<bytes>)`: Encoding.*.GetBytes(x),
-    Convert.FromBase64String(x) and the like. (None, False) for any other source (configuration,
-    environment, Key Vault, a parameter)."""
-    args = new.get("args") or []
-    if len(args) != 1 or not isinstance(args[0], dict) or args[0].get("k") != "call":
-        return None, False
-    call = args[0]
+def _partial_literal(e) -> str | None:
+    """The first string fragment of an expression that mixes a literal with something unknown: a `+`
+    concatenation or an interpolated string. None for anything else (an index key such as config["K"] is
+    not a fragment of the value)."""
+    if not isinstance(e, dict):
+        return None
+    if e.get("k") == "bin" and e.get("op") in ("+", "&", "concat"):
+        for side in (e.get("l"), e.get("r")):
+            got = literal_str(side) or _partial_literal(side)
+            if got:
+                return got
+        return None
+    if e.get("k") == "interp":
+        for part in e.get("parts") or []:
+            got = literal_str(part)
+            if got:
+                return got
+    return None
+
+
+def _bytes_literal(model, t, body, call) -> tuple[str | None, bool | str]:
+    """(literal, maybe) behind `Encoding.*.GetBytes(x)` / `Convert.From*String(x)`; maybe is "partial" when
+    x only has a literal part. (None, False) for any other call."""
     kind = _BYTE_SOURCES.get((call_name(call) or "").lower())
     fn = call.get("fn") if isinstance(call.get("fn"), dict) else {}
     recv = receiver_text(fn.get("obj")) or str((fn.get("obj") or {}).get("type") or "")
@@ -1095,7 +1109,51 @@ def _key_literal(model, t, body, new: dict) -> tuple[str | None, bool]:
         return None, False
     if (kind == "encoding" and "Encoding" not in recv) or (kind == "convert" and not recv.endswith("Convert")):
         return None, False
-    return _literal_of(model, t, body, call["args"][0])
+    lit, maybe = _literal_of(model, t, body, call["args"][0])
+    if lit is None:
+        part = _partial_literal(call["args"][0])
+        return (part, "partial") if part else (None, False)
+    return lit, maybe
+
+
+def _byte_holder(model, t, body, name: str) -> tuple[str | None, bool | str]:
+    """The byte[] local or field `name` resolved to the call that initialises it. A local also assigned
+    something that is not a byte-source literal, or a field assigned elsewhere, is "maybe" (REVIEW)."""
+    inits = [n.get("init") for n in walk(body) if n.get("k") == "local" and n.get("name") == name]
+    if not inits:
+        f = next((x for x in t.fields if x.name == name), None)
+        inits = [f.init] if f is not None and f.init is not None else []
+        is_field = True
+    else:
+        is_field = False
+    got = [_bytes_literal(model, t, body, i) if isinstance(i, dict) and i.get("k") == "call" else (None, False)
+           for i in inits]
+    if not got or any(g[0] is None for g in got):
+        return None, False
+    lit, maybe = got[0]
+    for n in walk(body):
+        if (n.get("k") == "assign" and isinstance(n.get("target"), dict) and n["target"].get("k") == "name"
+                and n["target"].get("id") == name):
+            v = n.get("value")
+            if not (isinstance(v, dict) and v.get("k") == "call" and _bytes_literal(model, t, body, v)[0] is not None):
+                maybe = maybe or True
+    if is_field and not maybe and _assigned_elsewhere(model, t, name):
+        maybe = True
+    return lit, maybe
+
+
+def _key_literal(model, t, body, new: dict) -> tuple[str | None, bool | str]:
+    """(literal, maybe-not-constant) behind `new SymmetricSecurityKey(<bytes>)`: Encoding.*.GetBytes(x),
+    Convert.FromBase64String(x) and the like, directly or through a byte[] local or field. (None, False)
+    for any other source (configuration, environment, Key Vault, a parameter)."""
+    args = new.get("args") or []
+    if len(args) != 1 or not isinstance(args[0], dict):
+        return None, False
+    if args[0].get("k") == "name":
+        return _byte_holder(model, t, body, args[0].get("id") or "")
+    if args[0].get("k") != "call":
+        return None, False
+    return _bytes_literal(model, t, body, args[0])
 
 
 def _symmetric_news(root):
@@ -1143,7 +1201,10 @@ def _signing_keys(ctx: Ctx) -> None:
                             "from configuration, an environment variable or a key vault.")
                     if state == "review":
                         desc += " The code sits under an environment condition that could not be parsed."
-                    if maybe:
+                    if maybe == "partial":
+                        desc += (" Only part of the key is a literal (the rest is concatenated or interpolated), "
+                                 "so confirm what the rest of the key is.")
+                    elif maybe:
                         desc += (" The string is also assigned a non-literal value elsewhere, so the key may be "
                                  "loaded from configuration at run time; confirm which value is used.")
                     ctx.add("DNL-SEC-004", "high", _SEC004_TITLE, desc, t.file, new.get("line") or t.line,

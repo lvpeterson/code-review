@@ -22,6 +22,7 @@ _SKIP_PARTS = {"wwwroot"}
 _APPSETTINGS = re.compile(r"^appsettings(?:\.(?P<env>.+))?\.json$", re.IGNORECASE)
 _NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?")
 _MAX_DEPTH = 200
+_MAX_BYTES = 5 * 1024 * 1024    # a real settings file is a few KB; a bigger one is not read (hostile repo)
 
 
 @dataclass
@@ -279,6 +280,18 @@ def load_settings(model: ProjectModel) -> Settings:
         if not (m or launch) or not model.owns(path):
             continue
         env = "launch" if launch else m.group("env")
+        # A symlink (a device or a file outside the repo) or a huge file is never read: it could hang the scan.
+        skip = None
+        try:
+            if path.is_symlink():
+                skip = "is a symbolic link"
+            elif path.stat().st_size > _MAX_BYTES:
+                skip = f"is larger than {_MAX_BYTES // (1024 * 1024)} MB"
+        except OSError as ex:
+            skip = f"could not be inspected ({ex})"
+        if skip:
+            model.notes.append(f"{rel.as_posix()}: settings file {skip}; its settings were not analyzed")
+            continue
         sf = _read(path, rel.as_posix(), env, launch)
         if sf.error:
             model.notes.append(sf.error)

@@ -1030,3 +1030,77 @@ def test_minimal_api_version_set_is_reported_as_unread(tmp_path, mode):
     hits = _of(_scan(tmp_path, mode, body), "DNL-INV-004")
     assert [(f.severity, f.confidence, f.route) for f in hits] == [("low", "REVIEW", None)]
     assert "not read" in hits[0].description or "could not be compared" in hits[0].description
+
+
+# -- final fix wave ------------------------------------------------------------------------------------------
+
+
+def _two_projects(tmp_path, extra: dict):
+    prog = PROGRAM.format(body="app.UseDeveloperExceptionPage();")
+    csproj = make_app(tmp_path / "tmpl", {}) / "App.csproj"
+    for d in ("A", "B"):
+        sub = tmp_path / d
+        sub.mkdir(parents=True, exist_ok=True)
+        (sub / f"{d}.csproj").write_text(csproj.read_text(), encoding="utf-8")
+        (sub / "Program.cs").write_text(prog, encoding="utf-8")
+    (tmp_path / "tmpl" / "App.csproj").unlink()
+    for rel, text in extra.items():
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+
+
+def test_appsettings_in_unclaimed_directory_adds_one_note(tmp_path, mode):
+    cfg = '{"AllowedHosts": "*", "DetailedErrors": true}'
+    # `lib` is a project that has no web entry point; `A/conf` sits under A but is not A's own directory
+    lib = make_app(tmp_path / "tmpl2", {}, sdk="Microsoft.NET.Sdk") / "App.csproj"
+    _two_projects(tmp_path, {"A/appsettings.json": cfg, "lib/Lib.csproj": lib.read_text(),
+                             "lib/appsettings.json": cfg, "lib/appsettings.Production.json": cfg,
+                             "A/conf/appsettings.json": cfg})
+    (tmp_path / "tmpl2" / "App.csproj").unlink()
+    model, refs = prepare_model(tmp_path, degraded=(mode == "degraded"))
+    found = rules_pipeline.check(model, refs)
+    rules_pipeline.check(model, refs)          # a second run must not repeat the notes
+    notes = [n for n in model.notes if "is not read by the configuration rules" in n]
+    assert sorted(notes) == sorted(
+        f"appsettings in {d} is not read by the configuration rules: no web project claims it; secrets rules still scan it"
+        for d in ("A/conf", "lib"))
+    # A's own settings are still read (CFG-014 on A), the unclaimed ones are not
+    assert {f.file for f in found if f.check_id == "DNL-CFG-014"} == {"A/appsettings.json"}
+
+
+def test_all_claimed_directories_add_no_note(tmp_path, mode):
+    _two_projects(tmp_path, {"A/appsettings.json": "{}", "B/appsettings.json": "{}"})
+    model, refs = prepare_model(tmp_path, degraded=(mode == "degraded"))
+    rules_pipeline.check(model, refs)
+    assert not [n for n in model.notes if "is not read by the configuration rules" in n]
+
+
+def test_scope_of_is_defined_once():
+    from checks.dnl import rules_limits_core, rules_pipeline_auth
+    assert (rules_pipeline._scope_of is cfgctx._scope_of is rules_pipeline_auth._scope_of
+            is rules_limits_core._scope_of)
+
+
+def test_build_ctx_failure_still_runs_the_secrets_group(tmp_path, mode, monkeypatch):
+    files = {"Program.cs": PROGRAM.format(body="app.UseDeveloperExceptionPage();"),
+             "appsettings.json": '{"ConnectionStrings": {"Default": "Server=db;Password=Zx9kLm3pQ7"}}'}
+    model, refs = prepare_model(make_app(tmp_path, files), degraded=(mode == "degraded"))
+
+    def boom(*a, **k):
+        raise RuntimeError("synthetic pipeline failure")
+    monkeypatch.setattr(cfgctx, "pipeline_for", boom)
+    found = rules_pipeline.check(model, refs)
+    assert [f.check_id for f in found] == ["DNL-SEC-001"]
+    assert any("synthetic pipeline failure" in n for n in model.notes)
+
+
+def test_build_ctx_failure_in_settings_load_is_noted(tmp_path, mode, monkeypatch):
+    model, refs = prepare_model(make_app(tmp_path, {"Program.cs": PROGRAM.format(body="")}),
+                                degraded=(mode == "degraded"))
+
+    def boom(*a, **k):
+        raise RuntimeError("synthetic settings failure")
+    monkeypatch.setattr(cfgctx, "load_settings", boom)
+    assert rules_pipeline.check(model, refs) == []
+    assert any("synthetic settings failure" in n for n in model.notes)

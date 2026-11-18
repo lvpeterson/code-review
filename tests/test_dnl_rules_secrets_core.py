@@ -32,7 +32,7 @@ def test_connection_string_password_high_at_key_line(tmp_path, mode):
 
 def test_integrated_security_and_placeholders_are_clean(tmp_path, mode):
     for i, v in enumerate(["Server=db;Integrated Security=true", "Server=db;Password=$(DbPassword)",
-                           "Server=db;Password={DbPassword}", "Server=db;Password=#{Pw}#",
+                           "Server=db;Password=#{Pw}#",
                            "Server=db;Password=${DB_PW}", "Server=db;Password=%DB_PW%",
                            "Server=db;Password=<set me>", "Server=db;Password=;", "",
                            "@Microsoft.KeyVault(SecretUri=https://v.example.test/secrets/c)",
@@ -200,3 +200,50 @@ def test_placeholder_with_literal_text_is_reported(tmp_path, mode):
     assert {f.check_id for f in _sec(tmp_path / "k", {"appsettings.json": text}, mode)} == {"DNL-SEC-002"}
     text = '{"Jwt": {"Key": "${JwtKey}"}, "A": {"Secret": "$(S)", "Token": "#{T}#", "ApiKey": "%K%"}}'
     assert _sec(tmp_path / "j", {"appsettings.json": text}, mode) == []
+
+
+# -- final fix wave ---------------------------------------------------------------------------------------
+
+
+def test_braced_and_double_underscore_connection_passwords_are_review(tmp_path, mode):
+    for i, v in enumerate(["Server=db;Password={Summer2024}", "Server=db;Password={{Summer2024}}",
+                           "Server=db;Password=__Summer2024__", 'Server=db;Password="{Summer2024}"']):
+        got = _conn(tmp_path / str(i), v, mode)
+        assert [(f.check_id, f.severity, f.confidence) for f in got] == [("DNL-SEC-001", "high", "REVIEW")], v
+
+
+def test_whole_value_braced_placeholder_on_other_key_stays_clean(tmp_path, mode):
+    text = '{"Jwt": {"Key": "{JwtKey}"}, "A": {"Secret": "__S__", "ApiKey": "{{K}}"}}'
+    assert _sec(tmp_path, {"appsettings.json": text}, mode) == []
+
+
+def test_other_placeholders_inside_connection_password_stay_ignored(tmp_path, mode):
+    for i, v in enumerate(["Server=a;Password=${Pw}", "Server=a;Password=$(Pw)", "Server=a;Password=#{Pw}#",
+                           "Server=a;Password=%PW%"]):
+        assert _conn(tmp_path / str(i), v, mode) == [], v
+
+
+def test_password_in_any_string_value_is_checked(tmp_path, mode):
+    text = '{\n  "Redis": {\n    "Configuration": "cache.example.test:6380,password=Zx9kLm3pQ7,ssl=True"\n  }\n}\n'
+    got = _sec(tmp_path / "a", {"appsettings.json": text}, mode)
+    assert _shape(got) == {("DNL-SEC-001", "high", None, None, "appsettings.json", 3)}
+    assert "Zx9kLm3pQ7" not in got[0].description
+    text = '{"Redis": {"Configuration": "cache.example.test:6380,password=${REDIS_PW},ssl=True"}}'
+    assert _sec(tmp_path / "b", {"appsettings.json": text}, mode) == []
+    # the key-name exclusions still hold: a setting-shaped key is not a password holder
+    text = '{"Auth": {"PasswordResetUrl": "https://x.example.test/r?a=1;password=Zx9kLm3pQ7"}}'
+    assert _sec(tmp_path / "c", {"appsettings.json": text}, mode) == []
+
+
+def test_bare_key_under_encryption_sections_is_secret(tmp_path, mode):
+    for i, sect in enumerate(("Encryption", "DataCrypto", "AesSettings", "Hmac", "FieldEncryptor")):
+        text = '{\n  "%s": {\n    "Key": "k8s9d7f6g5h4j3k2"\n  }\n}\n' % sect
+        got = _sec(tmp_path / str(i), {"appsettings.json": text}, mode)
+        assert _shape(got) == {("DNL-SEC-002", "medium", None, None, "appsettings.json", 3)}, sect
+    text = '{"Logging": {"Key": "k8s9d7f6g5h4j3k2"}, "Paes": {"Key": "k8s9d7f6g5h4j3k2"}}'
+    assert _sec(tmp_path / "n", {"appsettings.json": text}, mode) == []
+
+
+def test_placeholder_followed_by_literal_after_comma_is_reported(tmp_path, mode):
+    for i, v in enumerate(["Server=a;Password=${A},realsecret1", "Server=a;Password={Summer2024},ssl=True"]):
+        assert {f.check_id for f in _conn(tmp_path / str(i), v, mode)} == {"DNL-SEC-001"}, v

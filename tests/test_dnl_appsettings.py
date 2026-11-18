@@ -118,3 +118,25 @@ def test_unscoped_effective_single_directory_and_launch_scope(tmp_path):
     assert s.effective("Production")["a"].value == 1
     assert s.effective("Production", "")["a"].value == 1
     assert [e.key for e in s.entries("launch", "")] == ["A:B"]
+
+
+# -- final fix wave: hostile settings files are not read ------------------------------------------------------
+
+
+def test_oversized_settings_file_is_skipped_with_a_note(tmp_path):
+    big = '{"A": "' + "x" * (5 * 1024 * 1024 + 10) + '"}'
+    model, s = _settings(tmp_path, {"appsettings.json": big, "appsettings.Production.json": '{"B": 1}'})
+    assert [f.path for f in s.files] == ["appsettings.Production.json"]
+    assert any("appsettings.json" in n and "larger than 5 MB" in n for n in model.notes)
+
+
+def test_symlinked_settings_file_is_skipped_with_a_note(tmp_path):
+    root = make_app(tmp_path, {"appsettings.Production.json": '{"B": 1}'})
+    try:
+        (root / "appsettings.json").symlink_to("/dev/zero")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not available here")
+    model, _ = prepare_model(root, degraded=True)
+    s = load_settings(model)
+    assert [f.path for f in s.files] == ["appsettings.Production.json"]
+    assert any("appsettings.json" in n and "symbolic link" in n for n in model.notes)

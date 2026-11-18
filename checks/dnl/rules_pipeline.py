@@ -9,23 +9,13 @@ from dataclasses import dataclass, field
 
 from checks.dnl import rules_limits_core, rules_pipeline_auth, rules_secrets_core
 from checks.dnl.auth_core import _NON_AUTHZ_EXTENSIONS, _sensitive
-from checks.dnl.cfgctx import Ctx, build_ctx
+from checks.dnl.cfgctx import Ctx, _scope_of, build_ctx, load_settings_once, note_unclaimed_scopes
 from checks.dnl.ir import attr_key, call_chain, call_name, const_str, literal_str, receiver_text, walk
 from checks.dnl.options import always_true, const, opt, options_of, param_escapes, verdict, walk_conditional
 from checks.dnl.pipeline import PipeCall, Pipeline
 from checks.dnl.project import ProjectModel
 from checks.dnl.routes_core import CoreRouteRef, _chain_types
 from core.models import Finding
-
-
-def _scope_of(ctx: Ctx, pipe: Pipeline) -> str | None:
-    """The settings scope of a pipeline's project: its directory relative to the model root ("" = the
-    root), or None when no appsettings file sits there (effective() must never get an unknown scope)."""
-    if pipe.project is None or ctx.settings is None:
-        return None
-    rel = ctx.model.rel(pipe.project.dir)
-    scope = "" if rel in (".", "") else rel
-    return scope if scope in ctx.settings.scopes() else None
 
 
 def _certain_and_uncertain(ctx: Ctx, pipe: Pipeline, *names: str) -> list[tuple[PipeCall, str | None]]:
@@ -1239,8 +1229,24 @@ _GROUPS: list = [("errors", _errors), ("transport", _transport), ("cors", _cors)
 
 
 def check(model: ProjectModel, refs: list[CoreRouteRef]) -> list[Finding]:
-    ctx: Ctx = build_ctx(model, refs)
-    for name, fn in _GROUPS:
+    try:
+        ctx: Ctx = build_ctx(model, refs)
+        note_unclaimed_scopes(ctx)
+    except Exception as exc:  # noqa: BLE001
+        # Settings-only fallback: the secrets rules need no pipeline, so one broken project (or model) does
+        # not silence them. Every pipeline rule sees no pipelines and says nothing.
+        note = f"configuration context failed ({type(exc).__name__}: {exc}); only the settings rules ran"
+        if note not in model.notes:
+            model.notes.append(note)
+        try:
+            settings = load_settings_once(model)
+        except Exception:  # noqa: BLE001
+            settings = None
+        ctx = Ctx(model, refs, [], settings)
+        groups = [g for g in _GROUPS if g[0] == "secrets"]
+    else:
+        groups = _GROUPS
+    for name, fn in groups:
         try:
             fn(ctx)
         except Exception as exc:  # noqa: BLE001
