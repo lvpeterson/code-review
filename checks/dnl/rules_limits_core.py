@@ -7,10 +7,15 @@ helpers live in auth_core.py and the sibling rule modules.
 
 Known limits. RES-005 reads one handler body: a parameter handed to another method (`repo.List(pageSize)`)
 is not followed, and a bound written there is not seen (not reported either way); a comparison against a
-literal of 0 or 1 is a lower-bound check, not a cap, and a comparison only caps when its branch returns,
-throws or assigns the value (any other mention is REVIEW). RES-004 counts a route-level `RequireRateLimiting`
-/ `[EnableRateLimiting]` only when a limiter middleware certainly runs in Production (the policy is
-unenforced without it).
+literal of 0 or 1 is a lower-bound check, not a cap. A cap is a comparison of the value against a constant
+(literal, folded expression or `const` field; a `static readonly` field is not read) with `>` / `>=` in an
+`if` the handler always reaches (not nested under another `if`), the condition being that comparison or an `||`
+chain including it (an `&&` conjunct is not a cap; the `<` / `<=` forms mirror this), guarding a branch that
+returns, throws or assigns the value, ignoring returns inside lambdas; a ternary or a Min / Clamp with a
+constant operand counts when its result is used. Any other mention of the value is REVIEW. RES-004 counts a
+route-level `RequireRateLimiting` / `[EnableRateLimiting]` only when a limiter middleware certainly runs in
+Production (the policy is unenforced without it). Scanned text is never evaluated: page directives are folded
+by a small bounded parser (no `**`, shifts <= 64, capped magnitudes), anything else is UNKNOWN / REVIEW.
 """
 from __future__ import annotations
 
@@ -35,9 +40,24 @@ _OPS = {"*": lambda a, b: a * b, "+": lambda a, b: a + b, "-": lambda a, b: a - 
         "/": lambda a, b: a // b if b else UNKNOWN, "<<": lambda a, b: a << b if 0 <= b < 64 else UNKNOWN}
 
 
-def _num(e):
+_CAP = 2**80                      # intermediate results above this abort the folding (UNKNOWN)
+
+
+def _apply(op: str, a, b):
+    """One folded operation, UNKNOWN when it is not safe or not defined (shift count outside 0..64, division by
+    zero, a float shifted, a result above _CAP)."""
+    if op == "<<" and not (isinstance(a, int) and isinstance(b, int) and 0 <= b <= 64):
+        return UNKNOWN
+    if op == "/" and not b:
+        return UNKNOWN
+    v = _OPS[op](a, b)
+    return v if v is not UNKNOWN and abs(v) <= _CAP else UNKNOWN
+
+
+def _num(e, consts: dict | None = None):
     """A compile-time number, None for a literal null, else UNKNOWN: literals, `long.MaxValue` style
-    members, casts, and `* + - / <<` over those (`2000L * 1024 * 1024`)."""
+    members, casts, names found in `consts` (const fields), and `* + - / <<` over those
+    (`2000L * 1024 * 1024`)."""
     if not isinstance(e, dict):
         return UNKNOWN
     k = e.get("k")
@@ -46,16 +66,18 @@ def _num(e):
         if v is None and e.get("t") == "null":
             return None
         return v if isinstance(v, (int, float)) and not isinstance(v, bool) else UNKNOWN
+    if k == "name":
+        return (consts or {}).get(e.get("id"), UNKNOWN)
     if k == "member":
         text = receiver_text(e).lower()
         return _MAXES.get(text[len("system."):] if text.startswith("system.") else text, UNKNOWN)
     if k == "cast":
-        return _num(e.get("e"))
+        return _num(e.get("e"), consts)
     if k == "bin" and e.get("op") in _OPS:
-        a, b = _num(e.get("l")), _num(e.get("r"))
+        a, b = _num(e.get("l"), consts), _num(e.get("r"), consts)
         if a is UNKNOWN or b is UNKNOWN or a is None or b is None:
             return UNKNOWN
-        return _OPS[e["op"]](a, b)
+        return _apply(e["op"], a, b)
     return UNKNOWN
 
 
@@ -195,25 +217,114 @@ def _fluent_calls(ref: CoreRouteRef) -> list[list[dict]]:
 
 
 _DIRECTIVE = re.compile(r"(?<![A-Za-z0-9_])(DisableRequestSizeLimit|RequestSizeLimit|RequestFormLimits)"
-                        r"(?:Attribute)?\b\s*(?:\(((?:[^()]|\([^()]*\))*)\))?")
+                        r"(?:Attribute)?\b")
 _FORM_ARG = re.compile(r"MultipartBodyLengthLimit\s*=\s*([^,]+)")
+
+
+_FOLD_TOKEN = re.compile(r"\s*(?:(\d[\d_]*)[lLuU]*|(<<|[-+*/()])|([A-Za-z_][\w.]*))")
+_MAX_TOKENS, _MAX_DEPTH = 200, 40
+
+
+class _Stop(Exception):
+    """The text is not a constant this folder reads (or it is too big or too deep): UNKNOWN."""
 
 
 def _fold(text: str):
     """The value of a constant expression written as text in a page directive, with the same folding as code
-    (`100 * 1024 * 1024`, `2000L * 1024 * 1024`, `long.MaxValue`): a number, None for `null`, else UNKNOWN."""
+    (`100 * 1024 * 1024`, `2000L * 1024 * 1024`, `1L << 40`, `long.MaxValue`): a number, None for `null`,
+    else UNKNOWN. A small recursive parser over `+ - * / << ( )`, integer literals and `*.MaxValue`: it never
+    evaluates the text, `**` is a syntax error, shifts, magnitudes, token count and nesting are capped."""
     t = text.strip()
     if t == "null":
         return None
-    t = re.sub(r"(?i)\b(?:system\.)?(\w+\.maxvalue)\b", lambda m: str(_MAXES.get(m.group(1).lower(), "x")), t)
-    t = re.sub(r"(?<=\d)[lLuU]+\b", "", t).replace("_", "")
-    if not t or not re.fullmatch(r"[\d\s*+\-/()<]+", t) or "<<<" in t:
-        return UNKNOWN
+    toks: list[tuple[str, str]] = []
+    i = 0
+    while i < len(t):
+        m = _FOLD_TOKEN.match(t, i)
+        if not m or m.end() == i or len(toks) > _MAX_TOKENS:
+            return UNKNOWN
+        i = m.end()
+        if m.group(1):
+            toks.append(("n", m.group(1).replace("_", "")))
+        elif m.group(2):
+            toks.append(("o", m.group(2)))
+        else:
+            name = m.group(3).lower()
+            name = name[len("system."):] if name.startswith("system.") else name
+            if name not in _MAXES:
+                return UNKNOWN
+            toks.append(("n", str(_MAXES[name])))
+    pos = 0
+
+    def peek():
+        return toks[pos] if pos < len(toks) else (None, None)
+
+    def take():
+        nonlocal pos
+        pos += 1
+        return toks[pos - 1]
+
+    def primary(depth: int):
+        if depth > _MAX_DEPTH or pos >= len(toks):
+            raise _Stop
+        kind, val = take()
+        if kind == "n":
+            return int(val)
+        if val == "-":
+            v = primary(depth + 1)
+            return -v
+        if val == "(":
+            v = shift(depth + 1)
+            if take() != ("o", ")"):
+                raise _Stop
+            return v
+        raise _Stop
+
+    def level(ops, nxt):
+        def parse(depth: int):
+            v = nxt(depth)
+            while peek()[0] == "o" and peek()[1] in ops:
+                op = take()[1]
+                v = _apply(op, v, nxt(depth))
+                if v is UNKNOWN:
+                    raise _Stop
+            return v
+        return parse
+
+    def mul(depth):
+        return level(("*", "/"), primary)(depth)
+
+    def add(depth):
+        return level(("+", "-"), mul)(depth)
+
+    def shift(depth):
+        return level(("<<",), add)(depth)
+
     try:
-        v = eval(t.replace("/", "//"), {"__builtins__": {}}, {})  # noqa: S307 -- digits and operators only
-    except Exception:  # noqa: BLE001
+        v = shift(0)
+        if pos != len(toks):
+            return UNKNOWN
+    except _Stop:
         return UNKNOWN
-    return v if isinstance(v, (int, float)) and abs(v) < 2**70 else UNKNOWN
+    return v
+
+
+def _args_after(text: str, i: int):
+    """The text between the parentheses that follow position i (balanced, any depth up to 100), "" when no
+    parenthesis follows, None when they are not balanced."""
+    j = i
+    while j < len(text) and text[j].isspace():
+        j += 1
+    if j >= len(text) or text[j] != "(":
+        return ""
+    depth = 0
+    for k in range(j, min(len(text), j + 2000)):
+        depth += (text[k] == "(") - (text[k] == ")")
+        if depth > 100:
+            return None
+        if depth == 0:
+            return text[j + 1:k]
+    return None
 
 
 def _directive_issues(text: str) -> list[tuple[str, bool]]:
@@ -221,16 +332,19 @@ def _directive_issues(text: str) -> list[tuple[str, bool]]:
     (`[DisableRequestSizeLimit()]` and `[DisableRequestSizeLimit]` are the same attribute)."""
     out: list[tuple[str, bool]] = []
     for m in _DIRECTIVE.finditer(text):
-        name, args = m.group(1), m.group(2)
+        name, args = m.group(1), _args_after(text, m.end())
         if name == "DisableRequestSizeLimit":
             out.append(("@attribute [DisableRequestSizeLimit]", True))
             continue
-        if name == "RequestFormLimits":
-            fm = _FORM_ARG.search(args or "")
+        if args is None:
+            val = UNKNOWN
+            label = f"@attribute [{name}(...)]"
+        elif name == "RequestFormLimits":
+            fm = _FORM_ARG.search(args)
             val = _fold(fm.group(1)) if fm else 0
             label = "@attribute [RequestFormLimits(MultipartBodyLengthLimit = ...)]"
         else:
-            val = _fold(args) if args and args.strip() else 0
+            val = _fold(args) if args.strip() else 0
             label = "@attribute [RequestSizeLimit(...)]"
         if val is UNKNOWN:
             out.append((label + " with a value that is not a compile-time constant", False))
@@ -399,10 +513,12 @@ def _rate_limiting(ctx: Ctx) -> None:
             more = f" and {len(open_routes) - 5} more" if len(open_routes) > 5 else ""
             if _env_state(r.meta.get("env")) == "review":
                 conf = "REVIEW"
-            desc = (f"The Production pipeline has no rate limiting (no UseRateLimiter, no third-party limiter, no "
-                    f"RequireRateLimiting / [EnableRateLimiting] on the route or its group) while it serves "
-                    f"login, token or password-reset endpoints: {names}{more}. They are open to credential "
-                    "stuffing, password guessing and reset-mail floods.")
+            lead = ("The Production pipeline runs no rate limiter (no UseRateLimiter, no third-party limiter)"
+                    if unenforced else
+                    "The Production pipeline has no rate limiting (no UseRateLimiter, no third-party limiter, no "
+                    "RequireRateLimiting / [EnableRateLimiting] on the route or its group)")
+            desc = (f"{lead} while it serves login, token or password-reset endpoints: {names}{more}. They are "
+                    "open to credential stuffing, password guessing and reset-mail floods.")
             if unenforced:
                 desc += (" A rate-limiting policy is named on "
                          + ", ".join(f"{x.route.handler_name} ({x.route.path})" for x in unenforced[:5])
@@ -462,21 +578,45 @@ def _cmp_nodes(e, names: set) -> list[dict]:
     return out
 
 
-def _bound_calls(e, names: set) -> list[dict]:
-    """`Math.Min` / `Math.Clamp` / `Clamp` calls over the parameter (or a carrier local) inside an expression."""
+def _bound_calls(e, names: set, consts: dict, need_const: bool = False) -> list[dict]:
+    """`Math.Min` / `Math.Clamp` / `Clamp` calls over the parameter (or a carrier local) inside an expression;
+    with `need_const`, only those that also take a compile-time number (a cap, not a copy)."""
     out = []
     for n in walk(e):
         if n.get("k") == "call" and (call_name(n) or "").lower() in _BOUND_CALLS:
             fn = n.get("fn")
-            if (any(_mentions(a, names) for a in n.get("args") or [])
-                    or (isinstance(fn, dict) and fn.get("k") == "member" and _mentions(fn.get("obj"), names))):
+            args = list(n.get("args") or [])
+            if ((any(_mentions(a, names) for a in args)
+                 or (isinstance(fn, dict) and fn.get("k") == "member" and _mentions(fn.get("obj"), names)))
+                    and (not need_const or any(isinstance(_num(a, consts), (int, float)) for a in args))):
                 out.append(n)
     return out
 
 
+_STOP_KINDS = frozenset({"if", "loop", "cond", "lambda"})
+_OR, _AND = frozenset({"||", "or", "orelse"}), frozenset({"&&", "and", "andalso"})
+
+
+def _top(node):
+    """Pre-order over the nodes that run whenever the code around them runs: it stops at (but yields) an `if`,
+    a loop, a ternary and a lambda or local function (their bodies may not run, or run elsewhere), and skips
+    `catch` handlers."""
+    if isinstance(node, list):
+        for x in node:
+            yield from _top(x)
+    elif isinstance(node, dict):
+        yield node
+        if node.get("k") in _STOP_KINDS:
+            return
+        for key, v in node.items():
+            if isinstance(v, (dict, list)) and not (node.get("k") == "try" and key == "catches"):
+                yield from _top(v)
+
+
 def _acts(stmts, names: set) -> bool:
-    """A branch that leaves the handler (return / throw) or assigns the parameter or a carrier (a clamp)."""
-    for n in walk(stmts):
+    """A branch that certainly leaves the handler (return / throw) or assigns the parameter or a carrier (a
+    clamp); a jump under a nested `if`, loop or lambda does not count."""
+    for n in _top(stmts):
         if n.get("k") in ("return", "throw"):
             return True
         if (n.get("k") == "assign" and isinstance(n.get("target"), dict) and n["target"].get("k") == "name"
@@ -485,17 +625,70 @@ def _acts(stmts, names: set) -> bool:
     return False
 
 
-def _bound_state(body: list, names: set, takes: list[dict]) -> str | None:
+def _tracked(e, names: set) -> bool:
+    """The parameter (or a carrier local) itself, its nullable `.Value`, or a cast of either."""
+    if not isinstance(e, dict):
+        return False
+    k = e.get("k")
+    if k == "name":
+        return e.get("id") in names
+    if k == "member" and e.get("name") == "Value":
+        return _tracked(e.get("obj"), names)
+    return k == "cast" and _tracked(e.get("e"), names)
+
+
+_FLIP = {"<": ">", ">": "<", "<=": ">=", ">=": "<="}
+
+
+def _cap_cmp(n: dict, names: set, consts: dict) -> str | None:
+    """"exceed" for `value > C` / `>= C`, "within" for `value < C` / `<= C` (either operand order) where C
+    is a compile-time number above 1 (a literal, a const field or a folded constant); None otherwise."""
+    op, left, right = n.get("op"), n.get("l"), n.get("r")
+    if n.get("k") != "bin" or op not in _CMP:
+        return None
+    if _tracked(left, names):
+        c = _num(right, consts)
+    elif _tracked(right, names):
+        c, op = _num(left, consts), _FLIP[op]
+    else:
+        return None
+    if not isinstance(c, (int, float)) or c <= 1:
+        return None
+    return "exceed" if op in (">", ">=") else "within"
+
+
+def _guards(cond, kind: str, names: set, consts: dict) -> bool:
+    """The condition is a cap comparison of that kind, or an `||` chain (exceed) / `&&` chain (within) that
+    includes one: only then does the branch it selects hold exactly the values past the cap."""
+    joins = _OR if kind == "exceed" else _AND
+    if isinstance(cond, dict) and cond.get("k") == "bin" and cond.get("op") in joins:
+        return _guards(cond.get("l"), kind, names, consts) or _guards(cond.get("r"), kind, names, consts)
+    return isinstance(cond, dict) and _cap_cmp(cond, names, consts) == kind
+
+
+def _inside(branch, takes: list[dict]) -> bool:
+    ids = {id(n) for n in walk(branch)}
+    return all(id(t) in ids for t in takes)
+
+
+def _bound_state(body: list, names: set, takes: list[dict], consts: dict) -> str | None:
     """"bound" when the handler certainly caps the value, "weak" when a comparison or Min / Clamp mentions it
     but nothing shows that it limits what reaches Take (REVIEW), None when nothing does. A cap is: a
-    comparison in an `if` whose branch returns, throws or assigns the value; a ternary comparison or a
-    Min / Clamp whose result is used (inside a Take argument, or assigned to what Take reads)."""
+    comparison of the value against a constant in an `if` the handler always reaches (not nested under another
+    `if`) whose condition is that comparison, or an `||` chain including it (`&&` for the within-form), when
+    the branch it selects returns, throws or assigns the value (or every Take sits in the other branch); a
+    ternary with such a comparison, or a Min / Clamp with a constant operand, whose result is used (inside a
+    Take argument, or assigned to what Take reads)."""
     reach = {n.get("id") for t in takes for a in t.get("args") or [] for n in walk(a) if n.get("k") == "name"}
     strong = False
-    for n in walk(body):
-        if n.get("k") == "if" and _cmp_nodes(n.get("cond"), names):
-            if _acts(n.get("then"), names) or _acts(n.get("else"), names):
-                strong = True
+    for n in _top(body):
+        if n.get("k") != "if":
+            continue
+        cond, then, other = n.get("cond"), n.get("then"), n.get("else")
+        if _guards(cond, "exceed", names, consts) and (_acts(then, names) or _inside(other, takes)):
+            strong = True
+        if _guards(cond, "within", names, consts) and (_acts(other, names) or _inside(then, takes)):
+            strong = True
     contexts: list[tuple[object, bool]] = [(a, True) for t in takes for a in t.get("args") or []]
     for n in walk(body):
         if n.get("k") == "local" and n.get("name") in names:
@@ -504,23 +697,41 @@ def _bound_state(body: list, names: set, takes: list[dict]) -> str | None:
               and n["target"].get("k") == "name" and n["target"].get("id") in names):
             contexts.append((n.get("value"), n["target"]["id"] in reach))
     for val, reaches in contexts:
+        if not reaches:
+            continue
         for n in walk(val):
-            if n.get("k") == "cond" and reaches and _cmp_nodes(n, names):
+            if n.get("k") == "cond" and any(_cap_cmp(c, names, consts) for c in walk(n)):
                 strong = True
-        if reaches and _bound_calls(val, names):
+        if _bound_calls(val, names, consts, need_const=True):
             strong = True
     if strong:
         return "bound"
-    return "weak" if _cmp_nodes(body, names) or _bound_calls(body, names) else None
+    return "weak" if _cmp_nodes(body, names) or _bound_calls(body, names, consts) else None
 
 
-def _page_findings(ref: CoreRouteRef) -> list[tuple[str, int, bool]]:
+def _consts(ctx: Ctx, ref: CoreRouteRef) -> dict:
+    """Const fields of the handler's class chain whose initialiser folds to a number (`private const int
+    MaxPage = 100;`). A `static readonly` field is not read as a constant."""
+    out: dict = {}
+    if ref.type is None:
+        return out
+    for t in _chain_types(ctx.model, ref.type):
+        for f in t.fields:
+            if f.is_const and f.init is not None and f.name not in out:
+                v = _num(f.init, out)
+                if isinstance(v, (int, float)):
+                    out[f.name] = v
+    return out
+
+
+def _page_findings(ctx: Ctx, ref: CoreRouteRef) -> list[tuple[str, int, bool]]:
     """[(parameter, line of the Take call, weak)] for page-size parameters reaching Take with no certain
     bound; `weak` when some comparison or Min / Clamp mentions the value but does not visibly cap it."""
     m = ref.method
     if m is None:
         return []
     out = []
+    consts = _consts(ctx, ref)
     for p in m.params:
         if not (_PAGE_PARAM.match(p.name) and _integer(p.type)):
             continue
@@ -538,7 +749,7 @@ def _page_findings(ref: CoreRouteRef) -> list[tuple[str, int, bool]]:
                  and any(_mentions(a, names) for a in n.get("args") or [])]
         if not takes:
             continue
-        state = _bound_state(m.body, names, takes)
+        state = _bound_state(m.body, names, takes, consts)
         if state != "bound":
             out.append((p.name, takes[0].get("line") or m.line, state == "weak"))
     return out
@@ -551,7 +762,7 @@ def _page_sizes(ctx: Ctx) -> None:
         env = _env_state(r.meta.get("env"))
         if env == "skip":
             continue
-        for pname, line, weak in _page_findings(ref):
+        for pname, line, weak in _page_findings(ctx, ref):
             key = (r.file, r.line, r.handler_name, r.path, pname)
             if key in seen:
                 continue

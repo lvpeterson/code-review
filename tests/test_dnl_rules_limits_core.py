@@ -379,3 +379,57 @@ def test_res001_razor_directives(tmp_path, mode):
     assert not got(f, "DNL-RES-001")
     f = scan(tmp_path / "g", razor("[RequestSizeLimit(Limits.Max)]"), mode)
     assert got(f, "DNL-RES-001") == {("DNL-RES-001", "low", "REVIEW")}
+
+
+# -- fix round 2 ---------------------------------------------------------------------------------------
+
+def test_res001_razor_directive_never_evaluates_hostile_text(tmp_path, mode):
+    import time
+    for i, expr in enumerate(["9**9**9", "1 << 999999", "(" * 150 + "1" + ")" * 150, "(((1)",
+                              "99999999999 * 99999999999 * 99999999999 * 99999999999"]):
+        t0 = time.monotonic()
+        f = scan(tmp_path / str(i), razor(f"[RequestSizeLimit({expr})]"), mode)
+        assert time.monotonic() - t0 < 60, expr
+        assert got(f, "DNL-RES-001") == {("DNL-RES-001", "low", "REVIEW")}, expr
+    f = scan(tmp_path / "ok", razor("[RequestSizeLimit(100 * 1024 * 1024)]"), mode)
+    assert not got(f, "DNL-RES-001")
+    f = scan(tmp_path / "nested", razor("[RequestSizeLimit((100 * 1024) * (1024 * 1000))]"), mode)
+    assert got(f, "DNL-RES-001") == {("DNL-RES-001", "low", None)}      # nested parentheses are read, not skipped
+    f = scan(tmp_path / "shift", razor("[RequestSizeLimit(1L << 40)]"), mode)
+    assert got(f, "DNL-RES-001") == {("DNL-RES-001", "low", None)}
+
+
+def _list(stmt: str, fields: str = "") -> dict:
+    return mvc(fields + "\n[HttpGet] public IActionResult List(int pageSize, bool isAdmin) { " + stmt +
+               " return Ok(db.Items.Take(pageSize).ToList()); }")
+
+
+def test_res005_only_constant_caps_on_unconditional_guards_count(tmp_path, mode):
+    review = {
+        "count_cmp": "if (items.Count < pageSize) return BadRequest();",
+        "and_conjunct": "if (pageSize > 100 && !user.IsAdmin) return Forbid();",
+        "nested_under_other_if": "if (!isAdmin) { if (pageSize > 100) return BadRequest(); }",
+        "lambda_return": "if (pageSize > 100) { var f = () => { return 1; }; _log.Warn(\"x\"); }",
+        "variable_threshold": "if (pageSize > limits.Max) return BadRequest();",
+        "min_with_variable": "pageSize = Math.Min(pageSize, userLimit);",
+        "else_if": "if (isAdmin) { } else if (pageSize > 100) return BadRequest();",
+    }
+    for name, stmt in review.items():
+        f = scan(tmp_path / name, _list(stmt), mode)
+        assert got(f, "DNL-RES-005") == {("DNL-RES-005", "low", "REVIEW")}, name
+    clean = {
+        "const_field": ("if (pageSize > MaxPage) return BadRequest();", "private const int MaxPage = 100;"),
+        "or_chain": ("if (pageSize < 1 || pageSize > 100) throw new ArgumentException();", ""),
+        "folded": ("if (pageSize >= 10 * 10 + 1) return BadRequest();", ""),
+        "flipped": ("if (100 < pageSize) return BadRequest();", ""),
+        "within_else": ("if (pageSize <= 100) { } else return BadRequest();", ""),
+        "after_other_guard": ("if (!ModelState.IsValid) return BadRequest(); if (pageSize > 100) pageSize = 100;", ""),
+    }
+    for name, (stmt, fields) in clean.items():
+        assert not got(scan(tmp_path / name, _list(stmt, fields), mode), "DNL-RES-005"), name
+
+
+def test_res004_unenforced_lead_sentence(tmp_path, mode):
+    f = scan(tmp_path, mvc(ENABLED, LIMITER), mode)
+    d = of(f, "DNL-RES-004")[0].description
+    assert "no RequireRateLimiting" not in d and "unenforced" in d
