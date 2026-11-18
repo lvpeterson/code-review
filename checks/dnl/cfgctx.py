@@ -37,7 +37,11 @@ class Ctx:
         missing piece, or an ambiguous startup choice means the pipeline may not be what was read."""
         why: list[str] = []
         for c in pipe.uncertain():
-            why.append(f"{c.name} at {c.file}:{c.line} is under an environment condition that could not be parsed")
+            if c.in_branch:
+                why.append(f"{c.name} at {c.file}:{c.line} is inside a Map/MapWhen/UseWhen branch, so it does not "
+                           "cover the whole app")
+            else:
+                why.append(f"{c.name} at {c.file}:{c.line} is under an environment condition that could not be parsed")
         for c in pipe.unresolved():
             if (c.kind in ("services", "app") and c.name not in _NON_AUTHZ_EXTENSIONS
                     and c.runs_in("Production") is not False):

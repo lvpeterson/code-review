@@ -166,7 +166,9 @@ def _developer_page(ctx: Ctx, pipe: Pipeline, add) -> None:
     for c, conf in _certain_and_uncertain(ctx, pipe, "UseDeveloperExceptionPage"):
         desc = ("The developer exception page returns stack traces, source lines, headers and route data to "
                 "the client; it must run only in Development.")
-        if conf:
+        if conf and c.in_branch:
+            desc += " It sits inside a Map/MapWhen/UseWhen branch; confirm it is limited to Development."
+        elif conf:
             desc += " It sits under an environment condition that could not be parsed; confirm it is limited to Development."
         add("DNL-CFG-008", "medium", "Developer exception page can run in Production", desc, c.file, c.line, conf)
 

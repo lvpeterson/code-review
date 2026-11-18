@@ -69,6 +69,12 @@ class PipeCall:
     # (type, method) this call was followed into; None for framework calls and calls not followed.
     target: tuple | None = None
 
+    @property
+    def in_branch(self) -> bool:
+        """True for a call inside a Map / MapWhen / UseWhen branch: it runs only for some requests, so it never
+        covers the whole app (runs_in is None for it)."""
+        return any(p[0] == "branch" for p, _t in self.guards)
+
     def runs_in(self, env_name: str) -> bool | None:
         """True when the call runs in that environment, False when it does not, None when
         the enclosing conditions cannot tell (an environment check that could not be parsed)."""
@@ -263,6 +269,8 @@ def _pred(e, scope: dict, ctx: _Ctx, depth: int = 0):
 def _show(p) -> str:
     """Human-readable form of a predicate for PipeCall.env."""
     k = p[0]
+    if k == "branch":
+        return "branch"
     if k == "env":
         return next((v for v in _ENV_CALLS.values() if v.lower() == p[1]), p[1])
     if k == "not":
@@ -315,6 +323,7 @@ class _Ctx:
     methods: dict[str, list[tuple[TypeIR, MethodIR]]] = field(default_factory=dict)
     # id() of the solution call nodes being followed right now (becomes PipeCall.via).
     via: list[int] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
 
 def _expr_kind(e, scope: dict) -> str | None:
@@ -585,6 +594,156 @@ def _endpoints_lambda(ctx: _Ctx, call: dict, scope: dict, guards: tuple, file: s
             _expr(ctx, body, inner, guards, file, stack, depth)
 
 
+# Calls whose callback argument configures the host: walked like Startup methods, unconditionally.
+_HOST_CALLBACKS = frozenset({"ConfigureWebHostDefaults", "ConfigureWebHost", "ConfigureServices", "Configure"})
+# Calls that build a middleware branch from a callback: walked as conditional code.
+_BRANCH_CALLS = frozenset({"Map", "MapWhen", "UseWhen"})
+
+
+def _is_branch_shape(lam: dict) -> bool:
+    """`app.Map("/x", b => b.Run(..))`: a one-parameter lambda taking an application builder (declared, or
+    used as one), as opposed to an endpoint handler."""
+    params = lam.get("params") or []
+    if len(params) != 1 or not isinstance(params[0], str):
+        return False
+    infos = lam.get("param_info") or []
+    if infos and isinstance(infos[0], dict) and _type_kind(infos[0].get("type")) == "app":
+        return True
+    return any(n.get("k") == "call" and (call_name(n) or "").startswith(("Run", "Use", "Map"))
+               and receiver_text((n.get("fn") or {}).get("obj")) == params[0] for n in walk(lam.get("body")))
+
+
+def _callback_arg(ctx: _Ctx, call: dict, nm: str):
+    """The callback a pipeline call takes: (kind, node-or-method) where kind is "lambda" or "method"; None
+    when the call takes none (an options lambda, an endpoint handler, a plain value)."""
+    args = [a for a in call.get("args") or [] if isinstance(a, dict)]
+    if not args:
+        return None
+    last = args[-1]
+    if last.get("k") == "lambda":
+        return ("lambda", last)
+    if last.get("k") in ("name", "member"):
+        cands = ctx.methods.get(last.get("id") if last.get("k") == "name" else last.get("name") or "") or []
+        if len(cands) == 1:
+            return ("method", cands[0])
+    return ("other", last)
+
+
+def _walk_callback(ctx: _Ctx, cb, bind: str | None, scope: dict, guards: tuple, file: str, stack: tuple,
+                   depth: int) -> None:
+    """Walk a lambda or method-group callback in place. `bind` is the builder kind given to its last parameter
+    (unless the parameter's declared type says otherwise): "services" for ConfigureServices, "app" for
+    Configure and a branch, None for a host builder."""
+    kind, item = cb
+    if kind == "lambda":
+        inner = _closure_scope(scope, item)
+        names = [x for x in item.get("params") or [] if isinstance(x, str)]
+        infos = item.get("param_info") or []
+        types = [infos[i].get("type") if i < len(infos) and isinstance(infos[i], dict) else None
+                 for i in range(len(names))]
+        body, f, key = item.get("body"), file, ("fn", id(item))
+    else:
+        t, m = item
+        inner = {}
+        names, types = [p.name for p in m.params], [p.type for p in m.params]
+        body, f, key = m.body, t.file, m
+    if key in stack:
+        return
+    for i, nm in enumerate(names):
+        inner.pop(nm, None)
+        k = _type_kind(types[i]) or (bind if bind and i == len(names) - 1 else None)
+        if k:
+            inner[nm] = k
+    st = stack + (key,)
+    if isinstance(body, list):
+        _stmts(ctx, body, inner, guards, f, st, depth + 1)
+    else:
+        _expr(ctx, body, inner, guards, f, st, depth + 1)
+
+
+def _callbacks(ctx: _Ctx, call: dict, nm: str, kind: str, scope: dict, guards: tuple, file: str, stack: tuple,
+               depth: int) -> None:
+    """Follow the callback of a host call (`ConfigureWebHostDefaults(wb => ..)`, `ConfigureServices(s => ..)`,
+    `Configure(app => ..)`) as unconditional code and of a branch call (`Map` / `MapWhen` / `UseWhen`) as
+    conditional code. A callback that cannot be followed adds a model note (the findings that depend on a
+    complete pipeline then stay REVIEW)."""
+    sym = call.get("sym") or ""
+    targs = (call.get("fn") or {}).get("targs") or []
+    line = call.get("line", 0)
+    where = f"{call_name(call)} at {file}:{line}"
+    if nm in _BRANCH_CALLS:
+        cb = _callback_arg(ctx, call, nm)
+        if cb is None:
+            return
+        if nm == "Map":
+            # Only a middleware branch: by symbol, a branch-shaped lambda, or a method taking the app builder.
+            if cb[0] == "lambda":
+                ok = sym.rsplit(".", 1)[0].endswith(".MapExtensions") or (not sym and _is_branch_shape(cb[1]))
+            elif cb[0] == "method":
+                ok = bool(cb[1][1].params) and _type_kind(cb[1][1].params[0].type) == "app"
+            else:
+                ok = sym.rsplit(".", 1)[0].endswith(".MapExtensions")
+            if not ok:
+                return
+        if cb[0] == "other" or depth >= _MAX_DEPTH:
+            ctx.notes.append(f"the branch of {where} could not be followed; middleware inside it is not modelled")
+            return
+        _walk_callback(ctx, cb, "app", scope, guards + ((("branch",), True),), file, stack, depth)
+        return
+    if nm == "Configure" and (kind == "services" or targs):
+        return          # `services.Configure<TOptions>(o => ..)` is an options callback, not a pipeline
+    if nm == "ConfigureServices" and kind == "app":
+        return
+    cb = _callback_arg(ctx, call, nm)
+    if cb is None:
+        return
+    if cb[0] == "other":
+        if isinstance(cb[1], dict) and cb[1].get("k") in ("name", "member", "call", "new", "lit"):
+            # A delegate value that is not a method of this solution: it may register anything.
+            if nm != "Configure" or cb[1].get("k") != "lit":
+                ctx.notes.append(f"the callback of {where} could not be followed; what it registers is not modelled")
+        return
+    if depth >= _MAX_DEPTH:
+        ctx.notes.append(f"the callback of {where} is nested too deeply to be followed")
+        return
+    bind = "services" if nm == "ConfigureServices" else "app" if nm == "Configure" else None
+    _walk_callback(ctx, cb, bind, scope, guards, file, stack, depth)
+
+
+def _local_fn_of(scope: dict, call: dict) -> dict | None:
+    """The local function (or lambda-valued local) a bare call `Name(...)` goes to."""
+    fn = call.get("fn") or {}
+    if fn.get("k") == "name":
+        lam = scope.get(_LOCAL_FN + (fn.get("id") or ""))
+        if isinstance(lam, dict):
+            return lam
+    return None
+
+
+def _walk_local_fn(ctx: _Ctx, lam: dict, call: dict, scope: dict, recv_kind, guards: tuple, file: str,
+                   stack: tuple, depth: int) -> None:
+    """Follow a call to a local function inline, as a solution method call is followed: its body sees the
+    caller's locals (closure scope), its parameters are builders by declared type or by what the call passes."""
+    inner = _closure_scope(scope, lam)
+    infos = lam.get("param_info") or []
+    names = [x for x in lam.get("params") or [] if isinstance(x, str)]
+    arg_kinds = [_expr_kind(a, scope) for a in call.get("args") or []]
+    for i, nm in enumerate(names):
+        inner.pop(nm, None)
+        ty = infos[i].get("type") if i < len(infos) and isinstance(infos[i], dict) else None
+        k = _type_kind(ty) or (arg_kinds[i] if i < len(arg_kinds) else None)
+        if k:
+            inner[nm] = k
+    ctx.via.append(id(call))
+    body = lam.get("body")
+    st = stack + (("fn", id(lam)),)
+    if isinstance(body, list):
+        _stmts(ctx, body, inner, guards, file, st, depth + 1)
+    else:
+        _expr(ctx, body, inner, guards, file, st, depth + 1)
+    ctx.via.pop()
+
+
 def _expr(ctx: _Ctx, e, scope: dict, guards: tuple, file: str, stack: tuple, depth: int) -> str | None:
     """Record the calls of one expression statement or initializer; returns the builder
     kind of its value (for `var app = builder.Build()`)."""
@@ -611,13 +770,16 @@ def _expr(ctx: _Ctx, e, scope: dict, guards: tuple, file: str, stack: tuple, dep
     for call in calls:
         kind = _call_kind(call, root, calls, scope, memo)
         nm = call_name(call) or ""
-        target = _find_target(ctx, call)
+        local = _local_fn_of(scope, call)
+        target = _find_target(ctx, call) if local is None else None
         if target is not None and target[1] in stack:
             continue  # cycle guard: re-entering a method being followed adds no new fact
+        if local is not None and ("fn", id(local)) in stack:
+            continue  # the same guard for a local function calling itself
         followed = target is not None and depth < _MAX_DEPTH
         ctx.calls.append(PipeCall(
             name=nm, kind=kind, node=call, chain=calls, file=file, line=call.get("line", 0), env=_display_env(guards),
-            resolved=bool(call.get("sym")) or nm in _FRAMEWORK_CALLS or target is not None,
+            resolved=bool(call.get("sym")) or nm in _FRAMEWORK_CALLS or target is not None or local is not None,
             order=ctx.order, guards=guards, via=tuple(ctx.via), target=target if followed else None))
         ctx.order += 1
         if followed:
@@ -627,8 +789,15 @@ def _expr(ctx: _Ctx, e, scope: dict, guards: tuple, file: str, stack: tuple, dep
             ctx.via.append(id(call))
             _stmts(ctx, m.body, _scope_for(m, recv_kind, arg_kinds, ext), guards, t.file, stack + (m,), depth + 1)
             ctx.via.pop()
+        elif local is not None:
+            if depth >= _MAX_DEPTH:
+                ctx.notes.append(f"local function {nm}() nested deeper than {_MAX_DEPTH} calls was not followed")
+            else:
+                _walk_local_fn(ctx, local, call, scope, recv_kind, guards, file, stack, depth)
         elif nm == "UseEndpoints":
             _endpoints_lambda(ctx, call, scope, guards, file, stack, depth)
+        elif nm in _HOST_CALLBACKS or nm in _BRANCH_CALLS:
+            _callbacks(ctx, call, nm, kind, scope, guards, file, stack, depth)
         recv_kind = kind
     # A `Build()` result is the app, whatever the builder was called.
     if calls and call_name(calls[-1]) == "Build" and kind == "other":
@@ -700,7 +869,7 @@ def _build(model: ProjectModel, proj: Project | None) -> Pipeline:
     for t, m in entries:
         scope = {p.name: k for p in m.params if (k := _type_kind(p.type))}
         _stmts(ctx, m.body, scope, (), t.file, (m,), 1)
-    return Pipeline(proj, style, ctx.calls, tfm, notes, list(entries))
+    return Pipeline(proj, style, ctx.calls, tfm, notes + ctx.notes, list(entries))
 
 
 def pipeline_for(model: ProjectModel, proj: Project | None) -> Pipeline:
